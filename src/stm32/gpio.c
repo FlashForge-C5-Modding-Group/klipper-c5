@@ -11,6 +11,13 @@
 #include "internal.h" // gpio_peripheral
 #include "sched.h" // sched_shutdown
 
+#if CONFIG_MACH_N32G430F8S7
+DECL_ENUMERATION_RANGE("pin", "PA0", GPIO('A', 0), 8);
+DECL_ENUMERATION("pin", "PA9", GPIO('A', 9));
+DECL_ENUMERATION("pin", "PA10", GPIO('A', 10));
+DECL_ENUMERATION("pin", "PB1", GPIO('B', 1));
+DECL_ENUMERATION("pin", "PD0", GPIO('D', 0));
+#else
 DECL_ENUMERATION_RANGE("pin", "PA0", GPIO('A', 0), 16);
 DECL_ENUMERATION_RANGE("pin", "PB0", GPIO('B', 0), 16);
 DECL_ENUMERATION_RANGE("pin", "PC0", GPIO('C', 0), 16);
@@ -32,6 +39,8 @@ DECL_ENUMERATION_RANGE("pin", "PH0", GPIO('H', 0), 16);
 #ifdef GPIOI
 DECL_ENUMERATION_RANGE("pin", "PI0", GPIO('I', 0), 16);
 #endif
+#endif
+
 
 static GPIO_TypeDef * const digital_regs[] = {
     ['A' - 'A'] = GPIOA, GPIOB, GPIOC,
@@ -54,6 +63,14 @@ static GPIO_TypeDef * const digital_regs[] = {
     ['I' - 'A'] = GPIOI,
 #endif
 };
+#if CONFIG_MACH_N32G430F8S7
+static const uint16_t digital_pin_masks[] = {
+    ['A' - 'A'] = 0x06ff,
+    ['B' - 'A'] = 0x0002,
+    ['D' - 'A'] = 0x0001,
+};
+#endif
+
 
 // Convert a register and bit location back to an integer pin identifier
 static int
@@ -73,6 +90,11 @@ gpio_pin_to_regs(uint32_t pin)
     uint32_t port = GPIO2PORT(pin);
     if (port >= ARRAY_SIZE(digital_regs) || !digital_regs[port])
         shutdown("Not a valid pin");
+#if CONFIG_MACH_N32G430F8S7
+    if (port >= ARRAY_SIZE(digital_pin_masks)
+        || !(digital_pin_masks[port] & GPIO2BIT(pin)))
+        shutdown("Not a valid pin");
+#endif
     return digital_regs[port];
 }
 

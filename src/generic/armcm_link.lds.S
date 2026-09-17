@@ -6,12 +6,18 @@
 
 #include "autoconf.h" // CONFIG_FLASH_APPLICATION_ADDRESS
 
+#if CONFIG_MACH_N32G430F8S7
+#define ARMCM_ROM_LENGTH (CONFIG_FLASH_SIZE - (CONFIG_FLASH_APPLICATION_ADDRESS - CONFIG_FLASH_BOOT_ADDRESS))
+#else
+#define ARMCM_ROM_LENGTH CONFIG_FLASH_SIZE
+#endif
+
 OUTPUT_FORMAT("elf32-littlearm", "elf32-littlearm", "elf32-littlearm")
 OUTPUT_ARCH(arm)
 
 MEMORY
 {
-  rom (rx) : ORIGIN = CONFIG_FLASH_APPLICATION_ADDRESS , LENGTH = CONFIG_FLASH_SIZE
+  rom (rx) : ORIGIN = CONFIG_FLASH_APPLICATION_ADDRESS , LENGTH = ARMCM_ROM_LENGTH
   ram (rwx) : ORIGIN = CONFIG_RAM_START , LENGTH = CONFIG_RAM_SIZE
 }
 
@@ -46,6 +52,11 @@ SECTIONS
         . = ALIGN(4);
         _data_end = .;
     } > ram
+
+#if CONFIG_MACH_N32G430F8S7
+    ASSERT(LOADADDR(.data) + SIZEOF(.data) <= ORIGIN(rom) + LENGTH(rom),
+           "region `rom' overflowed by initialized data")
+#endif
 
     .bss (NOLOAD) :
     {

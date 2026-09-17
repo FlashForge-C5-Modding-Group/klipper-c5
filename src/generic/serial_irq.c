@@ -14,9 +14,20 @@
 #include "sched.h" // sched_wake_tasks
 #include "serial_irq.h" // serial_enable_tx_irq
 
-#define RX_BUFFER_SIZE 192
+#define RX_BUFFER_SIZE CONFIG_SERIAL_RX_BUFFER_SIZE
 
+_Static_assert(RX_BUFFER_SIZE > 0, "Serial receive buffer must not be empty");
+_Static_assert(RX_BUFFER_SIZE <= UINT16_MAX,
+               "Serial receive buffer exceeds stored index width");
+_Static_assert(RX_BUFFER_SIZE <= UINT_FAST8_MAX,
+               "Serial parser length type is too narrow");
+
+#if RX_BUFFER_SIZE > UINT8_MAX
+static uint8_t receive_buf[RX_BUFFER_SIZE];
+static uint16_t receive_pos;
+#else
 static uint8_t receive_buf[RX_BUFFER_SIZE], receive_pos;
+#endif
 static uint8_t transmit_buf[96], transmit_pos, transmit_max;
 
 DECL_CONSTANT("SERIAL_BAUD", CONFIG_SERIAL_BAUD);
@@ -26,12 +37,23 @@ DECL_CONSTANT("RECEIVE_WINDOW", RX_BUFFER_SIZE);
 void
 serial_rx_byte(uint_fast8_t data)
 {
+#if RX_BUFFER_SIZE > UINT8_MAX
+    uint_fast16_t rpos = receive_pos;
+    if (data == MESSAGE_SYNC)
+        sched_wake_tasks();
+    if (rpos >= sizeof(receive_buf))
+        // Serial overflow - ignore it as crc error will force retransmit
+        return;
+    receive_buf[rpos] = data;
+    receive_pos = rpos + 1;
+#else
     if (data == MESSAGE_SYNC)
         sched_wake_tasks();
     if (receive_pos >= sizeof(receive_buf))
         // Serial overflow - ignore it as crc error will force retransmit
         return;
     receive_buf[receive_pos++] = data;
+#endif
 }
 
 // Tx interrupt - get next byte to transmit
@@ -48,6 +70,28 @@ serial_get_tx_byte(uint8_t *pdata)
 static void
 console_pop_input(uint_fast8_t len)
 {
+#if RX_BUFFER_SIZE > UINT8_MAX
+    uint_fast16_t copied = 0;
+    for (;;) {
+        uint_fast16_t rpos = readw(&receive_pos);
+        uint_fast16_t needcopy = rpos - len;
+        if (needcopy) {
+            memmove(&receive_buf[copied], &receive_buf[copied + len]
+                    , needcopy - copied);
+            copied = needcopy;
+            sched_wake_tasks();
+        }
+        irqstatus_t flag = irq_save();
+        if (rpos != readw(&receive_pos)) {
+            // Raced with irq handler - retry
+            irq_restore(flag);
+            continue;
+        }
+        writew(&receive_pos, needcopy);
+        irq_restore(flag);
+        break;
+    }
+#else
     uint_fast8_t copied = 0;
     for (;;) {
         uint_fast8_t rpos = readb(&receive_pos);
@@ -68,13 +112,19 @@ console_pop_input(uint_fast8_t len)
         irq_restore(flag);
         break;
     }
+#endif
 }
 
 // Process any incoming commands
 void
 console_task(void)
 {
+#if RX_BUFFER_SIZE > UINT8_MAX
+    uint_fast16_t rpos = readw(&receive_pos);
+    uint_fast8_t pop_count;
+#else
     uint_fast8_t rpos = readb(&receive_pos), pop_count;
+#endif
     int_fast8_t ret = command_find_block(receive_buf, rpos, &pop_count);
     if (ret > 0)
         command_dispatch(receive_buf, pop_count);
