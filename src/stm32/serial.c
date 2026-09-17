@@ -21,7 +21,11 @@
 
 // Select the configured serial port
 #if CONFIG_STM32_SERIAL_USART1
-  DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA10,PA9");
+  #if CONFIG_C5_LEVELBOARD
+    DECL_CONSTANT_STR("RESERVE_PINS_serial", "PH10,PH9");
+  #else
+    DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA10,PA9");
+  #endif
   #define GPIO_Rx GPIO('A', 10)
   #define GPIO_Tx GPIO('A', 9)
   #if CONFIG_MACH_N32G430F8S7

@@ -10,6 +10,10 @@
 #include "gpio.h" // gpio_out_setup
 #include "internal.h" // gpio_peripheral
 #include "sched.h" // sched_shutdown
+#if CONFIG_C5_LEVELBOARD
+uint8_t c5_levelboard_eddy_state(void);
+#endif
+
 
 #if CONFIG_MACH_N32G430F8S7
 DECL_ENUMERATION_RANGE("pin", "PA0", GPIO('A', 0), 8);
@@ -170,6 +174,10 @@ gpio_in_reset(struct gpio_in g, int32_t pull_up)
 uint8_t
 gpio_in_read(struct gpio_in g)
 {
+#if CONFIG_C5_LEVELBOARD
+    if (g.regs == GPIOD && g.bit == GPIO2BIT(GPIO('D', 0)))
+        return c5_levelboard_eddy_state();
+#endif
     GPIO_TypeDef *regs = g.regs;
     return !!(regs->IDR & g.bit);
 }

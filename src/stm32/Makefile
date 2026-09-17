@@ -44,6 +44,7 @@ reset-src-y := generic/armcm_reset.c
 reset-src-$(CONFIG_MACH_N32G430F8S7) := stm32/n32g430_reset.c
 src-y += generic/armcm_boot.c generic/armcm_irq.c $(reset-src-y)
 src-$(CONFIG_MACH_N32G430F8S7) += stm32/n32g430.c
+src-$(CONFIG_C5_LEVELBOARD) += stm32/c5_levelboard.c
 src-$(CONFIG_MACH_STM32F0) += stm32/stm32f0.c ../lib/stm32f0/system_stm32f0xx.c
 src-$(CONFIG_MACH_STM32F1) += stm32/stm32f1.c ../lib/stm32f1/system_stm32f1xx.c
 src-$(CONFIG_MACH_STM32F2) += stm32/stm32f4.c ../lib/stm32f2/system_stm32f2xx.c

@@ -115,6 +115,11 @@ choice
         select MACH_STM32F1
 endchoice
 
+config C5_LEVELBOARD
+    bool "Creator 5 levelBoard compatibility"
+    depends on MACH_N32G430F8S7
+    default n
+
 config MACH_STM32F103x6
     depends on LOW_LEVEL_OPTIONS && MACH_STM32F103
     bool "Only 10KiB of RAM (for rare stm32f103x6 variant)"
@@ -198,6 +203,7 @@ config MCU
     default "stm32h743xx" if MACH_STM32H743
     default "stm32h750xx" if MACH_STM32H750
     default "stm32l412xx" if MACH_STM32L412
+    default "stm32f103xe" if C5_LEVELBOARD
     default "n32g430f8s7" if MACH_N32G430F8S7
     default "stm32f103xe" if MACH_N32G45x
 
@@ -296,6 +302,7 @@ config STM32_DFU_ROM_ADDRESS
 
 choice
     prompt "Bootloader offset"
+    default STM32_FLASH_START_4000 if C5_LEVELBOARD
     default STM32_FLASH_START_0000 if MACH_N32G430F8S7
     config STM32_FLASH_START_2000
         bool "8KiB bootloader" if MACH_STM32F1 || MACH_STM32F070 || MACH_STM32G0 || MACH_STM32G4 || MACH_STM32F0x2
@@ -327,6 +334,7 @@ choice
 
     config STM32_FLASH_START_0000
         bool "No bootloader"
+        depends on !C5_LEVELBOARD
 endchoice
 config FLASH_APPLICATION_ADDRESS
     hex
