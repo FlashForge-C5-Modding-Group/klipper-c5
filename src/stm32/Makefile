@@ -22,6 +22,7 @@ CFLAGS-$(CONFIG_HAVE_LIMITED_CODE_SIZE) += -Os
 CFLAGS-$(CONFIG_MACH_STM32F0) += -mcpu=cortex-m0 -Ilib/stm32f0/include
 CFLAGS-$(CONFIG_MACH_STM32F103) += -mcpu=cortex-m3
 CFLAGS-$(CONFIG_MACH_N32G45x) += -mcpu=cortex-m4 -Ilib/n32g45x/include
+CFLAGS-$(CONFIG_MACH_N32G430F8S7) += -mcpu=cortex-m4
 CFLAGS-$(CONFIG_MACH_STM32F1) += -Ilib/stm32f1/include
 CFLAGS-$(CONFIG_MACH_STM32F2) += -mcpu=cortex-m3 -Ilib/stm32f2/include
 CFLAGS-$(CONFIG_MACH_STM32F4) += -mcpu=cortex-m4 -Ilib/stm32f4/include
@@ -39,7 +40,11 @@ $(OUT)klipper.elf: $(OUT)src/generic/armcm_link.ld
 # Add source files
 src-y += stm32/watchdog.c stm32/clockline.c stm32/dfu_reboot.c
 src-y += generic/crc16_ccitt.c
-src-y += generic/armcm_boot.c generic/armcm_irq.c generic/armcm_reset.c
+reset-src-y := generic/armcm_reset.c
+reset-src-$(CONFIG_MACH_N32G430F8S7) := stm32/n32g430_reset.c
+src-y += generic/armcm_boot.c generic/armcm_irq.c $(reset-src-y)
+src-$(CONFIG_MACH_N32G430F8S7) += stm32/n32g430.c
+src-$(CONFIG_C5_LEVELBOARD) += stm32/c5_levelboard.c
 src-$(CONFIG_MACH_STM32F0) += stm32/stm32f0.c ../lib/stm32f0/system_stm32f0xx.c
 src-$(CONFIG_MACH_STM32F1) += stm32/stm32f1.c ../lib/stm32f1/system_stm32f1xx.c
 src-$(CONFIG_MACH_STM32F2) += stm32/stm32f4.c ../lib/stm32f2/system_stm32f2xx.c
@@ -55,6 +60,7 @@ timer-src-$(CONFIG_MACH_STM32G0) := generic/timer_irq.c stm32/stm32f0_timer.c
 gpio-src-y := stm32/gpio.c stm32/gpioperiph.c
 gpio-src-$(CONFIG_MACH_STM32F1) := stm32/gpio.c
 gpio-src-$(CONFIG_MACH_STM32H7) := stm32/stm32h7_gpio.c stm32/gpioperiph.c
+gpio-src-$(CONFIG_MACH_N32G430F8S7) := stm32/gpio.c stm32/n32g430_gpio.c
 src-y += $(timer-src-y) $(gpio-src-y)
 adc-src-y := stm32/adc.c
 adc-src-$(CONFIG_MACH_STM32F0) := stm32/stm32f0_adc.c
@@ -106,6 +112,12 @@ flash: $(OUT)klipper.bin lib/hidflash/hid-flash
 	@echo "  Flashing $< to $(FLASH_DEVICE)"
 	$(Q)$(PYTHON) ./scripts/flash_usb.py -t $(CONFIG_MCU) -d "$(FLASH_DEVICE)" -s "$(CONFIG_FLASH_APPLICATION_ADDRESS)" $(if $(NOSUDO),--no-sudo) $(OUT)klipper.bin
 
+ifeq ($(CONFIG_MACH_N32G430F8S7),y)
+serialflash:
+	@echo "serialflash is unsupported for N32G430F8S7; preserve the reserved lower flash" >&2
+	@false
+else
 serialflash: $(OUT)klipper.bin
 	@echo "  Flashing $< to $(FLASH_DEVICE) via stm32flash"
 	$(Q)stm32flash -w $< -v -g 0 $(FLASH_DEVICE)
+endif

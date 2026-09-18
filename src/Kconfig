@@ -52,10 +52,17 @@ config SERIAL
 config SERIAL_BAUD
     depends on SERIAL
     int "Baud rate for serial port" if LOW_LEVEL_OPTIONS
+    default 230400 if C5_LEVELBOARD
     default 250000
     help
         Specify the baud rate of the serial port. This should be set
         to 250000. Read the FAQ before changing this value.
+config SERIAL_RX_BUFFER_SIZE
+    int
+    depends on SERIAL
+    default 384 if C5_LEVELBOARD
+    default 192
+
 
 # Generic configuration options for USB
 config USBSERIAL

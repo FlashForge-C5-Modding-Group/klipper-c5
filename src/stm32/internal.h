@@ -4,7 +4,9 @@
 
 #include "autoconf.h" // CONFIG_MACH_STM32F1
 
-#if CONFIG_MACH_STM32F0
+#if CONFIG_MACH_N32G430F8S7
+#include "n32g430.h"
+#elif CONFIG_MACH_STM32F0
 #include "stm32f0xx.h"
 #elif CONFIG_MACH_STM32F1
 #include "stm32f1xx.h"
@@ -35,6 +37,7 @@ GPIO_TypeDef *gpio_pin_to_regs(uint32_t pin);
 #define GPIO_OUTPUT 1
 #define GPIO_OPEN_DRAIN 0x100
 #define GPIO_HIGH_SPEED 0x200
+#define GPIO_DRIVE_4MA 0x400 // N32G430; ignored by existing GPIO backends
 #define GPIO_FUNCTION(fn) (2 | ((fn) << 4))
 #define GPIO_ANALOG 3
 void gpio_peripheral(uint32_t gpio, uint32_t mode, int pullup);
