@@ -3,7 +3,9 @@
 """Build and validate a Creator 5 Pro levelBoard firmware update."""
 
 import argparse
+import bz2
 import hashlib
+import lzma
 import json
 import logging
 import os
@@ -22,6 +24,12 @@ APP_END = 0x08010000
 RAM_START = 0x20000000
 RAM_END = 0x20004000
 NORMALIZATION = "application-48k-ff-fill-v1"
+MAX_LAYER_BYTES = 256 * 1024 * 1024
+MAX_TOTAL_EXPANDED = 512 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 10000
+MAX_ARCHIVE_DEPTH = 8
+_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz",
+                     ".tar.bz2", ".tbz", ".tbz2", ".gz", ".xz", ".bz2")
 SEED_CONFIG = (
     "CONFIG_MACH_STM32=y\n"
     "CONFIG_MACH_N32G430F8S7=y\n"
@@ -826,6 +834,686 @@ def build_firmware(output_dir, jobs=1, cross_prefix="arm-none-eabi-",
     }
 
 
+class _ArchiveBudget:
+    def __init__(self):
+        self.expanded_bytes = 0
+        self.members = 0
+
+    def charge(self, size, context):
+        if size < 0 or self.expanded_bytes + size > MAX_TOTAL_EXPANDED:
+            raise ToolError("cumulative archive expansion limit exceeded while "
+                            "reading %s" % context)
+        self.expanded_bytes += size
+
+    def member(self, label):
+        self.members += 1
+        if self.members > MAX_ARCHIVE_MEMBERS:
+            raise ToolError("archive member limit exceeded in %s" % label)
+
+
+def _tar_number(raw, field, label):
+    value = raw.rstrip(b"\0 ").lstrip(b" ")
+    if not value:
+        return 0
+    if any(byte < ord("0") or byte > ord("7") for byte in value):
+        raise ToolError("%s has an invalid tar %s field" % (label, field))
+    return int(value, 8)
+
+
+def _tar_checksum_valid(header, label=None):
+    try:
+        stored = _tar_number(header[148:156], "checksum", label or "tar header")
+    except ToolError:
+        return False
+    unsigned = sum(header[:148]) + 8 * ord(" ") + sum(header[156:])
+    signed = sum(byte if byte < 128 else byte - 256 for byte in header[:148])
+    signed += 8 * ord(" ")
+    signed += sum(byte if byte < 128 else byte - 256 for byte in header[156:])
+    return stored in (unsigned, signed)
+
+
+def _tar_magic(data):
+    return (len(data) >= 512 and
+            data[257:263] in (b"ustar\0", b"ustar "))
+
+
+def _decode_tar_field(raw, field, label):
+    nul = raw.find(b"\0")
+    if nul >= 0:
+        if any(raw[nul + 1:]):
+            raise ToolError("%s has an embedded NUL in tar %s" % (label, field))
+        raw = raw[:nul]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ToolError("%s has a non-UTF-8 tar %s" % (label, field))
+
+
+def _has_drive_prefixed_component(parts):
+    return any(re.match(r"^[A-Za-z]:", part)
+               for part in parts if part not in ("", ".", ".."))
+
+
+def _canonical_member_path(name, label):
+    if not name:
+        raise ToolError("%s has an empty archive member path" % label)
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ToolError("%s member path contains a control character: %r" %
+                        (label, name))
+    if "\\" in name:
+        raise ToolError("%s member path contains a backslash: %s" %
+                        (label, name))
+    if name.startswith("/"):
+        raise ToolError("%s member path is absolute: %s" % (label, name))
+    raw_parts = name.split("/")
+    if _has_drive_prefixed_component(raw_parts):
+        raise ToolError("%s member path has a Windows drive prefix: %s" %
+                        (label, name))
+    parts = []
+    for part in raw_parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ToolError("%s member path contains traversal: %s" %
+                            (label, name))
+        parts.append(part)
+    return "/".join(parts) if parts else "."
+
+
+def _link_target_parts(member_path, target, is_hardlink, label):
+    kind = "hardlink" if is_hardlink else "symlink"
+    if not target:
+        raise ToolError("%s has an empty %s target for %s" %
+                        (label, kind, member_path))
+    if any(ord(char) < 32 or ord(char) == 127 for char in target):
+        raise ToolError("%s %s target contains a control character: %s" %
+                        (label, kind, member_path))
+    if "\\" in target:
+        raise ToolError("%s %s target contains a backslash: %s" %
+                        (label, kind, member_path))
+    if target.startswith("/"):
+        raise ToolError("%s %s target is absolute: %s" %
+                        (label, kind, member_path))
+    parts = target.split("/")
+    if _has_drive_prefixed_component(parts):
+        raise ToolError("%s %s target has a drive prefix: %s" %
+                        (label, kind, member_path))
+    return parts
+
+
+def _resolve_archive_path(member_path, target_parts, is_hardlink,
+                          symlinks, label):
+    kind = "hardlink" if is_hardlink else "symlink"
+    resolved = [] if is_hardlink else member_path.split("/")[:-1]
+    active = set() if is_hardlink else {member_path}
+    frames = [[target_parts, 0, None]]
+    traversals = 0
+    while frames:
+        components, index, owner = frames[-1]
+        if index == len(components):
+            frames.pop()
+            if owner is not None:
+                active.remove(owner)
+            continue
+        part = components[index]
+        frames[-1][1] += 1
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                raise ToolError("%s %s target escapes archive root: %s" %
+                                (label, kind, member_path))
+            resolved.pop()
+            continue
+        candidate = "/".join(resolved + [part])
+        linked_parts = symlinks.get(candidate)
+        if linked_parts is None:
+            resolved.append(part)
+            continue
+        if candidate in active:
+            raise ToolError("%s has a symlink cycle involving %s" %
+                            (label, member_path))
+        traversals += 1
+        if traversals > MAX_ARCHIVE_MEMBERS:
+            raise ToolError("%s symlink traversal limit exceeded while "
+                            "resolving %s" % (label, member_path))
+        active.add(candidate)
+        frames.append([linked_parts, 0, candidate])
+    return "/".join(resolved) if resolved else "."
+
+
+def _validate_tar_relationships(members, label):
+    by_path = {}
+    for member in members:
+        path = member["canonical_path"]
+        if path in by_path:
+            raise ToolError("%s has a conflicting duplicate path: %s" %
+                            (label, path))
+        by_path[path] = member
+        if path == "." and member["type"] != "directory":
+            raise ToolError("%s archive root member is not a directory" %
+                            label)
+
+    for member in members:
+        path = member["canonical_path"]
+        if path == ".":
+            continue
+        components = path.split("/")
+        for count in range(1, len(components)):
+            ancestor = "/".join(components[:count])
+            parent = by_path.get(ancestor)
+            if parent is None:
+                continue
+            if parent["type"] == "symlink":
+                raise ToolError("%s member %s is under symlink ancestor %s" %
+                                (label, path, ancestor))
+            if parent["type"] != "directory":
+                raise ToolError(
+                    "%s member %s has non-directory file parent %s" %
+                    (label, path, ancestor))
+
+    symlinks = {}
+    hardlink_parts = {}
+    for member in members:
+        kind = member["type"]
+        if kind not in ("symlink", "hardlink"):
+            continue
+        is_hardlink = kind == "hardlink"
+        parts = _link_target_parts(
+            member["canonical_path"], member["link_target"],
+            is_hardlink, label)
+        if is_hardlink:
+            hardlink_parts[member["canonical_path"]] = parts
+        else:
+            symlinks[member["canonical_path"]] = parts
+
+    for origin, parts in symlinks.items():
+        by_path[origin]["_resolved_target"] = _resolve_archive_path(
+            origin, parts, False, symlinks, label)
+
+    hardlinks = {}
+    for origin, parts in hardlink_parts.items():
+        resolved = _resolve_archive_path(
+            origin, parts, True, symlinks, label)
+        by_path[origin]["_resolved_target"] = resolved
+        hardlinks[origin] = resolved
+
+    for origin in hardlinks:
+        seen = set()
+        current = origin
+        while current in hardlinks:
+            if current in seen:
+                raise ToolError("%s has a hardlink cycle involving %s" %
+                                (label, origin))
+            seen.add(current)
+            current = hardlinks[current]
+        target = by_path.get(current)
+        if target is None:
+            raise ToolError("%s has a dangling hardlink %s -> %s" %
+                            (label, origin, current))
+        if target["type"] != "file":
+            raise ToolError(
+                "%s hardlink %s does not resolve to a regular file" %
+                (label, origin))
+        by_path[origin]["_hardlink_source"] = current
+
+
+def _parse_tar(data, label, budget, depth, decrypt, openssl):
+    members = []
+    offset = 0
+    header_number = 0
+    while True:
+        if offset + 512 > len(data):
+            raise ToolError(
+                "%s tar is truncated before its end marker" % label)
+        header = data[offset:offset + 512]
+        if header == b"\0" * 512:
+            if offset + 1024 > len(data):
+                raise ToolError("%s tar is truncated in its end marker" % label)
+            if data[offset + 512:offset + 1024] != b"\0" * 512:
+                raise ToolError("%s tar has only one zero end block" % label)
+            if any(data[offset + 1024:]):
+                raise ToolError(
+                    "%s tar has trailing nonpadding garbage" % label)
+            break
+        header_number += 1
+        header_label = "%s tar header %d" % (label, header_number)
+        if header[257:263] not in (b"ustar\0", b"ustar "):
+            raise ToolError("%s has unsupported or missing tar magic" %
+                            header_label)
+        if not _tar_checksum_valid(header, header_label):
+            raise ToolError("%s checksum mismatch" % header_label)
+        name = _decode_tar_field(header[:100], "name", header_label)
+        prefix = _decode_tar_field(header[345:500], "prefix", header_label)
+        if prefix:
+            name = prefix + "/" + name
+        canonical = _canonical_member_path(name, label)
+        size = _tar_number(header[124:136], "size", header_label)
+        mode = _tar_number(header[100:108], "mode", header_label)
+        uid = _tar_number(header[108:116], "uid", header_label)
+        gid = _tar_number(header[116:124], "gid", header_label)
+        mtime = _tar_number(header[136:148], "mtime", header_label)
+        linkname = _decode_tar_field(header[157:257], "link name", header_label)
+        uname = _decode_tar_field(header[265:297], "user name", header_label)
+        gname = _decode_tar_field(header[297:329], "group name", header_label)
+        kind_byte = header[156:157]
+        if kind_byte in (b"", b"\0", b"0"):
+            kind = "file"
+        elif kind_byte == b"5":
+            kind = "directory"
+        elif kind_byte == b"2":
+            kind = "symlink"
+        elif kind_byte == b"1":
+            kind = "hardlink"
+        elif kind_byte == b"S":
+            raise ToolError("%s contains sparse member %s" % (label, name))
+        elif kind_byte in (b"3", b"4"):
+            raise ToolError("%s contains device member %s" % (label, name))
+        elif kind_byte == b"6":
+            raise ToolError("%s contains FIFO member %s" % (label, name))
+        else:
+            raise ToolError("%s contains unrecognized special member %s "
+                            "(type %r)" % (label, name, kind_byte))
+        if kind != "file" and size:
+            raise ToolError("%s non-file member %s has a nonzero size" %
+                            (label, name))
+        content_start = offset + 512
+        padded_size = (size + 511) & ~511
+        content_end = content_start + size
+        next_offset = content_start + padded_size
+        if (content_end < content_start or next_offset < content_start or
+                next_offset > len(data)):
+            raise ToolError("%s tar member %s is truncated" % (label, name))
+        budget.member(label)
+        budget.charge(size, "member %s" % name)
+        content = data[content_start:content_end]
+        link_target = linkname if kind in ("symlink", "hardlink") else None
+        digest = None
+        if kind == "file":
+            digest = hashlib.sha256(content).hexdigest()
+        elif link_target is not None:
+            digest = hashlib.sha256(link_target.encode("utf-8")).hexdigest()
+        member = {
+            "path": name,
+            "canonical_path": canonical,
+            "type": kind,
+            "size": size,
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "uname": uname,
+            "gname": gname,
+            "mtime": mtime,
+            "link_target": link_target,
+            "sha256": digest,
+            "leading_dot_slash": name.startswith("./"),
+            "unsafe": False,
+            "_data": content if kind == "file" else None,
+        }
+        members.append(member)
+        offset = next_offset
+
+    _validate_tar_relationships(members, label)
+    for member in members:
+        if member["type"] != "file":
+            continue
+        content = member["_data"]
+        nested_format = _detect_archive_format(content)
+        advertised = member["path"].lower().endswith(_ARCHIVE_SUFFIXES)
+        if nested_format is not None or advertised:
+            if nested_format is None:
+                raise ToolError("archive member %s advertises an archive but "
+                                "has an unknown or malformed format" %
+                                member["path"])
+            try:
+                member["nested"] = _inspect_layer(
+                    content, member["path"], budget, depth + 1,
+                    decrypt, openssl)
+            except ToolError as exc:
+                raise ToolError("archive member %s: %s" %
+                                (member["path"], exc), exc.exit_code)
+    return {
+        "format": "tar",
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "members": members,
+    }
+
+
+def _detect_archive_format(data):
+    if data.startswith(b"Salted__"):
+        return "encrypted"
+    if data.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if data.startswith(b"\xfd7zXZ\x00"):
+        return "xz"
+    if data.startswith(b"BZh"):
+        return "bzip2"
+    if _tar_magic(data) or (len(data) >= 1024 and not any(data)):
+        return "tar"
+    return None
+
+
+def _append_decompressed(output, chunk, label, budget):
+    if len(output) + len(chunk) > MAX_LAYER_BYTES:
+        raise ToolError("%s decompressed layer limit exceeded" % label)
+    budget.charge(len(chunk), "%s decompressed layer" % label)
+    output.extend(chunk)
+
+
+def _decompress_layer(data, kind, label, budget):
+    output = bytearray()
+    magic = {"gzip": b"\x1f\x8b", "xz": b"\xfd7zXZ\x00",
+             "bzip2": b"BZh"}[kind]
+    remaining = data
+    stream_number = 0
+    try:
+        while remaining:
+            if kind == "xz" and stream_number:
+                padding = 0
+                while (padding < len(remaining) and
+                       remaining[padding] == 0):
+                    padding += 1
+                if padding % 4:
+                    raise ToolError("%s xz stream padding length is not a "
+                                    "multiple of four" % label)
+                remaining = remaining[padding:]
+                if not remaining:
+                    break
+            if not remaining.startswith(magic):
+                raise ToolError("%s %s stream has trailing nonpadding "
+                                "garbage" % (label, kind))
+            position = 0
+            if kind == "gzip":
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                pending = b""
+                while not decompressor.eof:
+                    if not pending:
+                        if position >= len(remaining):
+                            raise ToolError("%s %s stream is truncated" %
+                                            (label, kind))
+                        pending = remaining[position:position + 65536]
+                        position += len(pending)
+                    chunk = decompressor.decompress(pending, 65536)
+                    pending = decompressor.unconsumed_tail
+                    _append_decompressed(output, chunk, label, budget)
+                remaining = decompressor.unused_data + remaining[position:]
+            else:
+                if kind == "xz":
+                    decompressor = lzma.LZMADecompressor(
+                        format=lzma.FORMAT_XZ, memlimit=MAX_LAYER_BYTES)
+                else:
+                    decompressor = bz2.BZ2Decompressor()
+                while not decompressor.eof:
+                    if decompressor.needs_input:
+                        if position >= len(remaining):
+                            raise ToolError("%s %s stream is truncated" %
+                                            (label, kind))
+                        compressed = remaining[position:position + 65536]
+                        position += len(compressed)
+                    else:
+                        compressed = b""
+                    chunk = decompressor.decompress(compressed,
+                                                    max_length=65536)
+                    _append_decompressed(output, chunk, label, budget)
+                remaining = decompressor.unused_data + remaining[position:]
+            stream_number += 1
+    except ToolError:
+        raise
+    except (EOFError, OSError, ValueError, zlib.error,
+            lzma.LZMAError) as exc:
+        raise ToolError("%s %s stream is truncated or malformed: %s" %
+                        (label, kind, sanitize_diagnostic(exc)))
+    return bytes(output)
+
+def _openssl_algorithm_unavailable(stderr):
+    lowered = stderr.lower()
+    indicators = ("unsupported", "unknown cipher", "error setting cipher",
+                  "initialization error", "digital envelope routines")
+    return any(indicator in lowered for indicator in indicators)
+
+
+def _openssl_once(data, decrypt, openssl, secret, providers):
+    command = [openssl, "enc", "-des-ede3-cbc"]
+    if decrypt:
+        command.append("-d")
+    command.extend(["-salt", "-md", "md5", "-pass",
+                    "env:C5_UPDATE_PASSPHRASE"])
+    command.extend(providers)
+    environment = os.environ.copy()
+    environment["C5_UPDATE_PASSPHRASE"] = secret
+    try:
+        result = subprocess.run(command, input=data, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=environment,
+                                check=False)
+    except (FileNotFoundError, PermissionError):
+        raise ToolError("OpenSSL executable is unavailable", 3)
+    return result
+
+
+def _openssl_provider_args(openssl, secret):
+    probe = b"Creator 5 update crypto preflight"
+    result = _openssl_once(probe, False, openssl, secret, ())
+    providers = ()
+    if result.returncode:
+        diagnostic = result.stderr.decode("utf-8", "replace")
+        if not _openssl_algorithm_unavailable(diagnostic):
+            raise ToolError("OpenSSL crypto preflight failed: %s" %
+                            sanitize_diagnostic(diagnostic, secret), 3)
+        providers = ("-provider", "default", "-provider", "legacy")
+        result = _openssl_once(probe, False, openssl, secret, providers)
+        if result.returncode:
+            diagnostic = result.stderr.decode("utf-8", "replace")
+            raise ToolError("OpenSSL DES-EDE3-CBC is unavailable: %s" %
+                            sanitize_diagnostic(diagnostic, secret), 3)
+    encrypted = result.stdout
+    if (not encrypted.startswith(b"Salted__") or len(encrypted) < 24 or
+            (len(encrypted) - 16) % 8):
+        raise ToolError("OpenSSL crypto preflight returned invalid ciphertext",
+                        3)
+    checked = _openssl_once(encrypted, True, openssl, secret, providers)
+    if checked.returncode or checked.stdout != probe:
+        diagnostic = checked.stderr.decode("utf-8", "replace")
+        raise ToolError("OpenSSL crypto preflight roundtrip failed: %s" %
+                        sanitize_diagnostic(diagnostic, secret), 3)
+    return providers
+
+
+def openssl_crypt(data, decrypt, openssl="openssl", secret=None):
+    if secret is None:
+        secret = os.environ.get("C5_UPDATE_PASSPHRASE")
+    if not secret:
+        raise ToolError("C5_UPDATE_PASSPHRASE must be nonempty for crypto")
+    if not isinstance(data, bytes):
+        data = bytes(data)
+    if decrypt and (not data.startswith(b"Salted__") or len(data) < 24 or
+                    (len(data) - 16) % 8):
+        raise ToolError("encrypted input has an invalid Salted__ header, salt, "
+                        "or ciphertext length")
+    providers = _openssl_provider_args(openssl, secret)
+    result = _openssl_once(data, decrypt, openssl, secret, providers)
+    if result.returncode:
+        operation = "decryption" if decrypt else "encryption"
+        diagnostic = result.stderr.decode("utf-8", "replace")
+        raise ToolError("OpenSSL %s failed: %s" %
+                        (operation, sanitize_diagnostic(diagnostic, secret)), 3)
+    output = result.stdout
+    if not decrypt and (not output.startswith(b"Salted__") or
+                        len(output) < 24 or (len(output) - 16) % 8):
+        raise ToolError("OpenSSL encryption returned invalid ciphertext", 3)
+    return output
+
+
+def _inspect_layer(data, label, budget, depth, decrypt, openssl):
+    if depth > MAX_ARCHIVE_DEPTH:
+        raise ToolError("archive nesting depth limit exceeded at %s" % label)
+    if len(data) > MAX_LAYER_BYTES:
+        raise ToolError("%s input layer limit exceeded" % label)
+    kind = _detect_archive_format(data)
+    if kind is None:
+        raise ToolError("unknown top-level archive format for %s" % label)
+    if kind == "tar":
+        return _parse_tar(data, label, budget, depth, decrypt, openssl)
+    if kind == "encrypted":
+        if not decrypt:
+            raise ToolError("%s is encrypted; use --decrypt to inspect it" %
+                            label)
+        if len(data) >= 24 and not (len(data) - 16) % 8:
+            maximum_plaintext = len(data) - 17
+            remaining_budget = MAX_TOTAL_EXPANDED - budget.expanded_bytes
+            if maximum_plaintext > remaining_budget:
+                raise ToolError(
+                    "cumulative archive expansion limit exceeded before "
+                    "decrypting %s" % label)
+        plain = openssl_crypt(data, True, openssl)
+        if len(plain) > MAX_LAYER_BYTES:
+            raise ToolError("%s decrypted layer limit exceeded" % label)
+        budget.charge(len(plain), "%s decrypted layer" % label)
+        payload = _inspect_layer(plain, "%s decrypted payload" % label,
+                                 budget, depth + 1, decrypt, openssl)
+        return {
+            "format": "encrypted",
+            "cipher": "des-ede3-cbc",
+            "digest": "md5",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "payload": payload,
+            "_payload": plain,
+        }
+    plain = _decompress_layer(data, kind, label, budget)
+    payload = _inspect_layer(plain, "%s %s payload" % (label, kind),
+                             budget, depth + 1, decrypt, openssl)
+    return {
+        "format": kind,
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "expanded_size": len(plain),
+        "payload": payload,
+        "_payload": plain,
+    }
+
+
+def _sanitized_archive_tree(value):
+    if isinstance(value, dict):
+        return {key: _sanitized_archive_tree(item)
+                for key, item in value.items() if not key.startswith("_")}
+    if isinstance(value, list):
+        return [_sanitized_archive_tree(item) for item in value]
+    return value
+
+
+def _tar_payload_model(model):
+    current = model
+    while current["format"] != "tar":
+        current = current["payload"]
+    return current
+
+
+def _temporary_extract(model):
+    tar_model = _tar_payload_model(model)
+    members = tar_model["members"]
+    root_members = sorted(
+        (member for member in members if member["type"] == "directory"),
+        key=lambda member: member["canonical_path"].count("/"))
+    files = [member for member in members if member["type"] == "file"]
+    links = [member for member in members
+             if member["type"] in ("symlink", "hardlink")]
+    with tempfile.TemporaryDirectory(prefix="c5-update-inspect-") as temp:
+        root = Path(temp).resolve()
+
+        def destination(member):
+            canonical = member["canonical_path"]
+            path = root if canonical == "." else root.joinpath(
+                *canonical.split("/"))
+            resolved = path.resolve(strict=False)
+            if resolved != root and not _inside(resolved, root):
+                raise ToolError(
+                    "temporary extraction containment check failed")
+            return path
+
+        try:
+            for member in root_members:
+                destination(member).mkdir(parents=True, exist_ok=True)
+            for member in files:
+                path = destination(member)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("xb") as output:
+                    output.write(member["_data"])
+                path.chmod(member["mode"] & 0o777)
+            for member in links:
+                path = destination(member)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if member["type"] == "hardlink":
+                    source = root.joinpath(
+                        *member["_hardlink_source"].split("/"))
+                    os.link(source, path)
+                else:
+                    canonical_target = member["_resolved_target"]
+                    target = (root if canonical_target == "." else
+                              root.joinpath(*canonical_target.split("/")))
+                    resolved_target = target.resolve(strict=False)
+                    if (resolved_target != root and
+                            not _inside(resolved_target, root)):
+                        raise ToolError(
+                            "temporary extraction link containment check "
+                            "failed")
+                    os.symlink(member["link_target"], path)
+            for member in reversed(root_members):
+                path = destination(member)
+                if path != root:
+                    path.chmod(member["mode"] & 0o777)
+        except ToolError:
+            raise
+        except OSError as exc:
+            raise ToolError("temporary extraction validation failed: %s" %
+                            sanitize_diagnostic(exc))
+
+
+def inspect_archive(data, decrypt=False, extract_temp=False,
+                    openssl="openssl"):
+    if not isinstance(data, bytes):
+        try:
+            input_size = len(data)
+        except (TypeError, ValueError):
+            raise ToolError("archive input must be bytes")
+        if input_size > MAX_LAYER_BYTES:
+            raise ToolError("archive input layer limit exceeded")
+        try:
+            data = bytes(data)
+        except (TypeError, ValueError):
+            raise ToolError("archive input must be bytes")
+    if len(data) > MAX_LAYER_BYTES:
+        raise ToolError("archive input layer limit exceeded")
+    budget = _ArchiveBudget()
+    budget.charge(len(data), "archive input")
+    model = _inspect_layer(data, "input archive", budget, 0,
+                           decrypt, openssl)
+    if extract_temp:
+        _temporary_extract(model)
+    report = _sanitized_archive_tree(model)
+    if extract_temp:
+        report["extraction_validated"] = True
+    report["resource_usage"] = {
+        "expanded_bytes": budget.expanded_bytes,
+        "members": budget.members,
+        "maximum_depth": MAX_ARCHIVE_DEPTH,
+    }
+    return report
+
+
+def _read_archive_input(path):
+    chunks = []
+    total = 0
+    with Path(path).open("rb") as source:
+        while True:
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_LAYER_BYTES:
+                raise ToolError("archive input layer limit exceeded")
+            chunks.append(chunk)
+    return b"".join(chunks)
 def _add_global(parser):
     parser.add_argument(
     "--cross-prefix",
@@ -893,6 +1581,11 @@ def main(argv=None):
         args.dictionary,
         args.cross_prefix,
          args.openssl))
+        elif args.command == "inspect":
+            archive_data = _read_archive_input(args.input)
+            _json_print(inspect_archive(
+                archive_data, decrypt=args.decrypt,
+                extract_temp=args.extract_temp, openssl=args.openssl))
         else:
             raise ToolError("%s stage is not implemented yet" % args.command)
         return 0

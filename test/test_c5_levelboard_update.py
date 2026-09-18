@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
+import bz2
+import gzip
+import lzma
+import tarfile
+from unittest import mock
 import contextlib
 import hashlib
 import importlib.util
@@ -67,6 +72,38 @@ def ihex(records=(), sp=0x20004000, reset=APP_START + 9, eof=True):
     if eof:
         data += record(1)
     return data
+def tar_bytes(entries):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w",
+                      format=tarfile.GNU_FORMAT) as archive:
+        for entry in entries:
+            info = tarfile.TarInfo(entry[0])
+            data = entry[1] if len(entry) > 1 else b""
+            kind = entry[2] if len(entry) > 2 else tarfile.REGTYPE
+            linkname = entry[3] if len(entry) > 3 else ""
+            info.type = kind
+            info.linkname = linkname
+            info.mode = (entry[4] if len(entry) > 4 else
+                         (0o755 if kind == tarfile.DIRTYPE else 0o664))
+            info.uid = 12
+            info.gid = 34
+            info.uname = "fixture-user"
+            info.gname = "fixture-group"
+            info.mtime = 123456789
+            info.size = (len(data) if kind in
+                         (tarfile.REGTYPE, tarfile.AREGTYPE) else 0)
+            archive.addfile(info, io.BytesIO(data) if info.size else None)
+    return output.getvalue()
+
+
+def corrupt_tar_name(value, replacement):
+    damaged = bytearray(value)
+    damaged[:100] = b"\0" * 100
+    damaged[:len(replacement)] = replacement
+    damaged[148:156] = b"        "
+    checksum = sum(damaged[:512])
+    damaged[148:156] = ("%06o\0 " % checksum).encode("ascii")
+    return bytes(damaged)
 
 
 class IntelHexTests(unittest.TestCase):
@@ -636,5 +673,339 @@ class RealFirmwareTests(unittest.TestCase):
                                    "arm-none-eabi-", "openssl")
 
 
+class ArchiveInspectionTests(unittest.TestCase):
+    def inspect(self, value, **kwargs):
+        return TOOL.inspect_archive(value, **kwargs)
+
+    def assert_rejected(self, value, *words, **kwargs):
+        with self.assertRaises(TOOL.ToolError) as raised:
+            self.inspect(value, **kwargs)
+        text = str(raised.exception).lower()
+        for word in words:
+            self.assertIn(word.lower(), text)
+
+    def test_reports_sanitized_metadata_and_recurses_by_magic(self):
+        inner = tar_bytes([("./payload", b"nested")])
+        outer = tar_bytes([
+            ("./plain", b"opaque"),
+            ("./gzip.bin", gzip.compress(inner)),
+            ("./xz.bin", lzma.compress(inner)),
+            ("./bzip.bin", bz2.compress(inner)),
+        ])
+        report = self.inspect(outer)
+        self.assertEqual(report["format"], "tar")
+        self.assertEqual(report["sha256"], hashlib.sha256(outer).hexdigest())
+        plain = report["members"][0]
+        self.assertEqual(plain, {
+            "path": "./plain", "canonical_path": "plain",
+            "type": "file", "size": 6, "mode": 0o664,
+            "uid": 12, "gid": 34, "uname": "fixture-user",
+            "gname": "fixture-group", "mtime": 123456789,
+            "link_target": None,
+            "sha256": hashlib.sha256(b"opaque").hexdigest(),
+            "leading_dot_slash": True, "unsafe": False,
+        })
+        for member, wrapper in zip(report["members"][1:],
+                                   ("gzip", "xz", "bzip2")):
+            self.assertEqual(member["nested"]["format"], wrapper)
+            self.assertEqual(member["nested"]["payload"]["format"], "tar")
+            self.assertEqual(member["nested"]["payload"]["members"][0]["path"],
+                             "./payload")
+        self.assertNotIn("data", json.dumps(report))
+
+    def test_accepts_normal_dot_roots_and_safe_relative_links(self):
+        value = tar_bytes([
+            ("./", b"", tarfile.DIRTYPE),
+            ("./dir/", b"", tarfile.DIRTYPE),
+            ("./dir/data", b"value"),
+            ("./dir/alias", b"", tarfile.SYMTYPE, "data"),
+            ("./hard", b"", tarfile.LNKTYPE, "./dir/data"),
+        ])
+        report = self.inspect(value)
+        types = {member["canonical_path"]: member["type"]
+                 for member in report["members"]}
+        self.assertEqual(types, {".": "directory", "dir": "directory",
+                                 "dir/data": "file", "dir/alias": "symlink",
+                                 "hard": "hardlink"})
+        links = [entry for entry in report["members"] if entry["link_target"]]
+        self.assertEqual([entry["unsafe"] for entry in links], [False, False])
+
+    def test_accepts_finite_repeated_symlink_traversal(self):
+        value = tar_bytes([
+            ("a", b"", tarfile.SYMTYPE, "."),
+            ("b", b"", tarfile.SYMTYPE, "a/a"),
+        ])
+        report = self.inspect(value)
+        self.assertEqual([member["canonical_path"]
+                          for member in report["members"]], ["a", "b"])
+
+    def test_rejects_unsafe_member_paths_before_extraction(self):
+        cases = (
+            ("/absolute", "absolute"),
+            ("../escape", "traversal"),
+            ("safe/../../escape", "traversal"),
+            ("C:/drive", "drive"),
+            ("./C:/drive", "drive"),
+            ("back\\slash", "backslash"),
+        )
+        for name, expected in cases:
+            with self.subTest(name=name):
+                self.assert_rejected(tar_bytes([(name, b"x")]), expected, name)
+        control = corrupt_tar_name(tar_bytes([("good", b"x")]), b"bad\nname")
+        self.assert_rejected(control, "control", "bad")
+        embedded_nul = corrupt_tar_name(
+            tar_bytes([("good", b"x")]), b"bad\0hidden")
+        self.assert_rejected(embedded_nul, "nul", "name")
+
+    def test_rejects_escaping_links_cycles_and_symlink_ancestor_writes(self):
+        cases = (
+            ([("link", b"", tarfile.SYMTYPE, "/outside")],
+             ("symlink", "absolute")),
+            ([("hard", b"", tarfile.LNKTYPE, "/outside")],
+             ("hardlink", "absolute")),
+            ([("link", b"", tarfile.SYMTYPE, "C:/outside")],
+             ("symlink", "drive")),
+            ([("dir/link", b"", tarfile.SYMTYPE, "../../outside")],
+             ("symlink", "escape")),
+            ([("d", b"", tarfile.DIRTYPE),
+              ("d/root", b"", tarfile.SYMTYPE, ".."),
+              ("d/escape", b"", tarfile.SYMTYPE, "root/..")],
+             ("symlink", "escape")),
+            ([("link", b"", tarfile.SYMTYPE, "./C:/outside")],
+             ("symlink", "drive")),
+            ([("hard", b"", tarfile.LNKTYPE, "../outside")],
+             ("hardlink", "escape")),
+            ([("hard", b"", tarfile.LNKTYPE, "missing")],
+             ("hardlink", "dangling")),
+            ([("a", b"", tarfile.SYMTYPE, "b"),
+              ("b", b"", tarfile.SYMTYPE, "a")],
+             ("symlink", "cycle")),
+            ([("a", b"", tarfile.SYMTYPE, "b/c"),
+              ("b", b"", tarfile.SYMTYPE, "a")],
+             ("symlink", "cycle")),
+            ([("a", b"", tarfile.LNKTYPE, "b"),
+              ("b", b"", tarfile.LNKTYPE, "a")],
+             ("hardlink", "cycle")),
+            ([("target", b"", tarfile.DIRTYPE),
+              ("link", b"", tarfile.SYMTYPE, "target"),
+              ("link/file", b"x")],
+             ("symlink", "ancestor")),
+        )
+        for entries, words in cases:
+            with self.subTest(words=words):
+                self.assert_rejected(tar_bytes(entries), *words)
+
+    def test_rejects_special_members_duplicates_and_file_parents(self):
+        specials = ((tarfile.CHRTYPE, "device"),
+                    (tarfile.BLKTYPE, "device"),
+                    (tarfile.FIFOTYPE, "fifo"),
+                    (tarfile.GNUTYPE_SPARSE, "sparse"),
+                    (b"Z", "unrecognized"),
+                    (b"s", "unrecognized"))
+        for kind, expected in specials:
+            with self.subTest(kind=kind):
+                self.assert_rejected(tar_bytes([("special", b"", kind)]),
+                                     expected, "special")
+        self.assert_rejected(
+            tar_bytes([("./same", b"one"), ("same", b"two")]),
+            "duplicate", "same")
+        self.assert_rejected(
+            tar_bytes([("parent", b"file"), ("parent/child", b"x")]),
+            "parent", "file")
+
+    def test_validates_tar_checksum_truncation_and_trailing_bytes(self):
+        value = tar_bytes([("file", b"content")])
+        damaged = bytearray(value)
+        damaged[0] ^= 1
+        self.assert_rejected(bytes(damaged), "checksum", "header")
+        self.assert_rejected(value[:1024], "truncated", "tar")
+        self.assert_rejected(value + b"not-padding", "trailing", "tar")
+
+    def test_claimed_nested_archives_and_unknown_top_level_must_parse(self):
+        self.assert_rejected(tar_bytes([("broken.tar.xz", b"not archive")]),
+                             "broken.tar.xz", "archive")
+        self.assert_rejected(b"PK\x03\x04not-a-supported-package", "unknown",
+                             "format")
+        inner = tar_bytes([("leaf", b"ok")])
+        truncated = (("gzip", gzip.compress(inner)[:-4]),
+                     ("xz", lzma.compress(inner)[:-4]),
+                     ("bzip2", bz2.compress(inner)[:-4]))
+        for kind, value in truncated:
+            with self.subTest(kind=kind):
+                self.assert_rejected(value, "truncated", kind)
+        trailing = (("gzip", gzip.compress(inner) + b"garbage"),
+                    ("xz", lzma.compress(inner) + b"garbage"),
+                    ("bzip2", bz2.compress(inner) + b"garbage"))
+        for kind, value in trailing:
+            with self.subTest(kind=kind):
+                self.assert_rejected(value, "trailing", kind)
+
+    def test_accepts_empty_tar_and_legal_xz_stream_padding(self):
+        empty = b"\0" * 1024
+        report = self.inspect(empty)
+        self.assertEqual(report["format"], "tar")
+        self.assertEqual(report["members"], [])
+
+        inner = tar_bytes([("leaf", b"ok")])
+        split = len(inner) // 2
+        padded = (lzma.compress(inner[:split]) + b"\0" * 4 +
+                  lzma.compress(inner[split:]) + b"\0" * 8)
+        report = self.inspect(padded)
+        self.assertEqual(report["format"], "xz")
+        self.assertEqual(report["payload"]["format"], "tar")
+        self.assertEqual(report["payload"]["members"][0]["path"], "leaf")
+        self.assert_rejected(lzma.compress(inner) + b"\0" * 2,
+                             "xz", "padding")
+
+    def test_xz_decoder_enforces_memory_limit_before_expansion(self):
+        inner = tar_bytes([("leaf", b"ok")])
+        high_memory = lzma.compress(inner, format=lzma.FORMAT_XZ, preset=6)
+        with mock.patch.object(TOOL, "MAX_LAYER_BYTES", 1024 * 1024):
+            self.assert_rejected(high_memory, "xz", "memory", "limit")
+
+    def test_enforces_input_layer_total_member_and_depth_limits(self):
+        value = tar_bytes([("file", b"x" * 2048)])
+        with mock.patch.object(TOOL, "MAX_LAYER_BYTES", 100):
+            self.assert_rejected(value, "input", "limit")
+        compressed = gzip.compress(value)
+        with mock.patch.object(TOOL, "MAX_LAYER_BYTES", 4096):
+            self.assert_rejected(compressed, "decompressed", "limit")
+        with mock.patch.object(TOOL, "MAX_TOTAL_EXPANDED", len(value) + 1024):
+            self.assert_rejected(value, "cumulative", "limit")
+        encrypted = b"Salted__" + b"12345678" + b"x" * 16
+        with mock.patch.object(
+                TOOL, "MAX_TOTAL_EXPANDED", len(encrypted) + 14):
+            with mock.patch.object(TOOL, "openssl_crypt") as crypt:
+                self.assert_rejected(encrypted, "cumulative", "limit",
+                                     decrypt=True)
+                crypt.assert_not_called()
+        members = tar_bytes([("one", b"1"), ("two", b"2"), ("three", b"3")])
+        with mock.patch.object(TOOL, "MAX_ARCHIVE_MEMBERS", 2):
+            self.assert_rejected(members, "member", "limit")
+        nested = tar_bytes([("leaf", b"ok")])
+        for index in range(4):
+            nested = tar_bytes([("layer%d.tar" % index, nested)])
+        with mock.patch.object(TOOL, "MAX_ARCHIVE_DEPTH", 2):
+            self.assert_rejected(nested, "depth", "limit")
+
+    def test_extract_temp_validates_then_removes_private_workspace(self):
+        value = tar_bytes([("./dir/", b"", tarfile.DIRTYPE),
+                           ("./dir/file", b"content"),
+                           ("./hard", b"", tarfile.LNKTYPE, "./dir/file")])
+        report = self.inspect(value, extract_temp=True)
+        self.assertTrue(report["extraction_validated"])
+        self.assertNotIn("extraction_path", report)
+        with tempfile.TemporaryDirectory() as link_probe:
+            probe = Path(link_probe) / "link"
+            try:
+                probe.symlink_to("target")
+            except OSError:
+                pass
+            else:
+                linked = tar_bytes([
+                    ("./target", b"content"),
+                    ("./alias", b"", tarfile.SYMTYPE, "target")])
+                self.inspect(linked, extract_temp=True)
+        with tempfile.TemporaryDirectory() as temp:
+            sentinel = Path(temp) / "sentinel"
+            sentinel.write_text("unchanged")
+            hostile = tar_bytes([("../sentinel", b"changed")])
+            self.assert_rejected(hostile, "traversal", extract_temp=True)
+            self.assertEqual(sentinel.read_text(), "unchanged")
+
+        restrictive = tar_bytes([
+            ("locked", b"", tarfile.DIRTYPE, "", 0o000),
+            ("locked/file", b"content"),
+        ])
+        report = self.inspect(restrictive, extract_temp=True)
+        self.assertTrue(report["extraction_validated"])
+
+    def test_inspect_cli_outputs_json_and_never_exposes_temp_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp) / "fixture.tar"
+            package.write_bytes(tar_bytes([("./payload", b"ok")]))
+            result = subprocess.run(
+                [sys.executable, str(TOOL_PATH), "inspect", "--input",
+                 str(package), "--extract-temp"], cwd=ROOT, text=True,
+                capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["format"], "tar")
+            self.assertTrue(report["extraction_validated"])
+            self.assertNotIn(str(Path(temp).resolve()), result.stdout)
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is required")
+    def test_real_openssl_roundtrip_requires_secret_and_redacts_failures(self):
+        secret = hashlib.sha256(os.urandom(32)).hexdigest()
+        wrong = hashlib.sha256(os.urandom(32)).hexdigest()
+        plain = tar_bytes([("./payload", b"secret-free-content")])
+        with mock.patch.dict(os.environ, {"C5_UPDATE_PASSPHRASE": secret},
+                             clear=False):
+            encrypted = TOOL.openssl_crypt(plain, decrypt=False,
+                                           openssl=shutil.which("openssl"))
+            self.assertTrue(encrypted.startswith(b"Salted__"))
+            decrypted = TOOL.openssl_crypt(
+                encrypted, decrypt=True, openssl=shutil.which("openssl"))
+            self.assertEqual(decrypted, plain)
+            report = self.inspect(encrypted, decrypt=True,
+                                  openssl=shutil.which("openssl"))
+            self.assert_rejected(encrypted, "--decrypt")
+            for malformed in (b"Salted__", b"Salted__12345678bad"):
+                with self.subTest(length=len(malformed)):
+                    with self.assertRaisesRegex(TOOL.ToolError,
+                                                "header|ciphertext|length"):
+                        TOOL.openssl_crypt(
+                            malformed, decrypt=True,
+                            openssl=shutil.which("openssl"))
+            self.assertEqual(report["format"], "encrypted")
+            self.assertEqual(report["payload"]["format"], "tar")
+        with mock.patch.dict(os.environ, {"C5_UPDATE_PASSPHRASE": wrong},
+                             clear=False):
+            with self.assertRaises(TOOL.ToolError) as raised:
+                self.inspect(encrypted, decrypt=True,
+                             openssl=shutil.which("openssl"))
+            self.assertIn(raised.exception.exit_code, (2, 3))
+            self.assertNotIn(secret, str(raised.exception))
+            self.assertNotIn(wrong, str(raised.exception))
+            with tempfile.TemporaryDirectory() as temp:
+                package = Path(temp) / "encrypted.tgz"
+                package.write_bytes(encrypted)
+                environment = os.environ.copy()
+                environment["C5_UPDATE_PASSPHRASE"] = wrong
+                result = subprocess.run(
+                    [sys.executable, str(TOOL_PATH), "--openssl",
+                     shutil.which("openssl"), "inspect", "--input",
+                     str(package), "--decrypt"], cwd=ROOT, text=True,
+                    capture_output=True, env=environment)
+                self.assertIn(result.returncode, (2, 3))
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn(secret, result.stderr)
+                self.assertNotIn(wrong, result.stderr)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assert_rejected(encrypted, "passphrase", decrypt=True,
+                                 openssl=shutil.which("openssl"))
+
+    @unittest.skipUnless(os.environ.get("C5_CANONICAL_TEMPLATE"),
+                         "set C5_CANONICAL_TEMPLATE for canonical inspection")
+    def test_canonical_package_and_embedded_control_are_inspectable(self):
+        package = Path(os.environ["C5_CANONICAL_TEMPLATE"])
+        if not package.is_file():
+            self.skipTest("canonical template is unavailable")
+        openssl = shutil.which("openssl")
+        if not openssl or not os.environ.get("C5_UPDATE_PASSPHRASE"):
+            self.skipTest("canonical OpenSSL/passphrase inputs are unavailable")
+        encrypted = package.read_bytes()
+        report = self.inspect(encrypted, decrypt=True, openssl=openssl)
+        self.assertEqual(report["format"], "encrypted")
+        self.assertEqual(report["payload"]["format"], "tar")
+        plain = TOOL.openssl_crypt(encrypted, decrypt=True, openssl=openssl)
+        with tarfile.open(fileobj=io.BytesIO(plain), mode="r:") as archive:
+            candidates = [member for member in archive.getmembers()
+                          if Path(member.name).name.startswith("control-")]
+            self.assertEqual(len(candidates), 1)
+            control = archive.extractfile(candidates[0]).read()
+        control_report = self.inspect(control)
+        self.assertEqual(control_report["format"], "tar")
+        self.assertEqual(len(control_report["members"]), 10)
 if __name__ == "__main__":
     unittest.main(verbosity=2)
