@@ -87,6 +87,15 @@ gpio_clock_enable(GPIO_TypeDef *regs)
 static void
 clock_setup(void)
 {
+    // Revert to the HSI regardless of the clock state the boot stage
+    // leaves behind; the PLL can not be disabled while it drives SYSCLK.
+    RCC->CR |= RCC_CR_HSION;
+    while (!(RCC->CR & RCC_CR_HSIRDY))
+        ;
+    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW_Msk) | RCC_CFGR_SW_HSI;
+    while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI)
+        ;
+
     // Clock-tree fields may only change while the PLL is disabled.
     RCC->CR &= ~RCC_CR_PLLON;
     while (RCC->CR & RCC_CR_PLLRDY)

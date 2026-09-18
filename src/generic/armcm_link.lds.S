@@ -15,6 +15,10 @@
 OUTPUT_FORMAT("elf32-littlearm", "elf32-littlearm", "elf32-littlearm")
 OUTPUT_ARCH(arm)
 
+#if CONFIG_MACH_N32G430F8S7
+ENTRY(ResetHandler)
+#endif
+
 MEMORY
 {
   rom (rx) : ORIGIN = CONFIG_FLASH_APPLICATION_ADDRESS , LENGTH = ARMCM_ROM_LENGTH
