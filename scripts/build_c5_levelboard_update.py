@@ -4,10 +4,12 @@
 
 import argparse
 import bz2
+import datetime
 import hashlib
-import lzma
+import io
 import json
 import logging
+import lzma
 import os
 from pathlib import Path
 import re
@@ -16,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tarfile
 import zlib
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +41,25 @@ SEED_CONFIG = (
     "CONFIG_STM32_SERIAL_USART1=y\n"
     "CONFIG_C5_LEVELBOARD=y\n"
 )
+
+CANONICAL_PLAINTEXT_SHA256 = (
+    "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616")
+CANONICAL_CONTROL_SHA256 = (
+    "2b05283f39cd68019e2d67b3068dff1e7a9a23507780635bab4bdfead2e48d9c")
+CANONICAL_INSTALLER_SHA256 = (
+    "615dc69a86e0f01a6e32688d4bd8615098e236d51cd7c5afdcd99d3113d3f8a8")
+CANONICAL_CONTROL_SCRIPT_SHA256 = (
+    "a042533ff5be0392455fe06a8f5270b8e27da04661e8eef830146ad540ba47e6")
+CANONICAL_IAP_SHA256 = (
+    "c258bf965a92dad33b15bff616ef3ac72e958618b9cbb059f0a9cd4602c51f68")
+PACKAGE_NAME_RE = re.compile(
+    r"^Creator5Pro-[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
+COMPONENT_NAME_RE = re.compile(
+    r"^(?:\./)?(control|kernel|library|software)-.+\.tar\.xz$")
+CONTROL_MEMBER_NAMES = (
+    "./eBoard.hex", "./heaterBoard.hex", "./IAPCommand", "./ISPCommand",
+    "./levelBoard.hex", "./mainBoardGD.hex", "./mcu.img",
+    "./md5sum.list", "./run.sh", "./Update")
 
 
 class ToolError(Exception):
@@ -1514,6 +1536,633 @@ def _read_archive_input(path):
                 raise ToolError("archive input layer limit exceeded")
             chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _inspect_archive_model(data, decrypt=False, openssl="openssl"):
+    if not isinstance(data, bytes):
+        try:
+            data = bytes(data)
+        except (TypeError, ValueError):
+            raise ToolError("archive input must be bytes")
+    if len(data) > MAX_LAYER_BYTES:
+        raise ToolError("archive input layer limit exceeded")
+    budget = _ArchiveBudget()
+    budget.charge(len(data), "archive input")
+    return _inspect_layer(data, "input archive", budget, 0,
+                          decrypt, openssl)
+
+
+def _regular_member_map(model, label):
+    if model.get("format") != "tar":
+        raise ToolError("%s is not a plain tar archive" % label)
+    members = model.get("members", [])
+    if any(member["type"] != "file" for member in members):
+        raise ToolError("%s canonical profile permits regular files only" %
+                        label)
+    return {member["path"]: member for member in members}
+
+
+def _parse_md5_list(data, expected_paths):
+    if not data.endswith(b"\n") or b"\r" in data:
+        raise ToolError("control md5sum.list must use LF-terminated lines")
+    entries = []
+    seen = set()
+    for number, line in enumerate(data.splitlines(), 1):
+        match = re.fullmatch(rb"([0-9a-f]{32})  (\./[^\x00-\x20]+)", line)
+        if not match:
+            raise ToolError("control md5sum.list line %d is malformed" %
+                            number)
+        path = match.group(2).decode("ascii")
+        if path in seen:
+            raise ToolError("control md5sum.list has duplicate path %s" % path)
+        seen.add(path)
+        entries.append((path, match.group(1).decode("ascii")))
+    if seen != set(expected_paths):
+        raise ToolError("control md5sum.list coverage does not match files")
+    return entries
+
+
+def _program_path(program, logical_name):
+    try:
+        found = shutil.which(str(program))
+    except (OSError, RuntimeError):
+        found = None
+    if not found:
+        raise ToolError("required external tool is unavailable: %s" %
+                        logical_name, 3)
+    return found
+
+
+def _verify_md5(control_files, checksum_data, md5sum="md5sum"):
+    entries = _parse_md5_list(checksum_data, control_files)
+    for path, expected in entries:
+        actual = hashlib.md5(control_files[path]).hexdigest()
+        if actual != expected:
+            raise ToolError("control checksum mismatch for %s" % path)
+    program = _program_path(md5sum, "md5sum")
+    try:
+        with tempfile.TemporaryDirectory(prefix="c5-update-md5-") as temp:
+            root = Path(temp)
+            for path, data in control_files.items():
+                destination = root / path[2:]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+            (root / "md5sum.list").write_bytes(checksum_data)
+            environment = os.environ.copy()
+            environment["LC_ALL"] = "C"
+            result = subprocess.run(
+                [program, "-c", "md5sum.list"], cwd=root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=environment, check=False)
+    except OSError:
+        raise ToolError("unable to run md5sum verification", 3)
+    if result.returncode:
+        raise ToolError("real md5sum verification failed")
+    return entries
+
+
+def _locate_template_members(model, md5sum="md5sum"):
+    outer = _regular_member_map(model, "outer template")
+    members = model["members"]
+    if len(members) != 8 or any(not member["leading_dot_slash"]
+                                for member in members):
+        raise ToolError("unsupported canonical template outer profile")
+    components = {}
+    for member in members:
+        match = COMPONENT_NAME_RE.fullmatch(member["path"])
+        if match:
+            kind = match.group(1)
+            if kind in components:
+                raise ToolError("unsupported template has duplicate %s "
+                                "component" % kind)
+            components[kind] = member
+    if set(components) != {"control", "kernel", "library", "software"}:
+        raise ToolError("unsupported canonical template component profile")
+    fixed_paths = {"./end.img", "./play", "./runFirmwareExe.sh",
+                   "./start.img"}
+    if set(outer) != fixed_paths | {
+            member["path"] for member in components.values()}:
+        raise ToolError("unsupported canonical template outer allowlist")
+    for kind, member in components.items():
+        nested = member.get("nested")
+        if not nested or nested.get("format") != "tar":
+            raise ToolError("canonical %s component is not a plain tar" % kind)
+    control_outer = components["control"]
+    control_model = control_outer["nested"]
+    control = _regular_member_map(control_model, "control template")
+    if (tuple(member["path"] for member in control_model["members"]) !=
+            CONTROL_MEMBER_NAMES or
+            any(not member["leading_dot_slash"]
+                for member in control_model["members"])):
+        raise ToolError("unsupported canonical control member profile")
+    input_files = {path: member["_data"] for path, member in control.items()
+                   if path != "./md5sum.list"}
+    checksum_entries = _verify_md5(
+        input_files, control["./md5sum.list"]["_data"], md5sum)
+    return {
+        "model": model,
+        "outer": outer,
+        "outer_members": members,
+        "components": components,
+        "control_outer": control_outer,
+        "control_model": control_model,
+        "control": control,
+        "control_members": control_model["members"],
+        "checksum_entries": checksum_entries,
+    }
+
+
+def _canonical_template_profile(model, md5sum="md5sum"):
+    if model.get("sha256") != CANONICAL_PLAINTEXT_SHA256:
+        raise ToolError("unsupported canonical template plaintext hash")
+    profile = _locate_template_members(model, md5sum)
+    if profile["control_outer"]["sha256"] != CANONICAL_CONTROL_SHA256:
+        raise ToolError("unsupported canonical control archive hash")
+    gates = (
+        (profile["outer"]["./runFirmwareExe.sh"],
+         CANONICAL_INSTALLER_SHA256, "outer installer"),
+        (profile["control"]["./run.sh"],
+         CANONICAL_CONTROL_SCRIPT_SHA256, "control script"),
+        (profile["control"]["./IAPCommand"], CANONICAL_IAP_SHA256,
+         "IAPCommand"),
+    )
+    for member, expected, label in gates:
+        if member["sha256"] != expected:
+            raise ToolError("unsupported canonical %s hash" % label)
+    return profile
+
+
+def _suppress_update_other(data):
+    lines = data.splitlines(keepends=True)
+    declaration = re.compile(
+        rb"^[ \t]*(?:(?:function[ \t]+update_other(?:[ \t]*\(\))?)|"
+        rb"(?:update_other[ \t]*\(\)))[ \t]*(?:\{[ \t]*)?"
+        rb"(?:\r?\n)?$")
+    definitions = [index for index, line in enumerate(lines)
+                   if declaration.fullmatch(line)]
+    if len(definitions) != 1:
+        raise ToolError("outer installer must contain exactly one "
+                        "update_other function definition")
+    start = definitions[0]
+    if b"{" in lines[start]:
+        body_start = start
+    elif (start + 1 < len(lines) and
+          re.fullmatch(rb"[ \t]*\{[ \t]*(?:\r?\n)?", lines[start + 1])):
+        body_start = start + 1
+    else:
+        raise ToolError("update_other function has no opening brace")
+    depth = 1
+    end = None
+    for index in range(body_start + 1, len(lines)):
+        if re.fullmatch(rb"[ \t]*\{[ \t]*(?:\r?\n)?", lines[index]):
+            depth += 1
+        elif re.fullmatch(rb"[ \t]*\}[ \t]*(?:\r?\n)?", lines[index]):
+            depth -= 1
+            if not depth:
+                end = index
+                break
+    if end is None:
+        raise ToolError("update_other function has no matching closing brace")
+    invocation = re.compile(rb"^[ \t]*update_other[ \t]*(?:\r?\n)?$")
+    calls = [index for index, line in enumerate(lines)
+             if not start <= index <= end and invocation.fullmatch(line)]
+    if len(calls) != 1:
+        raise ToolError("outer installer must contain exactly one standalone "
+                        "update_other invocation")
+    removed = set(range(start, end + 1)) | {calls[0]}
+    return b"".join(line for index, line in enumerate(lines)
+                    if index not in removed)
+
+
+def _check_shell_syntax(data, shell="sh"):
+    program = _program_path(shell, "sh")
+    try:
+        result = subprocess.run([program, "-n"], input=data,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, check=False)
+    except OSError:
+        raise ToolError("unable to run sh syntax validation", 3)
+    if result.returncode:
+        diagnostic = sanitize_diagnostic(
+            result.stderr.decode("utf-8", "replace").strip())
+        raise ToolError("generated outer installer failed sh -n%s" %
+                        ((": " + diagnostic) if diagnostic else ""))
+
+
+def _member_metadata(member):
+    return {key: member[key] for key in
+            ("path", "type", "mode", "uid", "gid", "uname", "gname",
+             "mtime", "link_target")}
+
+
+def _write_gnu_tar(entries):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w",
+                      format=tarfile.GNU_FORMAT) as tar:
+        for member, data in entries:
+            info = tarfile.TarInfo(member["path"])
+            info.type = tarfile.REGTYPE
+            info.mode = member["mode"]
+            info.uid = member["uid"]
+            info.gid = member["gid"]
+            info.uname = member["uname"]
+            info.gname = member["gname"]
+            info.mtime = member["mtime"]
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return output.getvalue()
+
+
+def _build_reduced_plaintext(profile, firmware_data, shell="sh",
+                              md5sum="md5sum"):
+    control = profile["control"]
+    retained = {"./IAPCommand", "./levelBoard.hex", "./mcu.img",
+                "./md5sum.list", "./run.sh", "./Update"}
+    checksum_paths = [path for path, unused in profile["checksum_entries"]
+                      if path in retained and path != "./md5sum.list"]
+    if set(checksum_paths) != retained - {"./md5sum.list"}:
+        raise ToolError("retained control checksum order is incomplete")
+    control_data = {
+        "./IAPCommand": control["./IAPCommand"]["_data"],
+        "./levelBoard.hex": firmware_data,
+        "./mcu.img": control["./mcu.img"]["_data"],
+        "./run.sh": control["./run.sh"]["_data"],
+        "./Update": control["./Update"]["_data"],
+    }
+    checksum_data = b"".join(
+        hashlib.md5(control_data[path]).hexdigest().encode("ascii") +
+        b"  " + path.encode("ascii") + b"\n"
+        for path in checksum_paths)
+    _verify_md5(control_data, checksum_data, md5sum)
+    control_data["./md5sum.list"] = checksum_data
+    control_entries = [(member, control_data[member["path"]])
+                       for member in profile["control_members"]
+                       if member["path"] in retained]
+    control_tar = _write_gnu_tar(control_entries)
+    if control_tar[257:265] != b"ustar  \0":
+        raise ToolError("generated control archive is not GNU tar")
+
+    transformed_installer = _suppress_update_other(
+        profile["outer"]["./runFirmwareExe.sh"]["_data"])
+    _check_shell_syntax(transformed_installer, shell)
+    control_path = profile["control_outer"]["path"]
+    outer_data = {
+        control_path: control_tar,
+        "./end.img": profile["outer"]["./end.img"]["_data"],
+        "./play": profile["outer"]["./play"]["_data"],
+        "./runFirmwareExe.sh": transformed_installer,
+        "./start.img": profile["outer"]["./start.img"]["_data"],
+    }
+    outer_entries = [(member, outer_data[member["path"]])
+                     for member in profile["outer_members"]
+                     if member["path"] in outer_data]
+    plaintext = _write_gnu_tar(outer_entries)
+    if plaintext[257:265] != b"ustar  \0":
+        raise ToolError("generated outer archive is not GNU tar")
+    evidence = {
+        "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
+        "outer_order": [member["path"] for member, unused in outer_entries],
+        "control_order": [member["path"]
+                          for member, unused in control_entries],
+        "outer_metadata": {member["path"]: _member_metadata(member)
+                           for member, unused in outer_entries},
+        "control_metadata": {member["path"]: _member_metadata(member)
+                             for member, unused in control_entries},
+        "outer_data": outer_data,
+        "control_data": control_data,
+        "control_path": control_path,
+    }
+    return plaintext, evidence
+
+
+def _assert_member(member, expected_metadata, expected_data, label):
+    if _member_metadata(member) != expected_metadata:
+        raise ToolError("generated %s metadata differs from template" % label)
+    if member["_data"] != expected_data:
+        raise ToolError(
+            "generated %s bytes differ from expected output" % label)
+
+
+def _manifest_member(label, member):
+    return {
+        "label": label,
+        "type": member["type"],
+        "mode": member["mode"],
+        "size": member["size"],
+        "sha256": member["sha256"],
+    }
+
+
+def _assert_reduced_profile(model, evidence, md5sum="md5sum"):
+    if (model.get("format") != "tar" or
+            model.get("sha256") != evidence["plaintext_sha256"]):
+        raise ToolError("generated plaintext archive hash mismatch")
+    members = model["members"]
+    if [member["path"] for member in members] != evidence["outer_order"]:
+        raise ToolError("generated outer archive order or allowlist mismatch")
+    if any(member["type"] != "file" or not member["leading_dot_slash"]
+           for member in members):
+        raise ToolError("generated outer archive has invalid member type or "
+                        "root convention")
+    outer = {member["path"]: member for member in members}
+    if set(outer) != set(evidence["outer_data"]):
+        raise ToolError("generated outer archive allowlist mismatch")
+    for path in evidence["outer_order"]:
+        _assert_member(outer[path], evidence["outer_metadata"][path],
+                       evidence["outer_data"][path], path)
+    control_member = outer[evidence["control_path"]]
+    control_model = control_member.get("nested")
+    if not control_model or control_model.get("format") != "tar":
+        raise ToolError("generated control package is not a plain GNU tar")
+    control_members = control_model["members"]
+    if ([member["path"] for member in control_members] !=
+            evidence["control_order"]):
+        raise ToolError(
+            "generated control archive order or allowlist mismatch")
+    if any(member["type"] != "file" or not member["leading_dot_slash"]
+           for member in control_members):
+        raise ToolError("generated control archive has invalid member type or "
+                        "root convention")
+    control = {member["path"]: member for member in control_members}
+    if set(control) != set(evidence["control_data"]):
+        raise ToolError("generated control archive allowlist mismatch")
+    for path in evidence["control_order"]:
+        _assert_member(control[path], evidence["control_metadata"][path],
+                       evidence["control_data"][path], path)
+    if [path for path in control if path.lower().endswith(".hex")] != [
+            "./levelBoard.hex"]:
+        raise ToolError(
+            "generated package contains unrelated firmware payload")
+    if control["./Update"]["size"] != 0:
+        raise ToolError("generated Update marker is not empty")
+    checksum_files = {path: member["_data"] for path, member in control.items()
+                      if path != "./md5sum.list"}
+    _verify_md5(checksum_files, control["./md5sum.list"]["_data"], md5sum)
+    outer_labels = {
+        evidence["control_path"]: "control package",
+        "./end.img": "end image",
+        "./play": "play helper",
+        "./runFirmwareExe.sh": "outer installer",
+        "./start.img": "start image",
+    }
+    control_labels = {
+        "./IAPCommand": "IAPCommand",
+        "./levelBoard.hex": "levelBoard firmware",
+        "./mcu.img": "control display image",
+        "./md5sum.list": "checksum list",
+        "./run.sh": "control script",
+        "./Update": "Update marker",
+    }
+    return {
+        "outer": [_manifest_member(outer_labels[path], outer[path])
+                  for path in evidence["outer_order"]],
+        "control": [_manifest_member(control_labels[path], control[path])
+                    for path in evidence["control_order"]],
+    }
+
+
+def _path_is_tracked(path):
+    try:
+        relative = path.relative_to(REPO_ROOT.resolve())
+    except (ValueError, OSError, RuntimeError):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--",
+             relative.as_posix()], cwd=REPO_ROOT,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False)
+    except OSError:
+        raise ToolError("required external tool is unavailable: git", 3)
+    return result.returncode == 0
+
+
+def _prepare_package_output(output, input_paths):
+    try:
+        output = Path(output).expanduser().resolve(strict=False)
+        inputs = {Path(path).expanduser().resolve(strict=False)
+                  for path in input_paths}
+    except (OSError, RuntimeError):
+        raise ToolError("unable to resolve package output path")
+    if not PACKAGE_NAME_RE.fullmatch(output.name):
+        raise ToolError("output basename must match Creator5Pro-*.tgz")
+    validate_output_root(output.parent)
+    manifest = Path(str(output) + ".manifest.json")
+    if output in inputs or manifest in inputs:
+        raise ToolError("package output overlaps an input path")
+    if _path_is_tracked(output) or _path_is_tracked(manifest):
+        raise ToolError("package destination may not be a tracked file")
+    if output.exists() or manifest.exists():
+        raise ToolError("package or manifest output already exists")
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ToolError("unable to create package output directory")
+    return output
+
+
+def _write_temporary_sibling(output, data, suffix):
+    descriptor = None
+    path = None
+    try:
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix="." + output.name + ".", suffix=suffix,
+            dir=output.parent)
+        path = Path(raw_path)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return path
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise ToolError("unable to prepare package publication")
+
+
+def _publish_outputs(output, ciphertext, manifest_data):
+    output = Path(output)
+    manifest = Path(str(output) + ".manifest.json")
+    if output.exists() or manifest.exists():
+        raise ToolError("package or manifest output already exists")
+    package_temp = None
+    manifest_temp = None
+    package_linked = False
+    manifest_linked = False
+    try:
+        package_temp = _write_temporary_sibling(
+            output, ciphertext, ".package.tmp")
+        manifest_temp = _write_temporary_sibling(
+            output, manifest_data, ".manifest.tmp")
+        os.link(package_temp, output)
+        package_linked = True
+        os.link(manifest_temp, manifest)
+        manifest_linked = True
+    except FileExistsError:
+        raise ToolError("package or manifest output already exists")
+    except ToolError:
+        raise
+    except OSError:
+        raise ToolError("atomic package publication failed")
+    finally:
+        if not manifest_linked and package_linked and package_temp is not None:
+            try:
+                if output.exists() and output.samefile(package_temp):
+                    output.unlink()
+            except OSError:
+                pass
+        for path in (package_temp, manifest_temp):
+            if path is not None:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+
+def _repository_state():
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False)
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False)
+    except OSError:
+        raise ToolError("required external tool is unavailable: git", 3)
+    if revision.returncode or status.returncode:
+        raise ToolError("unable to determine repository revision", 3)
+    commit = revision.stdout.decode("ascii", "replace").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ToolError("repository revision is not a full commit hash", 3)
+    return {"commit": commit, "dirty": bool(status.stdout.strip())}
+
+
+def _create_manifest(firmware_report, template_plaintext_hash, plaintext,
+                     ciphertext, members, shell, md5sum):
+    firmware = json.loads(json.dumps(firmware_report))
+    firmware.setdefault("dictionary", {})["kconfig"] = (
+        "[redacted: validated separately]")
+    tools = dict(firmware.get("tools", {}))
+    tools["sh"] = _version(shell)
+    tools["md5sum"] = _version(md5sum)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z")
+    return {
+        "schema_version": 1,
+        "repository": _repository_state(),
+        "build_timestamp_utc": timestamp,
+        "tools": tools,
+        "resolved_config": firmware["resolved_config"],
+        "firmware": firmware,
+        "template_plaintext_sha256": template_plaintext_hash,
+        "output": {
+            "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+            "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
+            "members": members,
+        },
+        "installer_changes": [
+            {"effect": "NIM log deletion", "status": "suppressed"},
+            {"effect": "persistent startup image replacement",
+             "status": "suppressed"},
+        ],
+        "validation": {
+            "passed": [
+                "firmware representations",
+                "canonical template hash gates",
+                "input control checksums",
+                "installer byte transformation and sh -n",
+                "reduced archive profile",
+                "output control checksums",
+                "fresh ciphertext decryption and reinspection",
+            ],
+            "hardware_verified": False,
+        },
+    }
+
+
+def package_update(template, firmware, elf, dictionary, output,
+                   cross_prefix="arm-none-eabi-", openssl="openssl"):
+    output = _prepare_package_output(
+        output, (template, firmware, elf, dictionary))
+    firmware_report = validate_firmware(
+        firmware, elf, dictionary, cross_prefix, openssl)
+    unused, firmware_data = _read_input_file(firmware)
+    if (hashlib.sha256(firmware_data).hexdigest() !=
+            firmware_report["hex_sha256"]):
+        raise ToolError("firmware changed after validation")
+    try:
+        template_data = _read_archive_input(template)
+    except OSError:
+        raise ToolError("unable to read canonical template")
+    if not template_data.startswith(b"Salted__"):
+        raise ToolError("canonical package template must be encrypted")
+    template_model = _inspect_archive_model(
+        template_data, decrypt=True, openssl=openssl)
+    if (template_model.get("format") != "encrypted" or
+            template_model.get("payload", {}).get("format") != "tar"):
+        raise ToolError("canonical template did not decrypt to a plain tar")
+    template_plaintext = template_model["_payload"]
+    shell_path = _program_path("sh", "sh")
+    md5sum_path = _program_path("md5sum", "md5sum")
+    profile = _canonical_template_profile(
+        template_model["payload"], md5sum_path)
+    plaintext, evidence = _build_reduced_plaintext(
+        profile, firmware_data, shell_path, md5sum_path)
+    constructed_model = _inspect_archive_model(plaintext)
+    member_summary = _assert_reduced_profile(
+        constructed_model, evidence, md5sum_path)
+
+    ciphertext = openssl_crypt(plaintext, False, openssl)
+    with tempfile.TemporaryDirectory(prefix="c5-update-verify-") as temp:
+        candidate = Path(temp) / "candidate.tgz"
+        candidate.write_bytes(ciphertext)
+        verified_model = _inspect_archive_model(
+            _read_archive_input(candidate), decrypt=True, openssl=openssl)
+        if (verified_model.get("format") != "encrypted" or
+                verified_model.get("_payload") != plaintext):
+            raise ToolError("fresh package decryption differs from plaintext")
+        verified_summary = _assert_reduced_profile(
+            verified_model["payload"], evidence, md5sum_path)
+    if verified_summary != member_summary:
+        raise ToolError("fresh package reinspection differs from construction")
+    manifest = _create_manifest(
+        firmware_report, hashlib.sha256(template_plaintext).hexdigest(),
+        plaintext, ciphertext, verified_summary, shell_path, md5sum_path)
+    manifest_data = (json.dumps(manifest, sort_keys=True, indent=2) +
+                     "\n").encode("utf-8")
+    _publish_outputs(output, ciphertext, manifest_data)
+    return {
+        "stage": "package",
+        "package": output.name,
+        "manifest": output.name + ".manifest.json",
+        "ciphertext_sha256": manifest["output"]["ciphertext_sha256"],
+        "plaintext_sha256": manifest["output"]["plaintext_sha256"],
+        "firmware_hex_sha256": firmware_report["hex_sha256"],
+        "firmware_normalized_sha256": firmware_report["normalized_sha256"],
+        "validation": manifest["validation"],
+    }
+
+
+def run_all_stages(template, output_dir, output, jobs=1,
+                   cross_prefix="arm-none-eabi-", openssl="openssl"):
+    _prepare_package_output(output, (template,))
+    build_dir = Path(output_dir) / "build"
+    build_report = build_firmware(build_dir, jobs, cross_prefix, openssl)
+    package_report = package_update(
+        template, build_dir / "levelBoard.hex", build_dir / "klipper.elf",
+        build_dir / "klipper.dict", output, cross_prefix, openssl)
+    return {"stage": "all", "build": build_report,
+            "package": package_report}
+
+
 def _add_global(parser):
     parser.add_argument(
     "--cross-prefix",
@@ -1586,8 +2235,16 @@ def main(argv=None):
             _json_print(inspect_archive(
                 archive_data, decrypt=args.decrypt,
                 extract_temp=args.extract_temp, openssl=args.openssl))
+        elif args.command == "package":
+            _json_print(package_update(
+                args.template, args.firmware, args.elf, args.dictionary,
+                args.output, args.cross_prefix, args.openssl))
+        elif args.command == "all":
+            _json_print(run_all_stages(
+                args.template, args.output_dir, args.output, args.jobs,
+                args.cross_prefix, args.openssl))
         else:
-            raise ToolError("%s stage is not implemented yet" % args.command)
+            raise ToolError("unknown stage")
         return 0
     except ToolError as exc:
         secret = os.environ.get("C5_UPDATE_PASSPHRASE")

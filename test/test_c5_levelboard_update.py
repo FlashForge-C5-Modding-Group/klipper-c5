@@ -582,6 +582,36 @@ SECTIONS {
                 for word in words:
                     self.assertIn(word, result.stderr.lower())
                 self.assertNotIn("traceback", result.stderr.lower())
+    def test_package_cli_rejects_unsupported_template_without_publishing(self):
+        openssl = shutil.which("openssl")
+        if not openssl:
+            self.skipTest("OpenSSL is required for unsupported templates")
+        secret = hashlib.sha256(os.urandom(32)).hexdigest()
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "Creator5Pro-unsupported.tgz"
+            plain = tar_bytes([("./plain", b"not canonical")])
+            with mock.patch.dict(os.environ,
+                                 {"C5_UPDATE_PASSPHRASE": secret},
+                                 clear=False):
+                template = Path(temp) / "template.tgz"
+                template.write_bytes(
+                    TOOL.openssl_crypt(plain, decrypt=False, openssl=openssl))
+                result = self.run_cli_package(template, output)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("unsupported canonical template", result.stderr)
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".manifest.json").exists())
+            self.assertNotIn(secret, result.stderr)
+
+    def run_cli_package(self, template, output):
+        return subprocess.run(
+            [sys.executable, str(TOOL_PATH), "--openssl",
+             shutil.which("openssl"), "package", "--template", str(template),
+             "--firmware", "firmware.hex", "--elf", "firmware.elf",
+             "--dictionary", "firmware.dict", "--output", str(output)],
+            cwd=self.directory, text=True, capture_output=True)
+
+
 @unittest.skipUnless(os.environ.get("RUN_C5_BUILD_TESTS") == "1",
                      "set RUN_C5_BUILD_TESTS=1 with the ARM toolchain "
                      "available")
@@ -1007,5 +1037,225 @@ class ArchiveInspectionTests(unittest.TestCase):
         control_report = self.inspect(control)
         self.assertEqual(control_report["format"], "tar")
         self.assertEqual(len(control_report["members"]), 10)
+
+
+@unittest.skipUnless(shutil.which("sh") and shutil.which("md5sum"),
+                     "sh and md5sum are required for package construction")
+class PackageTransformationTests(unittest.TestCase):
+    STOCK_INSTALLER = (b"#!/bin/sh\n"
+                       b"keep_before()\n{\n  :\n}\n"
+                       b"update_other()\n{\n"
+                       b"  rm -rf /usr/data/logs/NIM\n"
+                       b"  cp ./start.img /usr/share/start.img\n"
+                       b"}\n"
+                       b"keep_after()\n{\n  :\n}\n"
+                       b"update_other\n"
+                       b"echo done\n")
+
+    @staticmethod
+    def _checksum_list(files, order):
+        return b"".join(
+            hashlib.md5(files[name]).hexdigest().encode("ascii") +
+            b"  " + name.encode("ascii") + b"\n"
+            for name in order)
+
+    def _template(self):
+        control_files = {
+            "./eBoard.hex": b"unrelated-e-board",
+            "./heaterBoard.hex": b"unrelated-heater-board",
+            "./IAPCommand": b"iap-command",
+            "./ISPCommand": b"isp-command",
+            "./levelBoard.hex": b"old-level-board",
+            "./mainBoardGD.hex": b"unrelated-main-board",
+            "./mcu.img": b"display-image",
+            "./run.sh": b"#!/bin/sh\necho stock-control\n",
+            "./Update": b"",
+        }
+        checksum_order = [
+            "./eBoard.hex", "./heaterBoard.hex", "./IAPCommand",
+            "./ISPCommand", "./levelBoard.hex", "./mainBoardGD.hex",
+            "./mcu.img", "./run.sh", "./Update"]
+        checksums = self._checksum_list(control_files, checksum_order)
+        control = tar_bytes([
+            ("./eBoard.hex", control_files["./eBoard.hex"],
+             tarfile.REGTYPE, "", 0o777),
+            ("./heaterBoard.hex", control_files["./heaterBoard.hex"],
+             tarfile.REGTYPE, "", 0o777),
+            ("./IAPCommand", control_files["./IAPCommand"],
+             tarfile.REGTYPE, "", 0o775),
+            ("./ISPCommand", control_files["./ISPCommand"],
+             tarfile.REGTYPE, "", 0o775),
+            ("./levelBoard.hex", control_files["./levelBoard.hex"],
+             tarfile.REGTYPE, "", 0o777),
+            ("./mainBoardGD.hex", control_files["./mainBoardGD.hex"],
+             tarfile.REGTYPE, "", 0o777),
+            ("./mcu.img", control_files["./mcu.img"],
+             tarfile.REGTYPE, "", 0o775),
+            ("./md5sum.list", checksums, tarfile.REGTYPE, "", 0o664),
+            ("./run.sh", control_files["./run.sh"],
+             tarfile.REGTYPE, "", 0o777),
+            ("./Update", b"", tarfile.REGTYPE, "", 0o775),
+        ])
+        outer = tar_bytes([
+            ("./control-fixture.tar.xz", control),
+            ("./end.img", b"end-image", tarfile.REGTYPE, "", 0o775),
+            ("./kernel-fixture.tar.xz", tar_bytes([("kernel", b"x")])),
+            ("./library-fixture.tar.xz", tar_bytes([("library", b"x")])),
+            ("./play", b"play-helper", tarfile.REGTYPE, "", 0o775),
+            ("./runFirmwareExe.sh", self.STOCK_INSTALLER,
+             tarfile.REGTYPE, "", 0o775),
+            ("./software-fixture.tar.xz", tar_bytes([("software", b"x")])),
+            ("./start.img", b"start-image", tarfile.REGTYPE, "", 0o775),
+        ])
+        model = TOOL._inspect_archive_model(outer)
+        return outer, TOOL._locate_template_members(model)
+
+    def test_installer_removes_only_function_and_sole_call(self):
+        transformed = TOOL._suppress_update_other(self.STOCK_INSTALLER)
+        expected = (b"#!/bin/sh\n"
+                    b"keep_before()\n{\n  :\n}\n"
+                    b"keep_after()\n{\n  :\n}\n"
+                    b"echo done\n")
+        self.assertEqual(transformed, expected)
+        TOOL._check_shell_syntax(transformed, shutil.which("sh"))
+        for bad in (self.STOCK_INSTALLER + b"update_other\n",
+                    self.STOCK_INSTALLER.replace(
+                        b"update_other()\n", b"renamed()\n")):
+            with self.subTest(bad=hashlib.sha256(bad).hexdigest()):
+                with self.assertRaisesRegex(
+                        TOOL.ToolError,
+                        "exactly one.*update_other|update_other.*exactly one"):
+                    TOOL._suppress_update_other(bad)
+
+    def test_reduced_plaintext_is_reproducible_and_exactly_allowlisted(self):
+        unused, profile = self._template()
+        replacement = ihex()
+        first, evidence = TOOL._build_reduced_plaintext(
+            profile, replacement, shutil.which("sh"), shutil.which("md5sum"))
+        second, second_evidence = TOOL._build_reduced_plaintext(
+            profile, replacement, shutil.which("sh"), shutil.which("md5sum"))
+        self.assertEqual(first, second)
+        self.assertEqual(evidence["plaintext_sha256"],
+                         second_evidence["plaintext_sha256"])
+        model = TOOL._inspect_archive_model(first)
+        summary = TOOL._assert_reduced_profile(model, evidence,
+                                               shutil.which("md5sum"))
+        self.assertEqual([item["label"] for item in summary["outer"]], [
+            "control package", "end image", "play helper",
+            "outer installer", "start image"])
+        self.assertEqual([item["label"] for item in summary["control"]], [
+            "IAPCommand", "levelBoard firmware", "control display image",
+            "checksum list", "control script", "Update marker"])
+        self.assertNotIn(b"eBoard.hex", first)
+        self.assertNotIn(b"kernel-fixture", first)
+        with tarfile.open(fileobj=io.BytesIO(first), mode="r:") as outer:
+            control_info = outer.getmembers()[0]
+            control = outer.extractfile(control_info).read()
+            with tarfile.open(fileobj=io.BytesIO(control), mode="r:") as inner:
+                values = {member.name: inner.extractfile(member).read()
+                          for member in inner.getmembers()}
+        self.assertEqual(values["./levelBoard.hex"], replacement)
+        retained_order = ["./IAPCommand", "./levelBoard.hex", "./mcu.img",
+                          "./run.sh", "./Update"]
+        self.assertEqual(values["./md5sum.list"],
+                         self._checksum_list(values, retained_order))
+
+    def test_hash_gate_rejects_noncanonical_template(self):
+        outer, unused = self._template()
+        with self.assertRaisesRegex(TOOL.ToolError,
+                                    "unsupported canonical template"):
+            TOOL._canonical_template_profile(
+                TOOL._inspect_archive_model(outer))
+
+    def test_atomic_publication_never_overwrites_either_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "Creator5Pro-fixture.tgz"
+            manifest = Path(str(output) + ".manifest.json")
+            TOOL._publish_outputs(output, b"ciphertext", b"{\"ok\":true}\n")
+            self.assertEqual(output.read_bytes(), b"ciphertext")
+            self.assertEqual(manifest.read_bytes(), b"{\"ok\":true}\n")
+            with self.assertRaisesRegex(TOOL.ToolError, "already exists"):
+                TOOL._publish_outputs(output, b"replacement", b"{}\n")
+            self.assertEqual(output.read_bytes(), b"ciphertext")
+            self.assertEqual(manifest.read_bytes(), b"{\"ok\":true}\n")
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "Creator5Pro-fixture.tgz"
+            manifest = Path(str(output) + ".manifest.json")
+            manifest.write_bytes(b"owned")
+            with self.assertRaisesRegex(TOOL.ToolError, "already exists"):
+                TOOL._publish_outputs(output, b"ciphertext", b"{}\n")
+            self.assertFalse(output.exists())
+            self.assertEqual(manifest.read_bytes(), b"owned")
+
+    def test_output_contract_rejects_names_collisions_and_repository(
+            self):
+        with tempfile.TemporaryDirectory() as temp:
+            template = Path(temp) / "template.tgz"
+            template.write_bytes(b"template")
+            valid = Path(temp) / "Creator5Pro-levelboard.tgz"
+            self.assertEqual(TOOL._prepare_package_output(
+                valid, [template]), valid.resolve())
+            for invalid in (Path(temp) / "wrong.tgz",
+                            Path(temp) / "Creator5Pro-.tgz", template):
+                with self.subTest(path=invalid), self.assertRaises(
+                        TOOL.ToolError):
+                    TOOL._prepare_package_output(invalid, [template])
+            with self.assertRaises(TOOL.ToolError):
+                TOOL._prepare_package_output(
+                    ROOT / "scripts" / "Creator5Pro-bad.tgz", [template])
+
+    def test_checksum_and_shell_failures_are_rejected_before_packaging(self):
+        files = {"./payload": b"content"}
+        checksum = self._checksum_list(files, ["./payload"])
+        TOOL._verify_md5(files, checksum, shutil.which("md5sum"))
+        with self.assertRaisesRegex(TOOL.ToolError, "checksum mismatch"):
+            TOOL._verify_md5({"./payload": b"changed"}, checksum,
+                             shutil.which("md5sum"))
+        with self.assertRaisesRegex(TOOL.ToolError, "sh -n"):
+            TOOL._check_shell_syntax(b"#!/bin/sh\nif true; then\n",
+                                     shutil.which("sh"))
+
+    def test_manifest_is_schema_one_sanitized_and_marks_hardware(
+            self):
+        report = {
+            "resolved_config": dict(TOOL.REQUIRED_CONFIG),
+            "dictionary": {"kconfig": "/private/template/location"},
+            "tools": {"python": "test-python", "openssl": "test-openssl"},
+        }
+        manifest = TOOL._create_manifest(
+            report, TOOL.CANONICAL_PLAINTEXT_SHA256, b"plain", b"cipher",
+            {"outer": [], "control": []}, shutil.which("sh"),
+            shutil.which("md5sum"))
+        serialized = json.dumps(manifest)
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertFalse(manifest["validation"]["hardware_verified"])
+        self.assertEqual(manifest["firmware"]["dictionary"]["kconfig"],
+                         "[redacted: validated separately]")
+        self.assertNotIn("/private/template/location", serialized)
+        self.assertNotIn("control-fixture.tar.xz", serialized)
+        self.assertRegex(manifest["repository"]["commit"], r"^[0-9a-f]{40}$")
+
+    def test_package_cli_validation_failure_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            template = root / "template.tgz"
+            template.write_bytes(b"not-reached")
+            output = root / "Creator5Pro-validation-failure.tgz"
+            result = subprocess.run([
+                sys.executable, str(TOOL_PATH), "package",
+                "--template", str(template),
+                "--firmware", str(root / "missing.hex"),
+                "--elf", str(root / "missing.elf"),
+                "--dictionary", str(root / "missing.dict"),
+                "--output", str(output)], cwd=ROOT, text=True,
+                capture_output=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".manifest.json").exists())
+            self.assertNotIn(str(root), result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
