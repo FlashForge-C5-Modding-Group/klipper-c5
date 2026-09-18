@@ -1,0 +1,2259 @@
+#!/usr/bin/env python3
+# This file may be distributed under the terms of the GNU GPLv3 license.
+"""Build and validate a Creator 5 Pro levelBoard firmware update."""
+
+import argparse
+import bz2
+import datetime
+import hashlib
+import io
+import json
+import logging
+import lzma
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import tarfile
+import zlib
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+APP_START = 0x08004000
+APP_END = 0x08010000
+RAM_START = 0x20000000
+RAM_END = 0x20004000
+NORMALIZATION = "application-48k-ff-fill-v1"
+MAX_LAYER_BYTES = 256 * 1024 * 1024
+MAX_TOTAL_EXPANDED = 512 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 10000
+MAX_ARCHIVE_DEPTH = 8
+_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz",
+                     ".tar.bz2", ".tbz", ".tbz2", ".gz", ".xz", ".bz2")
+SEED_CONFIG = (
+    "CONFIG_MACH_STM32=y\n"
+    "CONFIG_MACH_N32G430F8S7=y\n"
+    "CONFIG_STM32_CLOCK_REF_8M=y\n"
+    "CONFIG_SERIAL=y\n"
+    "CONFIG_STM32_SERIAL_USART1=y\n"
+    "CONFIG_C5_LEVELBOARD=y\n"
+)
+
+CANONICAL_PLAINTEXT_SHA256 = (
+    "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616")
+CANONICAL_CONTROL_SHA256 = (
+    "2b05283f39cd68019e2d67b3068dff1e7a9a23507780635bab4bdfead2e48d9c")
+CANONICAL_INSTALLER_SHA256 = (
+    "615dc69a86e0f01a6e32688d4bd8615098e236d51cd7c5afdcd99d3113d3f8a8")
+CANONICAL_CONTROL_SCRIPT_SHA256 = (
+    "a042533ff5be0392455fe06a8f5270b8e27da04661e8eef830146ad540ba47e6")
+CANONICAL_IAP_SHA256 = (
+    "c258bf965a92dad33b15bff616ef3ac72e958618b9cbb059f0a9cd4602c51f68")
+PACKAGE_NAME_RE = re.compile(
+    r"^Creator5Pro-[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
+COMPONENT_NAME_RE = re.compile(
+    r"^(?:\./)?(control|kernel|library|software)-.+\.tar\.xz$")
+CONTROL_MEMBER_NAMES = (
+    "./eBoard.hex", "./heaterBoard.hex", "./IAPCommand", "./ISPCommand",
+    "./levelBoard.hex", "./mainBoardGD.hex", "./mcu.img",
+    "./md5sum.list", "./run.sh", "./Update")
+
+
+class ToolError(Exception):
+    def __init__(self, message, exit_code=2):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def sanitize_diagnostic(message, secret=None):
+    text = str(message)
+    if secret:
+        text = text.replace(secret, "[redacted]")
+    text = re.sub(
+    r"(?i)(?:[a-z]:[\\/]|/)(?:[^\s:'\"]+[\\/])+[^\s:'\"]*",
+    "[redacted]",
+     text)
+    return text
+
+
+def _inside(path, parent):
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_output_root(path):
+    try:
+        path = Path(path).expanduser().resolve(strict=False)
+        repo = REPO_ROOT.resolve()
+    except (OSError, RuntimeError):
+        raise ToolError("unable to resolve output path")
+    literal_out = repo / "out"
+    if (path == Path(path.anchor) or path == repo or
+            (_inside(path, repo) and not _inside(path, literal_out))):
+        raise ToolError(
+            "output must be outside the repository or beneath its "
+            "out directory")
+    return path
+
+
+def _hex_context(line_number, message):
+    raise ToolError("Intel HEX line %d: %s" % (line_number, message))
+
+
+def parse_ihex(data):
+    """Parse and strictly validate a levelBoard Intel HEX byte string."""
+    if isinstance(data, str):
+        try:
+            data = data.encode("ascii")
+        except UnicodeEncodeError:
+            raise ToolError("Intel HEX input is not ASCII")
+    try:
+        text = bytes(data).decode("ascii")
+    except UnicodeDecodeError:
+        raise ToolError("Intel HEX input is not ASCII")
+    if not text:
+        raise ToolError("Intel HEX input is empty")
+    # splitlines keeps line-ending policy explicit and exposes internal blanks.
+    lines = text.splitlines(keepends=True)
+    if not lines or not lines[-1].endswith(("\n", "\r")):
+        # A final record without an ending newline is legal.
+        pass
+    memory = {}
+    linear_base = 0
+    eof_seen = False
+    start_linear = None
+    for number, raw in enumerate(lines, 1):
+        line = raw.rstrip("\r\n")
+        endings = raw[len(line):]
+        if endings not in ("", "\n", "\r\n"):
+            _hex_context(number, "unsupported line ending")
+        if not line:
+            _hex_context(number, "blank internal record")
+        if line != line.strip():
+            _hex_context(number, "whitespace outside line ending")
+        if eof_seen:
+            _hex_context(number, "record after EOF")
+        if not line.startswith(":"):
+            _hex_context(number, "record does not start with ':'")
+        encoded = line[1:]
+        if len(encoded) % 2:
+            _hex_context(number, "odd hexadecimal length")
+        if not re.fullmatch(r"[0-9A-Fa-f]+", encoded or "-"):
+            _hex_context(number, "non-hexadecimal record")
+        record_bytes = bytes.fromhex(encoded)
+        if len(record_bytes) < 5:
+            _hex_context(number, "record is too short")
+        count = record_bytes[0]
+        if len(record_bytes) != count + 5:
+            _hex_context(number, "record length does not match byte count")
+        if sum(record_bytes) & 0xff:
+            _hex_context(number, "checksum mismatch")
+        address = (record_bytes[1] << 8) | record_bytes[2]
+        kind = record_bytes[3]
+        payload = record_bytes[4:-1]
+        if kind == 0:
+            end_offset = address + count
+            if end_offset > 0x10000:
+                _hex_context(number, "data crosses a 64 KiB address window")
+            absolute = linear_base + address
+            end_absolute = absolute + count
+            if end_absolute > 0x100000000:
+                _hex_context(number, "32-bit address arithmetic overflow")
+            if count and (absolute < APP_START or end_absolute > APP_END):
+                _hex_context(
+    number, "data address range 0x%08x..0x%08x is outside application range" %
+     (absolute, end_absolute - 1))
+            for offset, value in enumerate(payload):
+                current = absolute + offset
+                previous = memory.get(current)
+                if previous is not None and previous != value:
+                    _hex_context(
+    number,
+    "conflicting overlap at 0x%08x" %
+     current)
+                memory[current] = value
+        elif kind == 1:
+            if count or address:
+                _hex_context(number, "EOF must have zero length and address")
+            eof_seen = True
+        elif kind == 4:
+            if count != 2:
+                _hex_context(
+    number, "extended linear address record length must be 2")
+            if address:
+                _hex_context(
+    number, "extended linear address record address must be zero")
+            linear_base = int.from_bytes(payload, "big") << 16
+        elif kind == 5:
+            if count != 4:
+                _hex_context(
+    number, "start linear address record length must be 4")
+            if address:
+                _hex_context(
+    number, "start linear address record address must be zero")
+            if start_linear is not None:
+                _hex_context(number, "duplicate start linear address record")
+            start_linear = int.from_bytes(payload, "big")
+            start_target = start_linear & ~1
+            if not APP_START <= start_target < APP_END:
+                _hex_context(
+    number, "start linear address is outside application range")
+        elif kind in (2, 3):
+            _hex_context(
+    number,
+    "unsupported Intel HEX record type %02x" %
+     kind)
+        else:
+            _hex_context(number, "unknown Intel HEX record type %02x" % kind)
+    if not eof_seen:
+        raise ToolError("Intel HEX is missing EOF record")
+    if not memory:
+        raise ToolError("Intel HEX contains no application data")
+    missing_vectors = [
+    address for address in range(
+        APP_START,
+        APP_START +
+         8) if address not in memory]
+    if missing_vectors:
+        raise ToolError(
+            "Intel HEX is missing vector bytes at application base")
+    stack_pointer, reset_handler = struct.unpack(
+    "<II", bytes(
+        memory[address] for address in range(
+            APP_START, APP_START + 8)))
+    if not RAM_START <= stack_pointer <= RAM_END:
+        raise ToolError("stack pointer 0x%08x is outside SRAM" % stack_pointer)
+    if stack_pointer & 7:
+        raise ToolError(
+    "stack pointer 0x%08x is not eight-byte aligned" %
+     stack_pointer)
+    if not reset_handler & 1:
+        raise ToolError(
+    "reset handler 0x%08x does not set the Thumb bit" %
+     reset_handler)
+    reset_target = reset_handler & ~1
+    if not APP_START <= reset_target < APP_END:
+        raise ToolError(
+    "reset target 0x%08x is outside application range" %
+     reset_target)
+    if reset_target not in memory:
+        raise ToolError(
+    "reset target 0x%08x is not mapped executable data" %
+     reset_target)
+    addresses = sorted(memory)
+    intervals = []
+    start = previous = addresses[0]
+    for address in addresses[1:]:
+        if address != previous + 1:
+            intervals.append([start, previous + 1])
+            start = address
+        previous = address
+    intervals.append([start, previous + 1])
+    holes = [[left[1], right[0]] for left, right in zip(
+        intervals, intervals[1:]) if left[1] != right[0]]
+    if intervals[-1][1] < APP_END:
+        holes.append([intervals[-1][1], APP_END])
+    normalized = bytearray(b"\xff" * (APP_END - APP_START))
+    for address, value in memory.items():
+        normalized[address - APP_START] = value
+    return {
+        "memory": memory,
+        "mapped_byte_count": len(memory),
+        "intervals": intervals,
+        "holes": holes,
+        "stack_pointer": stack_pointer,
+        "reset_handler": reset_handler,
+        "reset_target": reset_target,
+        "start_linear_address": start_linear,
+        "normalization": NORMALIZATION,
+        "normalized_sha256": hashlib.sha256(normalized).hexdigest(),
+    }
+
+
+REQUIRED_CONFIG = {
+    "MACH_STM32": "y",
+    "MACH_N32G430F8S7": "y",
+    "C5_LEVELBOARD": "y",
+    "MCU": "stm32f103xe",
+    "STM32_SERIAL_USART1": "y",
+    "FLASH_APPLICATION_ADDRESS": "0x08004000",
+    "FLASH_BOOT_ADDRESS": "0x08000000",
+    "FLASH_SIZE": "0x10000",
+    "RAM_START": "0x20000000",
+    "RAM_SIZE": "0x4000",
+    "CLOCK_FREQ": "128000000",
+    "CLOCK_REF_FREQ": "8000000",
+    "SERIAL_BAUD": "230400",
+    "SERIAL_RX_BUFFER_SIZE": "384",
+}
+
+REQUIRED_CONSTANTS = {
+    "ADC_MAX": 4095,
+    "CLOCK_FREQ": 128000000,
+    "RECEIVE_WINDOW": 384,
+    "RESERVE_PINS_serial": "PH10,PH9",
+    "SERIAL_BAUD": 230400,
+    "STATS_SUMSQ_BASE": 256,
+}
+
+REQUIRED_COMMANDS = {
+    "identify offset=%u count=%c",
+    "set_trigger_threshold threshold=%i",
+    "get_mcu_version",
+    "get_basic_param num=%u",
+    "remove_peel action=%u",
+    "clear_shutdown",
+    "emergency_stop",
+    "get_uptime",
+    "get_clock",
+    "finalize_config crc=%u",
+    "get_config",
+    "allocate_oids count=%c",
+    "stepper_stop_on_trigger oid=%c trsync_oid=%c",
+    "endstop_recover_state oid=%c",
+    "endstop_query_state oid=%c",
+    "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c "
+    "rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
+    "config_endstop oid=%c pin=%c pull_up=%c",
+    "trsync_trigger oid=%c reason=%c",
+    "trsync_set_timeout oid=%c clock=%u",
+    "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
+    "config_trsync oid=%c",
+    "reset",
+}
+
+REQUIRED_RESPONSES = {
+    "identify_response offset=%u data=%.*s",
+    "trigger_threshold threshold=%i",
+    "mcu_version year=%u date=%u version=%u",
+    "param_value value=%u reserve=%u",
+    "peel_data value=%i",
+    "uptime high=%u clock=%u",
+    "clock clock=%u",
+    "config is_config=%c crc=%u is_shutdown=%c move_count=%hu",
+    "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c",
+    "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
+    "starting",
+    "is_shutdown static_string_id=%hu",
+    "shutdown clock=%u static_string_id=%hu",
+}
+
+
+def _unsupported_build_path(value):
+    return re.fullmatch(r"[A-Za-z0-9_./+\-]+", str(value)) is None
+
+
+def _tool_path(name):
+    try:
+        found = shutil.which(name)
+        path = str(Path(found).resolve()) if found else None
+    except (OSError, RuntimeError):
+        path = None
+    if not path:
+        raise ToolError("required external tool is unavailable: %s" % name, 3)
+    if _unsupported_build_path(path):
+        raise ToolError("unsupported build path for %s" % name)
+    return path
+
+
+def _run(command, logical_name, cwd=REPO_ROOT, env=None):
+    try:
+        result = subprocess.run(
+    command,
+    cwd=cwd,
+    env=env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+     check=False)
+    except OSError as exc:
+        raise ToolError("unable to run %s: %s" % (logical_name, exc), 3)
+    if result.returncode:
+        diagnostic = result.stderr.decode("utf-8", "replace").strip()
+        if not diagnostic:
+            diagnostic = result.stdout.decode("utf-8", "replace").strip()
+        diagnostic = sanitize_diagnostic(diagnostic)
+        if len(diagnostic) > 1000:
+            diagnostic = diagnostic[-1000:]
+        raise ToolError("%s failed%s" % (logical_name,
+                        ": " + diagnostic if diagnostic else ""), 3)
+    return result.stdout
+
+
+def _version(program):
+    try:
+        result = subprocess.run([program,
+    "--version"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    check=False,
+     timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unavailable"
+    if result.returncode:
+        return "unavailable"
+    line = result.stdout.decode("utf-8", "replace").splitlines()
+    if not line:
+        return "unavailable"
+    value = line[0].strip()
+    base = Path(program).name
+    value = re.sub(r"^.*[\\/]" + re.escape(base) + r"\s*", "", value)
+    return value[:240]
+
+
+def _load_resolved_config(config_path):
+    module_path = REPO_ROOT / "lib" / "kconfiglib"
+    sys.path.insert(0, str(module_path))
+    old_srctree = os.environ.get("srctree")
+    os.environ["srctree"] = str(REPO_ROOT)
+    try:
+        import kconfiglib
+        kconf = kconfiglib.Kconfig(str(REPO_ROOT / "src" / "Kconfig"),
+                                   warn=False)
+        kconf.load_config(str(config_path))
+        values = {}
+        for name in REQUIRED_CONFIG:
+            symbol = kconf.syms.get(name)
+            if symbol is None:
+                raise ToolError(
+    "required Kconfig symbol is missing: %s" %
+     name)
+            values[name] = symbol.str_value
+        for forbidden in ("MACH_STM32F1", "MACH_N32G45x"):
+            symbol = kconf.syms.get(forbidden)
+            if symbol is not None and symbol.str_value == "y":
+                raise ToolError(
+    "incompatible hardware Kconfig selected: %s" %
+     forbidden)
+    except ToolError:
+        raise
+    except (OSError, UnicodeError, ValueError):
+        raise ToolError("unable to resolve supplied Kconfig")
+    finally:
+        if old_srctree is None:
+            os.environ.pop("srctree", None)
+        else:
+            os.environ["srctree"] = old_srctree
+        try:
+            sys.path.remove(str(module_path))
+        except ValueError:
+            pass
+    for name, expected in REQUIRED_CONFIG.items():
+        actual = values[name]
+        if name in (
+    "FLASH_APPLICATION_ADDRESS",
+    "FLASH_BOOT_ADDRESS",
+    "FLASH_SIZE",
+    "RAM_START",
+     "RAM_SIZE"):
+            try:
+                matches = int(actual, 0) == int(expected, 0)
+            except ValueError:
+                matches = False
+        else:
+            matches = actual == expected
+        if not matches:
+            raise ToolError("resolved Kconfig %s is %s, expected %s" %
+                            (name, actual, expected))
+    return values
+
+
+def _load_resolved_config_text(config_text):
+    if not isinstance(config_text, str) or not config_text:
+        raise ToolError("dictionary Kconfig is missing or invalid")
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / ".config"
+            config_path.write_text(config_text, encoding="utf-8", newline="\n")
+            return _load_resolved_config(config_path)
+    except OSError:
+        raise ToolError("unable to validate dictionary Kconfig")
+
+
+def _parse_sections(text, elf_size):
+    sections = []
+    lines = text.splitlines()
+    pattern = re.compile(
+        r"^\s*\d+\s+(\S+)\s+([0-9a-fA-F]{8,16})\s+"
+        r"([0-9a-fA-F]{8,16})\s+([0-9a-fA-F]{8,16})\s+"
+        r"([0-9a-fA-F]{8,16})\s+2\*\*\d+\s*$")
+    index = 0
+    while index < len(lines):
+        match = pattern.match(lines[index])
+        if not match:
+            if re.match(r"^\s*\d+\s+", lines[index]):
+                raise ToolError("ambiguous objdump section output")
+            index += 1
+            continue
+        if index + 1 >= len(lines):
+            raise ToolError("ambiguous objdump section output")
+        flags = {item.strip() for item in lines[index + 1].strip().split(",")}
+        if not flags or any(not item for item in flags):
+            raise ToolError(
+    "ambiguous objdump flags for section %s" %
+     match.group(1))
+        section = {
+            "name": match.group(1), "size": int(match.group(2), 16),
+            "vma": int(match.group(3), 16), "lma": int(match.group(4), 16),
+            "offset": int(match.group(5), 16), "flags": flags,
+        }
+        if section["size"] and "CONTENTS" in flags:
+            end = section["offset"] + section["size"]
+            if end < section["offset"] or end > elf_size:
+                raise ToolError(
+    "ELF section %s exceeds file bounds" %
+     section["name"])
+        sections.append(section)
+        index += 2
+    if not sections:
+        raise ToolError("objdump reported no ELF sections")
+    return sections
+
+
+def _redact_dictionary_metadata(value):
+    value = str(value)
+    if (len(value) > 240 or any(ord(char) < 0x20 for char in value) or
+            re.search(r"(?i)(?:[a-z]:[\\/]|/|\\\\)", value)):
+        return "[redacted: unsafe metadata]"
+    return value
+
+
+def _load_dictionary(data):
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (AttributeError, UnicodeDecodeError, ValueError) as exc:
+        raise ToolError("invalid protocol dictionary JSON: %s" % exc)
+    sys.path.insert(0, str(REPO_ROOT / "klippy"))
+    previous_logging_disable = logging.root.manager.disable
+    try:
+        import msgproto
+        parser = msgproto.MessageParser()
+        logging.disable(logging.CRITICAL)
+        try:
+            parser.process_identify(data, decompress=False)
+        except Exception as exc:
+            raise ToolError("invalid protocol dictionary: %s" % exc)
+        finally:
+            logging.disable(previous_logging_disable)
+    finally:
+        try:
+            sys.path.remove(str(REPO_ROOT / "klippy"))
+        except ValueError:
+            pass
+    constants = parser.get_constants()
+    for name, expected in REQUIRED_CONSTANTS.items():
+        if constants.get(name) != expected:
+            raise ToolError(
+    "dictionary constant %s does not match required value" %
+     name)
+    resolved_config = _load_resolved_config_text(parser.get_kconfig())
+    raw_tables = {"command": raw.get("commands", {}),
+                  "response": raw.get("responses", {}),
+                  "output": raw.get("output", {})}
+    id_bindings = {}
+    name_bindings = {}
+    format_bindings = {}
+    for msgtype, table in raw_tables.items():
+        if not isinstance(table, dict):
+            raise ToolError("dictionary message table is invalid")
+        for msgformat, msgid in table.items():
+            if not isinstance(msgformat, str) or not isinstance(msgid, int):
+                raise ToolError("dictionary message assignment is invalid")
+            binding = (msgtype, msgformat)
+            previous = id_bindings.setdefault(msgid, binding)
+            if previous != binding:
+                raise ToolError(
+                    "dictionary has conflicting message ID assignments")
+            previous_format = format_bindings.setdefault(msgformat,
+                                                         (msgtype, msgid))
+            if previous_format != (msgtype, msgid):
+                raise ToolError(
+                    "dictionary has conflicting message format assignments")
+            if msgtype != "output":
+                name = msgformat.split(" ", 1)[0]
+                name_binding = (msgid, msgtype, msgformat)
+                previous_name = name_bindings.setdefault(name, name_binding)
+                if previous_name != name_binding:
+                    raise ToolError(
+                        "dictionary has conflicting non-output message names")
+    classified = {}
+    for msgid, msgtype, msgformat in parser.get_messages():
+        if msgformat in format_bindings:
+            classified[msgformat] = (msgid, msgtype)
+    message_types = {"command": set(), "response": set(), "output": set()}
+    for msgformat, (expected_type, expected_id) in format_bindings.items():
+        if classified.get(msgformat) != (expected_id, expected_type):
+            raise ToolError(
+                "dictionary message membership conflicts with MessageParser")
+        message_types[expected_type].add(msgformat)
+    missing_commands = REQUIRED_COMMANDS - message_types["command"]
+    missing_responses = REQUIRED_RESPONSES - message_types["response"]
+    if missing_commands:
+        raise ToolError(
+    "dictionary is missing required command membership: %s" %
+     sorted(missing_commands)[0])
+    if missing_responses:
+        raise ToolError(
+    "dictionary is missing required response membership: %s" %
+     sorted(missing_responses)[0])
+    command_names = {item.split(" ", 1)[0]
+                                for item in message_types["command"]}
+    response_names = {item.split(" ", 1)[0]
+                                 for item in message_types["response"]}
+    for forbidden in ("config_reset", "config_analog_in", "query_analog_in"):
+        if forbidden in command_names:
+            raise ToolError(
+    "forbidden dictionary command is present: %s" %
+     forbidden)
+    if "endstop_recover_state" in response_names:
+        raise ToolError(
+            "forbidden dictionary response is present: endstop_recover_state")
+    all_formats = set().union(*message_types.values())
+    if any(item.split(" ", 1)[0] == "Levelboard" for item in all_formats):
+        raise ToolError("forbidden Levelboard dictionary format is present")
+    if raw.get("commands", {}).get("identify offset=%u count=%c") != 1:
+        raise ToolError("bootstrap identify message ID is not 1")
+    if raw.get("responses", {}).get(
+        "identify_response offset=%u data=%.*s") != 0:
+        raise ToolError("bootstrap identify_response message ID is not 0")
+    version, build_versions = parser.get_version_info()
+    return {
+    "constants": {
+        name: constants[name] for name in sorted(REQUIRED_CONSTANTS)},
+        "version": _redact_dictionary_metadata(version),
+        "build_versions": _redact_dictionary_metadata(build_versions),
+        "kconfig": "[redacted: validated separately]",
+        "resolved_config": resolved_config,
+         }
+
+
+def _read_input_file(value):
+    name = Path(value).name
+    try:
+        path = Path(value).expanduser().resolve(strict=False)
+        if not path.is_file():
+            raise ToolError("required input is missing: %s" % name)
+        data = path.read_bytes()
+    except ToolError:
+        raise
+    except (OSError, RuntimeError):
+        raise ToolError("unable to read required input: %s" % name)
+    if not data:
+        raise ToolError("firmware input is empty: %s" % name)
+    return path, data
+def validate_firmware(firmware, elf, dictionary, cross_prefix="arm-none-eabi-",
+                      openssl="openssl"):
+    firmware, exact_hex = _read_input_file(firmware)
+    elf, elf_data = _read_input_file(elf)
+    dictionary, dictionary_data = _read_input_file(dictionary)
+    image = parse_ihex(exact_hex)
+    objdump = _tool_path(cross_prefix + "objdump")
+    nm = _tool_path(cross_prefix + "nm")
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    file_info = _run([objdump, "-f", str(elf)], "objdump",
+                     env=env).decode("ascii", "replace")
+    if "file format elf32-littlearm" not in file_info or not re.search(
+        r"architecture:\s*arm", file_info):
+        raise ToolError(
+            "ELF is not an expected ELF32 little-endian ARM executable")
+    entries = re.findall(r"start address 0x([0-9a-fA-F]+)", file_info)
+    if len(entries) != 1:
+        raise ToolError("objdump did not report exactly one ELF entry point")
+    elf_entry = int(entries[0], 16)
+    if (image["start_linear_address"] is not None and
+            (image["start_linear_address"] & ~1) != (elf_entry & ~1)):
+        raise ToolError(
+            "Intel HEX start linear address does not match ELF entry point")
+    section_text = _run([objdump, "-h", str(elf)], "objdump",
+                        env=env).decode("ascii", "replace")
+    sections = _parse_sections(section_text, len(elf_data))
+    file_backed = []
+    code_ranges = []
+    allowed = set()
+    for section in sections:
+        size = section["size"]
+        flags = section["flags"]
+        if not size or "ALLOC" not in flags:
+            continue
+        vma_end = section["vma"] + size
+        in_flash = (APP_START <= section["vma"] and vma_end <= APP_END)
+        in_ram = (RAM_START <= section["vma"] and vma_end <= RAM_END)
+        has_load_image = "CONTENTS" in flags and "LOAD" in flags
+        if has_load_image:
+            if vma_end > 0x100000000 or (not in_flash and not in_ram):
+                if (RAM_START <= section["vma"] <= RAM_END or
+                        section["vma"] < RAM_START < vma_end):
+                    raise ToolError(
+    "RAM section %s crosses SRAM bounds" %
+     section["name"])
+                raise ToolError(
+    "allocated section %s is outside flash and SRAM" %
+     section["name"])
+            end = section["lma"] + size
+            if (end > 0x100000000 or section["lma"] < APP_START or
+                    end > APP_END):
+                raise ToolError(
+    "ELF load section %s crosses application flash bounds" %
+     section["name"])
+            body = elf_data[section["offset"]:section["offset"] + size]
+            for offset, value in enumerate(body):
+                address = section["lma"] + offset
+                if image["memory"].get(address) != value:
+                    raise ToolError("ELF/HEX mismatch in %s at 0x%08x" %
+                                    (section["name"], address))
+                allowed.add(address)
+            file_backed.append(section)
+            if "CODE" in flags:
+                code_ranges.append((section["vma"], vma_end))
+        elif vma_end > 0x100000000 or not in_ram:
+            raise ToolError(
+    "RAM ALLOC/NOLOAD section %s is outside SRAM bounds" %
+     section["name"])
+    extra = sorted(set(image["memory"]) - allowed)
+    if extra:
+        raise ToolError(
+    "HEX has byte outside ELF load sections at 0x%08x" %
+     extra[0])
+    if not any(start <= image["reset_target"] <
+               end for start, end in code_ranges):
+        raise ToolError("reset target is not within an ELF CODE section")
+    nm_text = _run([nm, "-S", "--defined-only", str(elf)],
+                   "nm", env=env).decode("ascii", "replace")
+    matches = re.findall(
+    r"^([0-9a-fA-F]+)\s+([0-9a-fA-F]+)\s+\S\s+command_identify_data$",
+    nm_text,
+     re.MULTILINE)
+    if len(matches) != 1:
+        raise ToolError(
+            "ELF must define exactly one sized command_identify_data symbol")
+    symbol_address, symbol_size = (int(item, 16) for item in matches[0])
+    owner = [section for section in file_backed
+             if section["vma"] <= symbol_address and
+             symbol_address + symbol_size <= section["vma"] + section["size"]]
+    if len(owner) != 1 or not symbol_size:
+        raise ToolError(
+            "command_identify_data is not contained in one ELF load section")
+    section = owner[0]
+    position = section["offset"] + symbol_address - section["vma"]
+    compressed = elf_data[position:position + symbol_size]
+    try:
+        embedded = zlib.decompress(compressed)
+    except zlib.error as exc:
+        raise ToolError("embedded dictionary is not valid zlib data: %s" % exc)
+    if embedded != dictionary_data:
+        raise ToolError(
+            "supplied dictionary does not match embedded dictionary")
+    dictionary_report = _load_dictionary(dictionary_data)
+    report = {key: value for key, value in image.items() if key != "memory"}
+    report.update({
+        "bounds": {"application": [APP_START, APP_END],
+                   "sram": [RAM_START, RAM_END]},
+        "hex_sha256": hashlib.sha256(exact_hex).hexdigest(),
+        "elf_sha256": hashlib.sha256(elf_data).hexdigest(),
+        "dictionary_sha256": hashlib.sha256(dictionary_data).hexdigest(),
+        "constants": dictionary_report["constants"],
+        "dictionary": {key: dictionary_report[key]
+                       for key in ("version", "build_versions", "kconfig")},
+        "resolved_config": dictionary_report["resolved_config"],
+        "tools": {
+            "python": sys.version.splitlines()[0],
+            "compiler": _version(_tool_path(cross_prefix + "gcc")),
+            "objcopy": _version(_tool_path(cross_prefix + "objcopy")),
+            "openssl": _version(openssl),
+        },
+    })
+    return report
+
+
+def build_firmware(output_dir, jobs=1, cross_prefix="arm-none-eabi-",
+                   openssl="openssl"):
+    if not isinstance(jobs, int) or jobs < 1:
+        raise ToolError("jobs must be a positive integer")
+    output = validate_output_root(output_dir)
+    try:
+        if output.exists():
+            if not output.is_dir():
+                raise ToolError("build output path is not a directory")
+            if any(output.iterdir()):
+                raise ToolError("build output directory is not empty")
+        else:
+            output.mkdir(parents=True)
+    except ToolError:
+        raise
+    except (OSError, RuntimeError):
+        raise ToolError("unable to prepare build output directory")
+    try:
+        python_path = Path(sys.executable).resolve()
+        repository_path = REPO_ROOT.resolve()
+    except (OSError, RuntimeError):
+        raise ToolError("unable to resolve required build paths")
+    for item in (repository_path, output, python_path, cross_prefix):
+        if _unsupported_build_path(item):
+            raise ToolError(
+                "unsupported build path contains whitespace or Make "
+                "metacharacters")
+    make = _tool_path("make")
+    gcc = _tool_path(cross_prefix + "gcc")
+    objcopy = _tool_path(cross_prefix + "objcopy")
+    for suffix in ("as", "ld", "nm", "objdump"):
+        _tool_path(cross_prefix + suffix)
+    libc_name = _run([gcc, "-print-file-name=libc_nano.a"],
+                     "ARM GCC").decode().strip()
+    if not libc_name or libc_name == "libc_nano.a" or not Path(
+        libc_name).is_file():
+        raise ToolError("ARM GCC newlib nano library is unavailable", 3)
+    config = output / ".config"
+    products_dir = output
+    try:
+        config.write_text(SEED_CONFIG, encoding="ascii", newline="\n")
+    except OSError:
+        raise ToolError("unable to write build configuration")
+    make_out = str(products_dir) + os.sep
+    env = os.environ.copy()
+    for name in ("MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "KCONFIG_CONFIG"):
+        env.pop(name, None)
+    env["LC_ALL"] = "C"
+    common = [make, "OUT=" + make_out, "KCONFIG_CONFIG=" + str(config),
+              "PYTHON=" + str(python_path), "CROSS_PREFIX=" + cross_prefix]
+    _run(common + ["olddefconfig"], "make olddefconfig", env=env)
+    resolved = _load_resolved_config(config)
+    _run(common + ["-j%d" % jobs, "all"], "firmware build", env=env)
+    elf = output / "klipper.elf"
+    binary = output / "klipper.bin"
+    dictionary = output / "klipper.dict"
+    firmware = output / "levelBoard.hex"
+    for path in (elf, binary, dictionary):
+        try:
+            valid = path.is_file() and bool(path.stat().st_size)
+        except OSError:
+            raise ToolError(
+    "unable to inspect build product: %s" %
+     path.name, 3)
+        if not valid:
+            raise ToolError("build did not produce nonempty %s" % path.name, 3)
+    _run([objcopy, "-O", "ihex", str(elf), str(firmware)], "objcopy", env=env)
+    try:
+        valid_firmware = firmware.is_file() and bool(firmware.stat().st_size)
+    except OSError:
+        raise ToolError("unable to inspect levelBoard.hex", 3)
+    if not valid_firmware:
+        raise ToolError("objcopy did not produce levelBoard.hex", 3)
+    validation = validate_firmware(
+    firmware, elf, dictionary, cross_prefix, openssl)
+    validation["resolved_config"] = resolved
+    return {
+        "stage": "build",
+        "products": {"elf": elf.name, "bin": binary.name,
+                     "firmware": firmware.name, "dictionary": dictionary.name,
+                     "config": config.name},
+        "firmware": validation,
+    }
+
+
+class _ArchiveBudget:
+    def __init__(self):
+        self.expanded_bytes = 0
+        self.members = 0
+
+    def charge(self, size, context):
+        if size < 0 or self.expanded_bytes + size > MAX_TOTAL_EXPANDED:
+            raise ToolError("cumulative archive expansion limit exceeded while "
+                            "reading %s" % context)
+        self.expanded_bytes += size
+
+    def member(self, label):
+        self.members += 1
+        if self.members > MAX_ARCHIVE_MEMBERS:
+            raise ToolError("archive member limit exceeded in %s" % label)
+
+
+def _tar_number(raw, field, label):
+    value = raw.rstrip(b"\0 ").lstrip(b" ")
+    if not value:
+        return 0
+    if any(byte < ord("0") or byte > ord("7") for byte in value):
+        raise ToolError("%s has an invalid tar %s field" % (label, field))
+    return int(value, 8)
+
+
+def _tar_checksum_valid(header, label=None):
+    try:
+        stored = _tar_number(header[148:156], "checksum", label or "tar header")
+    except ToolError:
+        return False
+    unsigned = sum(header[:148]) + 8 * ord(" ") + sum(header[156:])
+    signed = sum(byte if byte < 128 else byte - 256 for byte in header[:148])
+    signed += 8 * ord(" ")
+    signed += sum(byte if byte < 128 else byte - 256 for byte in header[156:])
+    return stored in (unsigned, signed)
+
+
+def _tar_magic(data):
+    return (len(data) >= 512 and
+            data[257:263] in (b"ustar\0", b"ustar "))
+
+
+def _decode_tar_field(raw, field, label):
+    nul = raw.find(b"\0")
+    if nul >= 0:
+        if any(raw[nul + 1:]):
+            raise ToolError("%s has an embedded NUL in tar %s" % (label, field))
+        raw = raw[:nul]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ToolError("%s has a non-UTF-8 tar %s" % (label, field))
+
+
+def _has_drive_prefixed_component(parts):
+    return any(re.match(r"^[A-Za-z]:", part)
+               for part in parts if part not in ("", ".", ".."))
+
+
+def _canonical_member_path(name, label):
+    if not name:
+        raise ToolError("%s has an empty archive member path" % label)
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ToolError("%s member path contains a control character: %r" %
+                        (label, name))
+    if "\\" in name:
+        raise ToolError("%s member path contains a backslash: %s" %
+                        (label, name))
+    if name.startswith("/"):
+        raise ToolError("%s member path is absolute: %s" % (label, name))
+    raw_parts = name.split("/")
+    if _has_drive_prefixed_component(raw_parts):
+        raise ToolError("%s member path has a Windows drive prefix: %s" %
+                        (label, name))
+    parts = []
+    for part in raw_parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ToolError("%s member path contains traversal: %s" %
+                            (label, name))
+        parts.append(part)
+    return "/".join(parts) if parts else "."
+
+
+def _link_target_parts(member_path, target, is_hardlink, label):
+    kind = "hardlink" if is_hardlink else "symlink"
+    if not target:
+        raise ToolError("%s has an empty %s target for %s" %
+                        (label, kind, member_path))
+    if any(ord(char) < 32 or ord(char) == 127 for char in target):
+        raise ToolError("%s %s target contains a control character: %s" %
+                        (label, kind, member_path))
+    if "\\" in target:
+        raise ToolError("%s %s target contains a backslash: %s" %
+                        (label, kind, member_path))
+    if target.startswith("/"):
+        raise ToolError("%s %s target is absolute: %s" %
+                        (label, kind, member_path))
+    parts = target.split("/")
+    if _has_drive_prefixed_component(parts):
+        raise ToolError("%s %s target has a drive prefix: %s" %
+                        (label, kind, member_path))
+    return parts
+
+
+def _resolve_archive_path(member_path, target_parts, is_hardlink,
+                          symlinks, label):
+    kind = "hardlink" if is_hardlink else "symlink"
+    resolved = [] if is_hardlink else member_path.split("/")[:-1]
+    active = set() if is_hardlink else {member_path}
+    frames = [[target_parts, 0, None]]
+    traversals = 0
+    while frames:
+        components, index, owner = frames[-1]
+        if index == len(components):
+            frames.pop()
+            if owner is not None:
+                active.remove(owner)
+            continue
+        part = components[index]
+        frames[-1][1] += 1
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                raise ToolError("%s %s target escapes archive root: %s" %
+                                (label, kind, member_path))
+            resolved.pop()
+            continue
+        candidate = "/".join(resolved + [part])
+        linked_parts = symlinks.get(candidate)
+        if linked_parts is None:
+            resolved.append(part)
+            continue
+        if candidate in active:
+            raise ToolError("%s has a symlink cycle involving %s" %
+                            (label, member_path))
+        traversals += 1
+        if traversals > MAX_ARCHIVE_MEMBERS:
+            raise ToolError("%s symlink traversal limit exceeded while "
+                            "resolving %s" % (label, member_path))
+        active.add(candidate)
+        frames.append([linked_parts, 0, candidate])
+    return "/".join(resolved) if resolved else "."
+
+
+def _validate_tar_relationships(members, label):
+    by_path = {}
+    for member in members:
+        path = member["canonical_path"]
+        if path in by_path:
+            raise ToolError("%s has a conflicting duplicate path: %s" %
+                            (label, path))
+        by_path[path] = member
+        if path == "." and member["type"] != "directory":
+            raise ToolError("%s archive root member is not a directory" %
+                            label)
+
+    for member in members:
+        path = member["canonical_path"]
+        if path == ".":
+            continue
+        components = path.split("/")
+        for count in range(1, len(components)):
+            ancestor = "/".join(components[:count])
+            parent = by_path.get(ancestor)
+            if parent is None:
+                continue
+            if parent["type"] == "symlink":
+                raise ToolError("%s member %s is under symlink ancestor %s" %
+                                (label, path, ancestor))
+            if parent["type"] != "directory":
+                raise ToolError(
+                    "%s member %s has non-directory file parent %s" %
+                    (label, path, ancestor))
+
+    symlinks = {}
+    hardlink_parts = {}
+    for member in members:
+        kind = member["type"]
+        if kind not in ("symlink", "hardlink"):
+            continue
+        is_hardlink = kind == "hardlink"
+        parts = _link_target_parts(
+            member["canonical_path"], member["link_target"],
+            is_hardlink, label)
+        if is_hardlink:
+            hardlink_parts[member["canonical_path"]] = parts
+        else:
+            symlinks[member["canonical_path"]] = parts
+
+    for origin, parts in symlinks.items():
+        by_path[origin]["_resolved_target"] = _resolve_archive_path(
+            origin, parts, False, symlinks, label)
+
+    hardlinks = {}
+    for origin, parts in hardlink_parts.items():
+        resolved = _resolve_archive_path(
+            origin, parts, True, symlinks, label)
+        by_path[origin]["_resolved_target"] = resolved
+        hardlinks[origin] = resolved
+
+    for origin in hardlinks:
+        seen = set()
+        current = origin
+        while current in hardlinks:
+            if current in seen:
+                raise ToolError("%s has a hardlink cycle involving %s" %
+                                (label, origin))
+            seen.add(current)
+            current = hardlinks[current]
+        target = by_path.get(current)
+        if target is None:
+            raise ToolError("%s has a dangling hardlink %s -> %s" %
+                            (label, origin, current))
+        if target["type"] != "file":
+            raise ToolError(
+                "%s hardlink %s does not resolve to a regular file" %
+                (label, origin))
+        by_path[origin]["_hardlink_source"] = current
+
+
+def _parse_tar(data, label, budget, depth, decrypt, openssl):
+    members = []
+    offset = 0
+    header_number = 0
+    while True:
+        if offset + 512 > len(data):
+            raise ToolError(
+                "%s tar is truncated before its end marker" % label)
+        header = data[offset:offset + 512]
+        if header == b"\0" * 512:
+            if offset + 1024 > len(data):
+                raise ToolError("%s tar is truncated in its end marker" % label)
+            if data[offset + 512:offset + 1024] != b"\0" * 512:
+                raise ToolError("%s tar has only one zero end block" % label)
+            if any(data[offset + 1024:]):
+                raise ToolError(
+                    "%s tar has trailing nonpadding garbage" % label)
+            break
+        header_number += 1
+        header_label = "%s tar header %d" % (label, header_number)
+        if header[257:263] not in (b"ustar\0", b"ustar "):
+            raise ToolError("%s has unsupported or missing tar magic" %
+                            header_label)
+        if not _tar_checksum_valid(header, header_label):
+            raise ToolError("%s checksum mismatch" % header_label)
+        name = _decode_tar_field(header[:100], "name", header_label)
+        prefix = _decode_tar_field(header[345:500], "prefix", header_label)
+        if prefix:
+            name = prefix + "/" + name
+        canonical = _canonical_member_path(name, label)
+        size = _tar_number(header[124:136], "size", header_label)
+        mode = _tar_number(header[100:108], "mode", header_label)
+        uid = _tar_number(header[108:116], "uid", header_label)
+        gid = _tar_number(header[116:124], "gid", header_label)
+        mtime = _tar_number(header[136:148], "mtime", header_label)
+        linkname = _decode_tar_field(header[157:257], "link name", header_label)
+        uname = _decode_tar_field(header[265:297], "user name", header_label)
+        gname = _decode_tar_field(header[297:329], "group name", header_label)
+        kind_byte = header[156:157]
+        if kind_byte in (b"", b"\0", b"0"):
+            kind = "file"
+        elif kind_byte == b"5":
+            kind = "directory"
+        elif kind_byte == b"2":
+            kind = "symlink"
+        elif kind_byte == b"1":
+            kind = "hardlink"
+        elif kind_byte == b"S":
+            raise ToolError("%s contains sparse member %s" % (label, name))
+        elif kind_byte in (b"3", b"4"):
+            raise ToolError("%s contains device member %s" % (label, name))
+        elif kind_byte == b"6":
+            raise ToolError("%s contains FIFO member %s" % (label, name))
+        else:
+            raise ToolError("%s contains unrecognized special member %s "
+                            "(type %r)" % (label, name, kind_byte))
+        if kind != "file" and size:
+            raise ToolError("%s non-file member %s has a nonzero size" %
+                            (label, name))
+        content_start = offset + 512
+        padded_size = (size + 511) & ~511
+        content_end = content_start + size
+        next_offset = content_start + padded_size
+        if (content_end < content_start or next_offset < content_start or
+                next_offset > len(data)):
+            raise ToolError("%s tar member %s is truncated" % (label, name))
+        budget.member(label)
+        budget.charge(size, "member %s" % name)
+        content = data[content_start:content_end]
+        link_target = linkname if kind in ("symlink", "hardlink") else None
+        digest = None
+        if kind == "file":
+            digest = hashlib.sha256(content).hexdigest()
+        elif link_target is not None:
+            digest = hashlib.sha256(link_target.encode("utf-8")).hexdigest()
+        member = {
+            "path": name,
+            "canonical_path": canonical,
+            "type": kind,
+            "size": size,
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "uname": uname,
+            "gname": gname,
+            "mtime": mtime,
+            "link_target": link_target,
+            "sha256": digest,
+            "leading_dot_slash": name.startswith("./"),
+            "unsafe": False,
+            "_data": content if kind == "file" else None,
+        }
+        members.append(member)
+        offset = next_offset
+
+    _validate_tar_relationships(members, label)
+    for member in members:
+        if member["type"] != "file":
+            continue
+        content = member["_data"]
+        nested_format = _detect_archive_format(content)
+        advertised = member["path"].lower().endswith(_ARCHIVE_SUFFIXES)
+        if nested_format is not None or advertised:
+            if nested_format is None:
+                raise ToolError("archive member %s advertises an archive but "
+                                "has an unknown or malformed format" %
+                                member["path"])
+            try:
+                member["nested"] = _inspect_layer(
+                    content, member["path"], budget, depth + 1,
+                    decrypt, openssl)
+            except ToolError as exc:
+                raise ToolError("archive member %s: %s" %
+                                (member["path"], exc), exc.exit_code)
+    return {
+        "format": "tar",
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "members": members,
+    }
+
+
+def _detect_archive_format(data):
+    if data.startswith(b"Salted__"):
+        return "encrypted"
+    if data.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if data.startswith(b"\xfd7zXZ\x00"):
+        return "xz"
+    if data.startswith(b"BZh"):
+        return "bzip2"
+    if _tar_magic(data) or (len(data) >= 1024 and not any(data)):
+        return "tar"
+    return None
+
+
+def _append_decompressed(output, chunk, label, budget):
+    if len(output) + len(chunk) > MAX_LAYER_BYTES:
+        raise ToolError("%s decompressed layer limit exceeded" % label)
+    budget.charge(len(chunk), "%s decompressed layer" % label)
+    output.extend(chunk)
+
+
+def _decompress_layer(data, kind, label, budget):
+    output = bytearray()
+    magic = {"gzip": b"\x1f\x8b", "xz": b"\xfd7zXZ\x00",
+             "bzip2": b"BZh"}[kind]
+    remaining = data
+    stream_number = 0
+    try:
+        while remaining:
+            if kind == "xz" and stream_number:
+                padding = 0
+                while (padding < len(remaining) and
+                       remaining[padding] == 0):
+                    padding += 1
+                if padding % 4:
+                    raise ToolError("%s xz stream padding length is not a "
+                                    "multiple of four" % label)
+                remaining = remaining[padding:]
+                if not remaining:
+                    break
+            if not remaining.startswith(magic):
+                raise ToolError("%s %s stream has trailing nonpadding "
+                                "garbage" % (label, kind))
+            position = 0
+            if kind == "gzip":
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                pending = b""
+                while not decompressor.eof:
+                    if not pending:
+                        if position >= len(remaining):
+                            raise ToolError("%s %s stream is truncated" %
+                                            (label, kind))
+                        pending = remaining[position:position + 65536]
+                        position += len(pending)
+                    chunk = decompressor.decompress(pending, 65536)
+                    pending = decompressor.unconsumed_tail
+                    _append_decompressed(output, chunk, label, budget)
+                remaining = decompressor.unused_data + remaining[position:]
+            else:
+                if kind == "xz":
+                    decompressor = lzma.LZMADecompressor(
+                        format=lzma.FORMAT_XZ, memlimit=MAX_LAYER_BYTES)
+                else:
+                    decompressor = bz2.BZ2Decompressor()
+                while not decompressor.eof:
+                    if decompressor.needs_input:
+                        if position >= len(remaining):
+                            raise ToolError("%s %s stream is truncated" %
+                                            (label, kind))
+                        compressed = remaining[position:position + 65536]
+                        position += len(compressed)
+                    else:
+                        compressed = b""
+                    chunk = decompressor.decompress(compressed,
+                                                    max_length=65536)
+                    _append_decompressed(output, chunk, label, budget)
+                remaining = decompressor.unused_data + remaining[position:]
+            stream_number += 1
+    except ToolError:
+        raise
+    except (EOFError, OSError, ValueError, zlib.error,
+            lzma.LZMAError) as exc:
+        raise ToolError("%s %s stream is truncated or malformed: %s" %
+                        (label, kind, sanitize_diagnostic(exc)))
+    return bytes(output)
+
+def _openssl_algorithm_unavailable(stderr):
+    lowered = stderr.lower()
+    indicators = ("unsupported", "unknown cipher", "error setting cipher",
+                  "initialization error", "digital envelope routines")
+    return any(indicator in lowered for indicator in indicators)
+
+
+def _openssl_once(data, decrypt, openssl, secret, providers):
+    command = [openssl, "enc", "-des-ede3-cbc"]
+    if decrypt:
+        command.append("-d")
+    command.extend(["-salt", "-md", "md5", "-pass",
+                    "env:C5_UPDATE_PASSPHRASE"])
+    command.extend(providers)
+    environment = os.environ.copy()
+    environment["C5_UPDATE_PASSPHRASE"] = secret
+    try:
+        result = subprocess.run(command, input=data, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=environment,
+                                check=False)
+    except (FileNotFoundError, PermissionError):
+        raise ToolError("OpenSSL executable is unavailable", 3)
+    return result
+
+
+def _openssl_provider_args(openssl, secret):
+    probe = b"Creator 5 update crypto preflight"
+    result = _openssl_once(probe, False, openssl, secret, ())
+    providers = ()
+    if result.returncode:
+        diagnostic = result.stderr.decode("utf-8", "replace")
+        if not _openssl_algorithm_unavailable(diagnostic):
+            raise ToolError("OpenSSL crypto preflight failed: %s" %
+                            sanitize_diagnostic(diagnostic, secret), 3)
+        providers = ("-provider", "default", "-provider", "legacy")
+        result = _openssl_once(probe, False, openssl, secret, providers)
+        if result.returncode:
+            diagnostic = result.stderr.decode("utf-8", "replace")
+            raise ToolError("OpenSSL DES-EDE3-CBC is unavailable: %s" %
+                            sanitize_diagnostic(diagnostic, secret), 3)
+    encrypted = result.stdout
+    if (not encrypted.startswith(b"Salted__") or len(encrypted) < 24 or
+            (len(encrypted) - 16) % 8):
+        raise ToolError("OpenSSL crypto preflight returned invalid ciphertext",
+                        3)
+    checked = _openssl_once(encrypted, True, openssl, secret, providers)
+    if checked.returncode or checked.stdout != probe:
+        diagnostic = checked.stderr.decode("utf-8", "replace")
+        raise ToolError("OpenSSL crypto preflight roundtrip failed: %s" %
+                        sanitize_diagnostic(diagnostic, secret), 3)
+    return providers
+
+
+def openssl_crypt(data, decrypt, openssl="openssl", secret=None):
+    if secret is None:
+        secret = os.environ.get("C5_UPDATE_PASSPHRASE")
+    if not secret:
+        raise ToolError("C5_UPDATE_PASSPHRASE must be nonempty for crypto")
+    if not isinstance(data, bytes):
+        data = bytes(data)
+    if decrypt and (not data.startswith(b"Salted__") or len(data) < 24 or
+                    (len(data) - 16) % 8):
+        raise ToolError("encrypted input has an invalid Salted__ header, salt, "
+                        "or ciphertext length")
+    providers = _openssl_provider_args(openssl, secret)
+    result = _openssl_once(data, decrypt, openssl, secret, providers)
+    if result.returncode:
+        operation = "decryption" if decrypt else "encryption"
+        diagnostic = result.stderr.decode("utf-8", "replace")
+        raise ToolError("OpenSSL %s failed: %s" %
+                        (operation, sanitize_diagnostic(diagnostic, secret)), 3)
+    output = result.stdout
+    if not decrypt and (not output.startswith(b"Salted__") or
+                        len(output) < 24 or (len(output) - 16) % 8):
+        raise ToolError("OpenSSL encryption returned invalid ciphertext", 3)
+    return output
+
+
+def _inspect_layer(data, label, budget, depth, decrypt, openssl):
+    if depth > MAX_ARCHIVE_DEPTH:
+        raise ToolError("archive nesting depth limit exceeded at %s" % label)
+    if len(data) > MAX_LAYER_BYTES:
+        raise ToolError("%s input layer limit exceeded" % label)
+    kind = _detect_archive_format(data)
+    if kind is None:
+        raise ToolError("unknown top-level archive format for %s" % label)
+    if kind == "tar":
+        return _parse_tar(data, label, budget, depth, decrypt, openssl)
+    if kind == "encrypted":
+        if not decrypt:
+            raise ToolError("%s is encrypted; use --decrypt to inspect it" %
+                            label)
+        if len(data) >= 24 and not (len(data) - 16) % 8:
+            maximum_plaintext = len(data) - 17
+            remaining_budget = MAX_TOTAL_EXPANDED - budget.expanded_bytes
+            if maximum_plaintext > remaining_budget:
+                raise ToolError(
+                    "cumulative archive expansion limit exceeded before "
+                    "decrypting %s" % label)
+        plain = openssl_crypt(data, True, openssl)
+        if len(plain) > MAX_LAYER_BYTES:
+            raise ToolError("%s decrypted layer limit exceeded" % label)
+        budget.charge(len(plain), "%s decrypted layer" % label)
+        payload = _inspect_layer(plain, "%s decrypted payload" % label,
+                                 budget, depth + 1, decrypt, openssl)
+        return {
+            "format": "encrypted",
+            "cipher": "des-ede3-cbc",
+            "digest": "md5",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "payload": payload,
+            "_payload": plain,
+        }
+    plain = _decompress_layer(data, kind, label, budget)
+    payload = _inspect_layer(plain, "%s %s payload" % (label, kind),
+                             budget, depth + 1, decrypt, openssl)
+    return {
+        "format": kind,
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "expanded_size": len(plain),
+        "payload": payload,
+        "_payload": plain,
+    }
+
+
+def _sanitized_archive_tree(value):
+    if isinstance(value, dict):
+        return {key: _sanitized_archive_tree(item)
+                for key, item in value.items() if not key.startswith("_")}
+    if isinstance(value, list):
+        return [_sanitized_archive_tree(item) for item in value]
+    return value
+
+
+def _tar_payload_model(model):
+    current = model
+    while current["format"] != "tar":
+        current = current["payload"]
+    return current
+
+
+def _temporary_extract(model):
+    tar_model = _tar_payload_model(model)
+    members = tar_model["members"]
+    root_members = sorted(
+        (member for member in members if member["type"] == "directory"),
+        key=lambda member: member["canonical_path"].count("/"))
+    files = [member for member in members if member["type"] == "file"]
+    links = [member for member in members
+             if member["type"] in ("symlink", "hardlink")]
+    with tempfile.TemporaryDirectory(prefix="c5-update-inspect-") as temp:
+        root = Path(temp).resolve()
+
+        def destination(member):
+            canonical = member["canonical_path"]
+            path = root if canonical == "." else root.joinpath(
+                *canonical.split("/"))
+            resolved = path.resolve(strict=False)
+            if resolved != root and not _inside(resolved, root):
+                raise ToolError(
+                    "temporary extraction containment check failed")
+            return path
+
+        try:
+            for member in root_members:
+                destination(member).mkdir(parents=True, exist_ok=True)
+            for member in files:
+                path = destination(member)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("xb") as output:
+                    output.write(member["_data"])
+                path.chmod(member["mode"] & 0o777)
+            for member in links:
+                path = destination(member)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if member["type"] == "hardlink":
+                    source = root.joinpath(
+                        *member["_hardlink_source"].split("/"))
+                    os.link(source, path)
+                else:
+                    canonical_target = member["_resolved_target"]
+                    target = (root if canonical_target == "." else
+                              root.joinpath(*canonical_target.split("/")))
+                    resolved_target = target.resolve(strict=False)
+                    if (resolved_target != root and
+                            not _inside(resolved_target, root)):
+                        raise ToolError(
+                            "temporary extraction link containment check "
+                            "failed")
+                    os.symlink(member["link_target"], path)
+            for member in reversed(root_members):
+                path = destination(member)
+                if path != root:
+                    path.chmod(member["mode"] & 0o777)
+        except ToolError:
+            raise
+        except OSError as exc:
+            raise ToolError("temporary extraction validation failed: %s" %
+                            sanitize_diagnostic(exc))
+
+
+def inspect_archive(data, decrypt=False, extract_temp=False,
+                    openssl="openssl"):
+    if not isinstance(data, bytes):
+        try:
+            input_size = len(data)
+        except (TypeError, ValueError):
+            raise ToolError("archive input must be bytes")
+        if input_size > MAX_LAYER_BYTES:
+            raise ToolError("archive input layer limit exceeded")
+        try:
+            data = bytes(data)
+        except (TypeError, ValueError):
+            raise ToolError("archive input must be bytes")
+    if len(data) > MAX_LAYER_BYTES:
+        raise ToolError("archive input layer limit exceeded")
+    budget = _ArchiveBudget()
+    budget.charge(len(data), "archive input")
+    model = _inspect_layer(data, "input archive", budget, 0,
+                           decrypt, openssl)
+    if extract_temp:
+        _temporary_extract(model)
+    report = _sanitized_archive_tree(model)
+    if extract_temp:
+        report["extraction_validated"] = True
+    report["resource_usage"] = {
+        "expanded_bytes": budget.expanded_bytes,
+        "members": budget.members,
+        "maximum_depth": MAX_ARCHIVE_DEPTH,
+    }
+    return report
+
+
+def _read_archive_input(path):
+    chunks = []
+    total = 0
+    with Path(path).open("rb") as source:
+        while True:
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_LAYER_BYTES:
+                raise ToolError("archive input layer limit exceeded")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _inspect_archive_model(data, decrypt=False, openssl="openssl"):
+    if not isinstance(data, bytes):
+        try:
+            data = bytes(data)
+        except (TypeError, ValueError):
+            raise ToolError("archive input must be bytes")
+    if len(data) > MAX_LAYER_BYTES:
+        raise ToolError("archive input layer limit exceeded")
+    budget = _ArchiveBudget()
+    budget.charge(len(data), "archive input")
+    return _inspect_layer(data, "input archive", budget, 0,
+                          decrypt, openssl)
+
+
+def _regular_member_map(model, label):
+    if model.get("format") != "tar":
+        raise ToolError("%s is not a plain tar archive" % label)
+    members = model.get("members", [])
+    if any(member["type"] != "file" for member in members):
+        raise ToolError("%s canonical profile permits regular files only" %
+                        label)
+    return {member["path"]: member for member in members}
+
+
+def _parse_md5_list(data, expected_paths):
+    if not data.endswith(b"\n") or b"\r" in data:
+        raise ToolError("control md5sum.list must use LF-terminated lines")
+    entries = []
+    seen = set()
+    for number, line in enumerate(data.splitlines(), 1):
+        match = re.fullmatch(rb"([0-9a-f]{32})  (\./[^\x00-\x20]+)", line)
+        if not match:
+            raise ToolError("control md5sum.list line %d is malformed" %
+                            number)
+        path = match.group(2).decode("ascii")
+        if path in seen:
+            raise ToolError("control md5sum.list has duplicate path %s" % path)
+        seen.add(path)
+        entries.append((path, match.group(1).decode("ascii")))
+    if seen != set(expected_paths):
+        raise ToolError("control md5sum.list coverage does not match files")
+    return entries
+
+
+def _program_path(program, logical_name):
+    try:
+        found = shutil.which(str(program))
+    except (OSError, RuntimeError):
+        found = None
+    if not found:
+        raise ToolError("required external tool is unavailable: %s" %
+                        logical_name, 3)
+    return found
+
+
+def _verify_md5(control_files, checksum_data, md5sum="md5sum"):
+    entries = _parse_md5_list(checksum_data, control_files)
+    for path, expected in entries:
+        actual = hashlib.md5(control_files[path]).hexdigest()
+        if actual != expected:
+            raise ToolError("control checksum mismatch for %s" % path)
+    program = _program_path(md5sum, "md5sum")
+    try:
+        with tempfile.TemporaryDirectory(prefix="c5-update-md5-") as temp:
+            root = Path(temp)
+            for path, data in control_files.items():
+                destination = root / path[2:]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+            (root / "md5sum.list").write_bytes(checksum_data)
+            environment = os.environ.copy()
+            environment["LC_ALL"] = "C"
+            result = subprocess.run(
+                [program, "-c", "md5sum.list"], cwd=root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=environment, check=False)
+    except OSError:
+        raise ToolError("unable to run md5sum verification", 3)
+    if result.returncode:
+        raise ToolError("real md5sum verification failed")
+    return entries
+
+
+def _locate_template_members(model, md5sum="md5sum"):
+    outer = _regular_member_map(model, "outer template")
+    members = model["members"]
+    if len(members) != 8 or any(not member["leading_dot_slash"]
+                                for member in members):
+        raise ToolError("unsupported canonical template outer profile")
+    components = {}
+    for member in members:
+        match = COMPONENT_NAME_RE.fullmatch(member["path"])
+        if match:
+            kind = match.group(1)
+            if kind in components:
+                raise ToolError("unsupported template has duplicate %s "
+                                "component" % kind)
+            components[kind] = member
+    if set(components) != {"control", "kernel", "library", "software"}:
+        raise ToolError("unsupported canonical template component profile")
+    fixed_paths = {"./end.img", "./play", "./runFirmwareExe.sh",
+                   "./start.img"}
+    if set(outer) != fixed_paths | {
+            member["path"] for member in components.values()}:
+        raise ToolError("unsupported canonical template outer allowlist")
+    for kind, member in components.items():
+        nested = member.get("nested")
+        if not nested or nested.get("format") != "tar":
+            raise ToolError("canonical %s component is not a plain tar" % kind)
+    control_outer = components["control"]
+    control_model = control_outer["nested"]
+    control = _regular_member_map(control_model, "control template")
+    if (tuple(member["path"] for member in control_model["members"]) !=
+            CONTROL_MEMBER_NAMES or
+            any(not member["leading_dot_slash"]
+                for member in control_model["members"])):
+        raise ToolError("unsupported canonical control member profile")
+    input_files = {path: member["_data"] for path, member in control.items()
+                   if path != "./md5sum.list"}
+    checksum_entries = _verify_md5(
+        input_files, control["./md5sum.list"]["_data"], md5sum)
+    return {
+        "model": model,
+        "outer": outer,
+        "outer_members": members,
+        "components": components,
+        "control_outer": control_outer,
+        "control_model": control_model,
+        "control": control,
+        "control_members": control_model["members"],
+        "checksum_entries": checksum_entries,
+    }
+
+
+def _canonical_template_profile(model, md5sum="md5sum"):
+    if model.get("sha256") != CANONICAL_PLAINTEXT_SHA256:
+        raise ToolError("unsupported canonical template plaintext hash")
+    profile = _locate_template_members(model, md5sum)
+    if profile["control_outer"]["sha256"] != CANONICAL_CONTROL_SHA256:
+        raise ToolError("unsupported canonical control archive hash")
+    gates = (
+        (profile["outer"]["./runFirmwareExe.sh"],
+         CANONICAL_INSTALLER_SHA256, "outer installer"),
+        (profile["control"]["./run.sh"],
+         CANONICAL_CONTROL_SCRIPT_SHA256, "control script"),
+        (profile["control"]["./IAPCommand"], CANONICAL_IAP_SHA256,
+         "IAPCommand"),
+    )
+    for member, expected, label in gates:
+        if member["sha256"] != expected:
+            raise ToolError("unsupported canonical %s hash" % label)
+    return profile
+
+
+def _suppress_update_other(data):
+    lines = data.splitlines(keepends=True)
+    declaration = re.compile(
+        rb"^[ \t]*(?:(?:function[ \t]+update_other(?:[ \t]*\(\))?)|"
+        rb"(?:update_other[ \t]*\(\)))[ \t]*(?:\{[ \t]*)?"
+        rb"(?:\r?\n)?$")
+    definitions = [index for index, line in enumerate(lines)
+                   if declaration.fullmatch(line)]
+    if len(definitions) != 1:
+        raise ToolError("outer installer must contain exactly one "
+                        "update_other function definition")
+    start = definitions[0]
+    if b"{" in lines[start]:
+        body_start = start
+    elif (start + 1 < len(lines) and
+          re.fullmatch(rb"[ \t]*\{[ \t]*(?:\r?\n)?", lines[start + 1])):
+        body_start = start + 1
+    else:
+        raise ToolError("update_other function has no opening brace")
+    depth = 1
+    end = None
+    for index in range(body_start + 1, len(lines)):
+        if re.fullmatch(rb"[ \t]*\{[ \t]*(?:\r?\n)?", lines[index]):
+            depth += 1
+        elif re.fullmatch(rb"[ \t]*\}[ \t]*(?:\r?\n)?", lines[index]):
+            depth -= 1
+            if not depth:
+                end = index
+                break
+    if end is None:
+        raise ToolError("update_other function has no matching closing brace")
+    invocation = re.compile(rb"^[ \t]*update_other[ \t]*(?:\r?\n)?$")
+    calls = [index for index, line in enumerate(lines)
+             if not start <= index <= end and invocation.fullmatch(line)]
+    if len(calls) != 1:
+        raise ToolError("outer installer must contain exactly one standalone "
+                        "update_other invocation")
+    removed = set(range(start, end + 1)) | {calls[0]}
+    return b"".join(line for index, line in enumerate(lines)
+                    if index not in removed)
+
+
+def _check_shell_syntax(data, shell="sh"):
+    program = _program_path(shell, "sh")
+    try:
+        result = subprocess.run([program, "-n"], input=data,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, check=False)
+    except OSError:
+        raise ToolError("unable to run sh syntax validation", 3)
+    if result.returncode:
+        diagnostic = sanitize_diagnostic(
+            result.stderr.decode("utf-8", "replace").strip())
+        raise ToolError("generated outer installer failed sh -n%s" %
+                        ((": " + diagnostic) if diagnostic else ""))
+
+
+def _member_metadata(member):
+    return {key: member[key] for key in
+            ("path", "type", "mode", "uid", "gid", "uname", "gname",
+             "mtime", "link_target")}
+
+
+def _write_gnu_tar(entries):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w",
+                      format=tarfile.GNU_FORMAT) as tar:
+        for member, data in entries:
+            info = tarfile.TarInfo(member["path"])
+            info.type = tarfile.REGTYPE
+            info.mode = member["mode"]
+            info.uid = member["uid"]
+            info.gid = member["gid"]
+            info.uname = member["uname"]
+            info.gname = member["gname"]
+            info.mtime = member["mtime"]
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return output.getvalue()
+
+
+def _build_reduced_plaintext(profile, firmware_data, shell="sh",
+                              md5sum="md5sum"):
+    control = profile["control"]
+    retained = {"./IAPCommand", "./levelBoard.hex", "./mcu.img",
+                "./md5sum.list", "./run.sh", "./Update"}
+    checksum_paths = [path for path, unused in profile["checksum_entries"]
+                      if path in retained and path != "./md5sum.list"]
+    if set(checksum_paths) != retained - {"./md5sum.list"}:
+        raise ToolError("retained control checksum order is incomplete")
+    control_data = {
+        "./IAPCommand": control["./IAPCommand"]["_data"],
+        "./levelBoard.hex": firmware_data,
+        "./mcu.img": control["./mcu.img"]["_data"],
+        "./run.sh": control["./run.sh"]["_data"],
+        "./Update": control["./Update"]["_data"],
+    }
+    checksum_data = b"".join(
+        hashlib.md5(control_data[path]).hexdigest().encode("ascii") +
+        b"  " + path.encode("ascii") + b"\n"
+        for path in checksum_paths)
+    _verify_md5(control_data, checksum_data, md5sum)
+    control_data["./md5sum.list"] = checksum_data
+    control_entries = [(member, control_data[member["path"]])
+                       for member in profile["control_members"]
+                       if member["path"] in retained]
+    control_tar = _write_gnu_tar(control_entries)
+    if control_tar[257:265] != b"ustar  \0":
+        raise ToolError("generated control archive is not GNU tar")
+
+    transformed_installer = _suppress_update_other(
+        profile["outer"]["./runFirmwareExe.sh"]["_data"])
+    _check_shell_syntax(transformed_installer, shell)
+    control_path = profile["control_outer"]["path"]
+    outer_data = {
+        control_path: control_tar,
+        "./end.img": profile["outer"]["./end.img"]["_data"],
+        "./play": profile["outer"]["./play"]["_data"],
+        "./runFirmwareExe.sh": transformed_installer,
+        "./start.img": profile["outer"]["./start.img"]["_data"],
+    }
+    outer_entries = [(member, outer_data[member["path"]])
+                     for member in profile["outer_members"]
+                     if member["path"] in outer_data]
+    plaintext = _write_gnu_tar(outer_entries)
+    if plaintext[257:265] != b"ustar  \0":
+        raise ToolError("generated outer archive is not GNU tar")
+    evidence = {
+        "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
+        "outer_order": [member["path"] for member, unused in outer_entries],
+        "control_order": [member["path"]
+                          for member, unused in control_entries],
+        "outer_metadata": {member["path"]: _member_metadata(member)
+                           for member, unused in outer_entries},
+        "control_metadata": {member["path"]: _member_metadata(member)
+                             for member, unused in control_entries},
+        "outer_data": outer_data,
+        "control_data": control_data,
+        "control_path": control_path,
+    }
+    return plaintext, evidence
+
+
+def _assert_member(member, expected_metadata, expected_data, label):
+    if _member_metadata(member) != expected_metadata:
+        raise ToolError("generated %s metadata differs from template" % label)
+    if member["_data"] != expected_data:
+        raise ToolError(
+            "generated %s bytes differ from expected output" % label)
+
+
+def _manifest_member(label, member):
+    return {
+        "label": label,
+        "type": member["type"],
+        "mode": member["mode"],
+        "size": member["size"],
+        "sha256": member["sha256"],
+    }
+
+
+def _assert_reduced_profile(model, evidence, md5sum="md5sum"):
+    if (model.get("format") != "tar" or
+            model.get("sha256") != evidence["plaintext_sha256"]):
+        raise ToolError("generated plaintext archive hash mismatch")
+    members = model["members"]
+    if [member["path"] for member in members] != evidence["outer_order"]:
+        raise ToolError("generated outer archive order or allowlist mismatch")
+    if any(member["type"] != "file" or not member["leading_dot_slash"]
+           for member in members):
+        raise ToolError("generated outer archive has invalid member type or "
+                        "root convention")
+    outer = {member["path"]: member for member in members}
+    if set(outer) != set(evidence["outer_data"]):
+        raise ToolError("generated outer archive allowlist mismatch")
+    for path in evidence["outer_order"]:
+        _assert_member(outer[path], evidence["outer_metadata"][path],
+                       evidence["outer_data"][path], path)
+    control_member = outer[evidence["control_path"]]
+    control_model = control_member.get("nested")
+    if not control_model or control_model.get("format") != "tar":
+        raise ToolError("generated control package is not a plain GNU tar")
+    control_members = control_model["members"]
+    if ([member["path"] for member in control_members] !=
+            evidence["control_order"]):
+        raise ToolError(
+            "generated control archive order or allowlist mismatch")
+    if any(member["type"] != "file" or not member["leading_dot_slash"]
+           for member in control_members):
+        raise ToolError("generated control archive has invalid member type or "
+                        "root convention")
+    control = {member["path"]: member for member in control_members}
+    if set(control) != set(evidence["control_data"]):
+        raise ToolError("generated control archive allowlist mismatch")
+    for path in evidence["control_order"]:
+        _assert_member(control[path], evidence["control_metadata"][path],
+                       evidence["control_data"][path], path)
+    if [path for path in control if path.lower().endswith(".hex")] != [
+            "./levelBoard.hex"]:
+        raise ToolError(
+            "generated package contains unrelated firmware payload")
+    if control["./Update"]["size"] != 0:
+        raise ToolError("generated Update marker is not empty")
+    checksum_files = {path: member["_data"] for path, member in control.items()
+                      if path != "./md5sum.list"}
+    _verify_md5(checksum_files, control["./md5sum.list"]["_data"], md5sum)
+    outer_labels = {
+        evidence["control_path"]: "control package",
+        "./end.img": "end image",
+        "./play": "play helper",
+        "./runFirmwareExe.sh": "outer installer",
+        "./start.img": "start image",
+    }
+    control_labels = {
+        "./IAPCommand": "IAPCommand",
+        "./levelBoard.hex": "levelBoard firmware",
+        "./mcu.img": "control display image",
+        "./md5sum.list": "checksum list",
+        "./run.sh": "control script",
+        "./Update": "Update marker",
+    }
+    return {
+        "outer": [_manifest_member(outer_labels[path], outer[path])
+                  for path in evidence["outer_order"]],
+        "control": [_manifest_member(control_labels[path], control[path])
+                    for path in evidence["control_order"]],
+    }
+
+
+def _path_is_tracked(path):
+    try:
+        relative = path.relative_to(REPO_ROOT.resolve())
+    except (ValueError, OSError, RuntimeError):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--",
+             relative.as_posix()], cwd=REPO_ROOT,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False)
+    except OSError:
+        raise ToolError("required external tool is unavailable: git", 3)
+    return result.returncode == 0
+
+
+def _prepare_package_output(output, input_paths):
+    try:
+        output = Path(output).expanduser().resolve(strict=False)
+        inputs = {Path(path).expanduser().resolve(strict=False)
+                  for path in input_paths}
+    except (OSError, RuntimeError):
+        raise ToolError("unable to resolve package output path")
+    if not PACKAGE_NAME_RE.fullmatch(output.name):
+        raise ToolError("output basename must match Creator5Pro-*.tgz")
+    validate_output_root(output.parent)
+    manifest = Path(str(output) + ".manifest.json")
+    if output in inputs or manifest in inputs:
+        raise ToolError("package output overlaps an input path")
+    if _path_is_tracked(output) or _path_is_tracked(manifest):
+        raise ToolError("package destination may not be a tracked file")
+    if output.exists() or manifest.exists():
+        raise ToolError("package or manifest output already exists")
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise ToolError("unable to create package output directory")
+    return output
+
+
+def _write_temporary_sibling(output, data, suffix):
+    descriptor = None
+    path = None
+    try:
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix="." + output.name + ".", suffix=suffix,
+            dir=output.parent)
+        path = Path(raw_path)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return path
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise ToolError("unable to prepare package publication")
+
+
+def _publish_outputs(output, ciphertext, manifest_data):
+    output = Path(output)
+    manifest = Path(str(output) + ".manifest.json")
+    if output.exists() or manifest.exists():
+        raise ToolError("package or manifest output already exists")
+    package_temp = None
+    manifest_temp = None
+    package_linked = False
+    manifest_linked = False
+    try:
+        package_temp = _write_temporary_sibling(
+            output, ciphertext, ".package.tmp")
+        manifest_temp = _write_temporary_sibling(
+            output, manifest_data, ".manifest.tmp")
+        os.link(package_temp, output)
+        package_linked = True
+        os.link(manifest_temp, manifest)
+        manifest_linked = True
+    except FileExistsError:
+        raise ToolError("package or manifest output already exists")
+    except ToolError:
+        raise
+    except OSError:
+        raise ToolError("atomic package publication failed")
+    finally:
+        if not manifest_linked and package_linked and package_temp is not None:
+            try:
+                if output.exists() and output.samefile(package_temp):
+                    output.unlink()
+            except OSError:
+                pass
+        for path in (package_temp, manifest_temp):
+            if path is not None:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+
+def _repository_state():
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False)
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False)
+    except OSError:
+        raise ToolError("required external tool is unavailable: git", 3)
+    if revision.returncode or status.returncode:
+        raise ToolError("unable to determine repository revision", 3)
+    commit = revision.stdout.decode("ascii", "replace").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ToolError("repository revision is not a full commit hash", 3)
+    return {"commit": commit, "dirty": bool(status.stdout.strip())}
+
+
+def _create_manifest(firmware_report, template_plaintext_hash, plaintext,
+                     ciphertext, members, shell, md5sum):
+    firmware = json.loads(json.dumps(firmware_report))
+    firmware.setdefault("dictionary", {})["kconfig"] = (
+        "[redacted: validated separately]")
+    tools = dict(firmware.get("tools", {}))
+    tools["sh"] = _version(shell)
+    tools["md5sum"] = _version(md5sum)
+    timestamp = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat().replace("+00:00", "Z")
+    return {
+        "schema_version": 1,
+        "repository": _repository_state(),
+        "build_timestamp_utc": timestamp,
+        "tools": tools,
+        "resolved_config": firmware["resolved_config"],
+        "firmware": firmware,
+        "template_plaintext_sha256": template_plaintext_hash,
+        "output": {
+            "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+            "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
+            "members": members,
+        },
+        "installer_changes": [
+            {"effect": "NIM log deletion", "status": "suppressed"},
+            {"effect": "persistent startup image replacement",
+             "status": "suppressed"},
+        ],
+        "validation": {
+            "passed": [
+                "firmware representations",
+                "canonical template hash gates",
+                "input control checksums",
+                "installer byte transformation and sh -n",
+                "reduced archive profile",
+                "output control checksums",
+                "fresh ciphertext decryption and reinspection",
+            ],
+            "hardware_verified": False,
+        },
+    }
+
+
+def package_update(template, firmware, elf, dictionary, output,
+                   cross_prefix="arm-none-eabi-", openssl="openssl"):
+    output = _prepare_package_output(
+        output, (template, firmware, elf, dictionary))
+    firmware_report = validate_firmware(
+        firmware, elf, dictionary, cross_prefix, openssl)
+    unused, firmware_data = _read_input_file(firmware)
+    if (hashlib.sha256(firmware_data).hexdigest() !=
+            firmware_report["hex_sha256"]):
+        raise ToolError("firmware changed after validation")
+    try:
+        template_data = _read_archive_input(template)
+    except OSError:
+        raise ToolError("unable to read canonical template")
+    if not template_data.startswith(b"Salted__"):
+        raise ToolError("canonical package template must be encrypted")
+    template_model = _inspect_archive_model(
+        template_data, decrypt=True, openssl=openssl)
+    if (template_model.get("format") != "encrypted" or
+            template_model.get("payload", {}).get("format") != "tar"):
+        raise ToolError("canonical template did not decrypt to a plain tar")
+    template_plaintext = template_model["_payload"]
+    shell_path = _program_path("sh", "sh")
+    md5sum_path = _program_path("md5sum", "md5sum")
+    profile = _canonical_template_profile(
+        template_model["payload"], md5sum_path)
+    plaintext, evidence = _build_reduced_plaintext(
+        profile, firmware_data, shell_path, md5sum_path)
+    constructed_model = _inspect_archive_model(plaintext)
+    member_summary = _assert_reduced_profile(
+        constructed_model, evidence, md5sum_path)
+
+    ciphertext = openssl_crypt(plaintext, False, openssl)
+    with tempfile.TemporaryDirectory(prefix="c5-update-verify-") as temp:
+        candidate = Path(temp) / "candidate.tgz"
+        candidate.write_bytes(ciphertext)
+        verified_model = _inspect_archive_model(
+            _read_archive_input(candidate), decrypt=True, openssl=openssl)
+        if (verified_model.get("format") != "encrypted" or
+                verified_model.get("_payload") != plaintext):
+            raise ToolError("fresh package decryption differs from plaintext")
+        verified_summary = _assert_reduced_profile(
+            verified_model["payload"], evidence, md5sum_path)
+    if verified_summary != member_summary:
+        raise ToolError("fresh package reinspection differs from construction")
+    manifest = _create_manifest(
+        firmware_report, hashlib.sha256(template_plaintext).hexdigest(),
+        plaintext, ciphertext, verified_summary, shell_path, md5sum_path)
+    manifest_data = (json.dumps(manifest, sort_keys=True, indent=2) +
+                     "\n").encode("utf-8")
+    _publish_outputs(output, ciphertext, manifest_data)
+    return {
+        "stage": "package",
+        "package": output.name,
+        "manifest": output.name + ".manifest.json",
+        "ciphertext_sha256": manifest["output"]["ciphertext_sha256"],
+        "plaintext_sha256": manifest["output"]["plaintext_sha256"],
+        "firmware_hex_sha256": firmware_report["hex_sha256"],
+        "firmware_normalized_sha256": firmware_report["normalized_sha256"],
+        "validation": manifest["validation"],
+    }
+
+
+def run_all_stages(template, output_dir, output, jobs=1,
+                   cross_prefix="arm-none-eabi-", openssl="openssl"):
+    _prepare_package_output(output, (template,))
+    build_dir = Path(output_dir) / "build"
+    build_report = build_firmware(build_dir, jobs, cross_prefix, openssl)
+    package_report = package_update(
+        template, build_dir / "levelBoard.hex", build_dir / "klipper.elf",
+        build_dir / "klipper.dict", output, cross_prefix, openssl)
+    return {"stage": "all", "build": build_report,
+            "package": package_report}
+
+
+def _add_global(parser):
+    parser.add_argument(
+    "--cross-prefix",
+    default="arm-none-eabi-",
+     help="ARM toolchain prefix")
+    parser.add_argument(
+    "--openssl",
+    default="openssl",
+     help="OpenSSL executable")
+
+
+def create_argument_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    _add_global(parser)
+    sub = parser.add_subparsers(dest="command", required=True)
+    build = sub.add_parser(
+    "build", help="build and validate C5 levelBoard firmware")
+    build.add_argument("--output-dir", required=True, type=Path)
+    build.add_argument("--jobs", type=int, default=1)
+    validate = sub.add_parser("validate",
+     help="validate firmware representations")
+    validate.add_argument("--firmware", required=True, type=Path)
+    validate.add_argument("--elf", required=True, type=Path)
+    validate.add_argument("--dictionary", required=True, type=Path)
+    inspect = sub.add_parser("inspect", help="inspect an update package")
+    inspect.add_argument("--input", required=True, type=Path)
+    inspect.add_argument("--decrypt", action="store_true")
+    inspect.add_argument("--extract-temp", action="store_true")
+    package = sub.add_parser(
+    "package",
+     help="create an encrypted update package")
+    package.add_argument("--template", required=True, type=Path)
+    package.add_argument("--firmware", required=True, type=Path)
+    package.add_argument("--elf", required=True, type=Path)
+    package.add_argument("--dictionary", required=True, type=Path)
+    package.add_argument("--output", required=True, type=Path)
+    all_cmd = sub.add_parser("all", help="build, validate, and package")
+    all_cmd.add_argument("--template", required=True, type=Path)
+    all_cmd.add_argument("--output-dir", required=True, type=Path)
+    all_cmd.add_argument("--output", required=True, type=Path)
+    all_cmd.add_argument("--jobs", type=int, default=1)
+    return parser
+
+
+def _json_print(report):
+    json.dump(report, sys.stdout, sort_keys=True, indent=2)
+    sys.stdout.write("\n")
+
+
+def main(argv=None):
+    args = create_argument_parser().parse_args(argv)
+    try:
+        if args.command == "build":
+            _json_print(
+    build_firmware(
+        args.output_dir,
+        args.jobs,
+        args.cross_prefix,
+         args.openssl))
+        elif args.command == "validate":
+            _json_print(
+    validate_firmware(
+        args.firmware,
+        args.elf,
+        args.dictionary,
+        args.cross_prefix,
+         args.openssl))
+        elif args.command == "inspect":
+            archive_data = _read_archive_input(args.input)
+            _json_print(inspect_archive(
+                archive_data, decrypt=args.decrypt,
+                extract_temp=args.extract_temp, openssl=args.openssl))
+        elif args.command == "package":
+            _json_print(package_update(
+                args.template, args.firmware, args.elf, args.dictionary,
+                args.output, args.cross_prefix, args.openssl))
+        elif args.command == "all":
+            _json_print(run_all_stages(
+                args.template, args.output_dir, args.output, args.jobs,
+                args.cross_prefix, args.openssl))
+        else:
+            raise ToolError("unknown stage")
+        return 0
+    except ToolError as exc:
+        secret = os.environ.get("C5_UPDATE_PASSPHRASE")
+        print("error: " + sanitize_diagnostic(exc, secret), file=sys.stderr)
+        return exc.exit_code
+    except OSError:
+        print("error: filesystem operation failed", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
