@@ -2190,8 +2190,16 @@ def _repository_state():
     return {"commit": commit, "dirty": bool(status.stdout.strip())}
 
 
+def _require_clean_repository():
+    repository = _repository_state()
+    if repository["dirty"]:
+        raise ToolError(
+            "refusing to create update package from a dirty repository")
+    return repository
+
+
 def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
-                     ciphertext, members, shell, md5sum):
+                     ciphertext, members, shell, md5sum, repository):
     firmwares = {}
     tools = {}
     for board in _canonical_boards(firmware_reports):
@@ -2208,7 +2216,7 @@ def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
         microsecond=0).isoformat().replace("+00:00", "Z")
     return {
         "schema_version": 2,
-        "repository": _repository_state(),
+        "repository": repository,
         "build_timestamp_utc": timestamp,
         "tools": tools,
         "firmwares": firmwares,
@@ -2265,6 +2273,14 @@ def _normalize_firmware_inputs(firmware_inputs):
     return normalized
 
 
+def _require_clean_firmware_reports(firmware_reports):
+    for board in _canonical_boards(firmware_reports):
+        version = firmware_reports[board].get(
+            "dictionary", {}).get("version", "")
+        if "dirty" in str(version).lower():
+            raise ToolError("refusing to package dirty firmware for %s" % board)
+
+
 def package_update(template, firmware_inputs, output,
                    cross_prefix="arm-none-eabi-", openssl="openssl"):
     firmware_inputs = _normalize_firmware_inputs(firmware_inputs)
@@ -2280,6 +2296,7 @@ def package_update(template, firmware_inputs, output,
             products["dictionary"], cross_prefix, openssl)
         firmware_reports[board] = report
         firmware_data[board] = exact_hex
+    _require_clean_firmware_reports(firmware_reports)
     try:
         template_data = _read_archive_input(template)
     except OSError:
@@ -2315,9 +2332,11 @@ def package_update(template, firmware_inputs, output,
             verified_model["payload"], evidence, selected_boards, md5sum_path)
     if verified_summary != member_summary:
         raise ToolError("fresh package reinspection differs from construction")
+    repository = _require_clean_repository()
     manifest = _create_manifest(
         firmware_reports, hashlib.sha256(template_plaintext).hexdigest(),
-        plaintext, ciphertext, verified_summary, shell_path, md5sum_path)
+        plaintext, ciphertext, verified_summary, shell_path, md5sum_path,
+        repository)
     manifest_data = (json.dumps(manifest, sort_keys=True, indent=2) +
                      "\n").encode("utf-8")
     _publish_outputs(output, ciphertext, manifest_data)
@@ -2445,11 +2464,13 @@ def main(argv=None):
                 archive_data, decrypt=args.decrypt,
                 extract_temp=args.extract_temp, openssl=args.openssl))
         elif args.command == "package":
+            _require_clean_repository()
             firmware_inputs = _cli_firmware_inputs(args.firmware)
             _json_print(package_update(
                 args.template, firmware_inputs, args.output,
                 args.cross_prefix, args.openssl))
         elif args.command == "all":
+            _require_clean_repository()
             _json_print(run_all_stages(
                 args.board, args.template, args.output_dir, args.output,
                 args.jobs, args.cross_prefix, args.openssl))

@@ -268,6 +268,28 @@ class FoundationTests(unittest.TestCase):
         self.assertNotIn("traceback", result.stderr.lower())
         self.assertEqual(result.stdout, "")
 
+    def test_package_commands_reject_dirty_repository_before_work(self):
+        dirty = {"commit": "a" * 40, "dirty": True}
+        commands = (
+            (["package", "--template", "template.tgz",
+              "--firmware", "levelBoard", "firmware.hex", "firmware.elf",
+              "firmware.dict", "--output", "Creator5Pro-test.tgz"],
+             "package_update"),
+            (["all", "--board", "levelBoard", "--template", "template.tgz",
+              "--output-dir", "build", "--output",
+              "Creator5Pro-test.tgz"],
+             "run_all_stages"),
+        )
+        for arguments, operation_name in commands:
+            with self.subTest(command=arguments[0]), \
+                    mock.patch.object(TOOL, "_repository_state",
+                                      return_value=dirty), \
+                    mock.patch.object(TOOL, operation_name) as operation, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(TOOL.main(arguments), 2)
+                self.assertIn("dirty repository", stderr.getvalue())
+                operation.assert_not_called()
+
     def test_output_root_policy_accepts_external_or_out_only(self):
         with tempfile.TemporaryDirectory() as outside:
             self.assertEqual(
@@ -1317,10 +1339,11 @@ class PackageTransformationTests(unittest.TestCase):
             "tools": {"python": "test-python",
                       "openssl": "test-openssl"},
         }
+        repository = {"commit": "a" * 40, "dirty": False}
         manifest = TOOL._create_manifest(
             {"levelBoard": report}, TOOL.CANONICAL_PLAINTEXT_SHA256,
             b"plain", b"cipher", {"outer": [], "control": []},
-            shutil.which("sh"), shutil.which("md5sum"))
+            shutil.which("sh"), shutil.which("md5sum"), repository)
         serialized = json.dumps(manifest)
         self.assertEqual(manifest["schema_version"], 2)
         self.assertFalse(manifest["validation"]["hardware_verified"])
@@ -1331,6 +1354,7 @@ class PackageTransformationTests(unittest.TestCase):
         self.assertNotIn("firmware", manifest)
         self.assertNotIn("/private/template/location", serialized)
         self.assertNotIn("control-fixture.tar.xz", serialized)
+        self.assertEqual(manifest["repository"], repository)
         self.assertRegex(manifest["repository"]["commit"], r"^[0-9a-f]{40}$")
 
     def test_package_cli_validation_failure_publishes_nothing(self):
@@ -1354,6 +1378,28 @@ class PackageTransformationTests(unittest.TestCase):
 
 
 class SelectionContractTests(unittest.TestCase):
+    def test_package_rejects_dirty_firmware_before_reading_template(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "Creator5Pro-test.tgz"
+            products = {
+                "firmware": root / "firmware.hex",
+                "elf": root / "firmware.elf",
+                "dictionary": root / "firmware.dict",
+            }
+            report = {"dictionary": {
+                "version": "v0.13.0-1-gabcdef12-dirty-20260919_test"}}
+            with mock.patch.object(
+                    TOOL, "_validate_firmware",
+                    return_value=(report, b"firmware")):
+                with self.assertRaisesRegex(
+                        TOOL.ToolError, "dirty firmware.*levelBoard"):
+                    TOOL.package_update(
+                        root / "template.tgz", {"levelBoard": products},
+                        output)
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".manifest.json").exists())
+
     def test_profiles_advertise_physical_mcu_identity(self):
         expected = {
             "eBoard": "n32g455ccl7",
