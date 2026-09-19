@@ -28,6 +28,7 @@
 
 // gpio.c
 GPIO_TypeDef *gpio_pin_to_regs(uint32_t pin);
+int gpio_regs_to_pin(GPIO_TypeDef *regs, uint32_t bit);
 #define GPIO(PORT, NUM) (((PORT)-'A') * 16 + (NUM))
 #define GPIO2PORT(PIN) ((PIN) / 16)
 #define GPIO2BIT(PIN) (1<<((PIN) % 16))
@@ -37,7 +38,6 @@ GPIO_TypeDef *gpio_pin_to_regs(uint32_t pin);
 #define GPIO_OUTPUT 1
 #define GPIO_OPEN_DRAIN 0x100
 #define GPIO_HIGH_SPEED 0x200
-#define GPIO_DRIVE_4MA 0x400 // N32G430; ignored by existing GPIO backends
 #define GPIO_FUNCTION(fn) (2 | ((fn) << 4))
 #define GPIO_ANALOG 3
 void gpio_peripheral(uint32_t gpio, uint32_t mode, int pullup);

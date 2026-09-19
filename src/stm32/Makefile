@@ -65,6 +65,7 @@ gpio-src-$(CONFIG_MACH_STM32F1) := stm32/gpio.c
 gpio-src-$(CONFIG_MACH_STM32H7) := stm32/stm32h7_gpio.c stm32/gpioperiph.c
 gpio-src-$(CONFIG_MACH_N32G430) := stm32/gpio.c stm32/n32g430_gpio.c
 src-y += $(timer-src-y) $(gpio-src-y)
+src-$(CONFIG_MACH_N32G430F8S7) += stm32/n32g430f8s7_gpio.c
 adc-src-y := stm32/adc.c
 adc-src-$(CONFIG_MACH_STM32F0) := stm32/stm32f0_adc.c
 adc-src-$(CONFIG_MACH_N32G45x) := ../lib/n32g45x/n32g45x_adc.c stm32/n32g45x_adc.c

@@ -16,7 +16,7 @@ gpio_peripheral(uint32_t gpio, uint32_t mode, int pullup)
     uint32_t mode_bits = mode & 0x0f, func = (mode >> 4) & 0x0f;
     uint32_t od = (mode >> 8) & 0x01;
     uint32_t slow = mode & GPIO_HIGH_SPEED ? 0 : 1;
-    uint32_t drive = mode & GPIO_DRIVE_4MA ? 2 : 0;
+    uint32_t drive = mode & N32G430_GPIO_DRIVE_4MA ? 2 : 0;
     uint32_t pup = pullup ? (pullup > 0 ? 1 : 2) : 0;
     uint32_t pos = gpio % 16, af_reg = pos / 8;
     uint32_t af_shift = (pos % 8) * 4, af_mask = 0x0f << af_shift;

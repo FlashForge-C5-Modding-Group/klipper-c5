@@ -31,10 +31,12 @@ c5_levelboard_acquisition_init(void)
     gpio_clock_enable(GPIOA);
     GPIOA->BSRR = GPIO2BIT(GPIO('A', 1));
     gpio_peripheral(GPIO('A', 1),
-                    GPIO_OUTPUT | GPIO_HIGH_SPEED | GPIO_DRIVE_4MA, 0);
+                    GPIO_OUTPUT | GPIO_HIGH_SPEED
+                    | N32G430_GPIO_DRIVE_4MA, 0);
 
     gpio_peripheral(GPIO('A', 0),
-                    GPIO_FUNCTION(8) | GPIO_HIGH_SPEED | GPIO_DRIVE_4MA, 0);
+                    GPIO_FUNCTION(8) | GPIO_HIGH_SPEED
+                    | N32G430_GPIO_DRIVE_4MA, 0);
     enable_pclock(TIM8_BASE);
     TIM8->PSC = 0;
     TIM8->ARR = 500;
