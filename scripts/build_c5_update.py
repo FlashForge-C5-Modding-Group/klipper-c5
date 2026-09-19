@@ -317,28 +317,38 @@ BOARD_PROFILES = {
             "STATS_SUMSQ_BASE": 256,
         },
         "required_commands": {
-            "identify offset=%u count=%c", "allocate_oids count=%c", "get_config",
+            "identify offset=%u count=%c", "allocate_oids count=%c",
+            "get_config",
             "finalize_config crc=%u", "get_clock", "get_uptime",
             "emergency_stop", "clear_shutdown", "reset",
-            "config_stepper oid=%c step_pin=%c dir_pin=%c invert_step=%c step_pulse_ticks=%u",
+            ("config_stepper oid=%c step_pin=%c dir_pin=%c "
+             "invert_step=%c step_pulse_ticks=%u"),
             "queue_step oid=%c interval=%u count=%hu add=%hi",
-            "set_next_step_dir oid=%c dir=%c", "reset_step_clock oid=%c clock=%u",
+            "set_next_step_dir oid=%c dir=%c",
+            "reset_step_clock oid=%c clock=%u",
             "stepper_get_position oid=%c",
             "stepper_stop_on_trigger oid=%c trsync_oid=%c",
             "config_endstop oid=%c pin=%c pull_up=%c",
-            "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
+            ("endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c "
+             "rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c"),
             "endstop_query_state oid=%c", "endstop_recover_state oid=%c",
             "config_trsync oid=%c",
-            "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
-            "trsync_set_timeout oid=%c clock=%u", "trsync_trigger oid=%c reason=%c",
-            "config_digital_out oid=%c pin=%u value=%c default_value=%c max_duration=%u",
+            ("trsync_start oid=%c report_clock=%u report_ticks=%u "
+             "expire_reason=%c"),
+            "trsync_set_timeout oid=%c clock=%u",
+            "trsync_trigger oid=%c reason=%c",
+            ("config_digital_out oid=%c pin=%u value=%c default_value=%c "
+             "max_duration=%u"),
             "set_digital_out_pwm_cycle oid=%c cycle_ticks=%u",
             "queue_digital_out oid=%c clock=%u on_ticks=%u",
             "update_digital_out oid=%c value=%c",
-            "config_pwm_out oid=%c pin=%u cycle_ticks=%u value=%hu default_value=%hu max_duration=%u",
+            ("config_pwm_out oid=%c pin=%u cycle_ticks=%u value=%hu "
+             "default_value=%hu max_duration=%u"),
             "queue_pwm_out oid=%c clock=%u value=%hu",
             "config_analog_in oid=%c pin=%u",
-            "query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu range_check_count=%c",
+            ("query_analog_in oid=%c clock=%u sample_ticks=%u "
+             "sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu "
+             "range_check_count=%c"),
             "config_spi oid=%c pin=%u cs_active_high=%c",
             "spi_set_bus oid=%c spi_bus=%u mode=%u rate=%u",
             "spi_transfer oid=%c data=%*s", "spi_send oid=%c data=%*s",
@@ -362,7 +372,8 @@ BOARD_PROFILES = {
             "analog_in_state oid=%c next_clock=%u value=%hu",
             "spi_transfer_response oid=%c response=%*s",
             "sensor_bulk_data oid=%c sequence=%hu data=%*s",
-            "sensor_bulk_status oid=%c clock=%u query_ticks=%u next_sequence=%hu buffered=%u possible_overflows=%hu",
+            ("sensor_bulk_status oid=%c clock=%u query_ticks=%u "
+             "next_sequence=%hu buffered=%u possible_overflows=%hu"),
             "mcu_version year=%u date=%u version=%u",
             "trigger_threshold threshold=%i", "param_value value=%u reserve=%u",
             "peel_data value=%i", "pa_value value=%u",
@@ -404,10 +415,13 @@ BOARD_PROFILES = {
             "get_config", "allocate_oids count=%c",
             "stepper_stop_on_trigger oid=%c trsync_oid=%c",
             "endstop_recover_state oid=%c", "endstop_query_state oid=%c",
-            "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
+            ("endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c "
+             "rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c"),
             "config_endstop oid=%c pin=%c pull_up=%c",
-            "trsync_trigger oid=%c reason=%c", "trsync_set_timeout oid=%c clock=%u",
-            "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
+            "trsync_trigger oid=%c reason=%c",
+            "trsync_set_timeout oid=%c clock=%u",
+            ("trsync_start oid=%c report_clock=%u report_ticks=%u "
+             "expire_reason=%c"),
             "config_trsync oid=%c", "reset",
         },
         "required_responses": {
@@ -679,7 +693,8 @@ def _load_dictionary(board, data):
                 "dictionary message membership conflicts with MessageParser")
         message_types[expected_type].add(msgformat)
     missing_commands = profile["required_commands"] - message_types["command"]
-    missing_responses = profile["required_responses"] - message_types["response"]
+    missing_responses = (
+        profile["required_responses"] - message_types["response"])
     if missing_commands:
         raise ToolError(
     "dictionary is missing required command membership: %s" %
@@ -712,7 +727,8 @@ def _load_dictionary(board, data):
     version, build_versions = parser.get_version_info()
     return {
     "constants": {
-        name: constants[name] for name in sorted(profile["required_constants"])},
+        name: constants[name]
+        for name in sorted(profile["required_constants"])},
         "version": _redact_dictionary_metadata(version),
         "build_versions": _redact_dictionary_metadata(build_versions),
         "kconfig": "[redacted: validated separately]",
@@ -920,7 +936,8 @@ def build_firmware(board, output_dir, jobs=1, cross_prefix="arm-none-eabi-",
     config = output / ".config"
     products_dir = output
     try:
-        config.write_text(profile["seed_config"], encoding="ascii", newline="\n")
+        config.write_text(
+            profile["seed_config"], encoding="ascii", newline="\n")
     except OSError:
         raise ToolError("unable to write build configuration")
     make_out = str(products_dir) + os.sep
@@ -952,7 +969,8 @@ def build_firmware(board, output_dir, jobs=1, cross_prefix="arm-none-eabi-",
     except OSError:
         raise ToolError("unable to inspect %s" % profile["firmware_name"], 3)
     if not valid_firmware:
-        raise ToolError("objcopy did not produce %s" % profile["firmware_name"], 3)
+        raise ToolError(
+            "objcopy did not produce %s" % profile["firmware_name"], 3)
     validation = validate_firmware(
         board, firmware, elf, dictionary, cross_prefix, openssl)
     validation["resolved_config"] = resolved
@@ -2379,7 +2397,8 @@ def create_argument_parser():
     build.add_argument("--jobs", type=int, default=1)
     validate = sub.add_parser("validate",
                               help="validate firmware representations")
-    validate.add_argument("--board", required=True, choices=tuple(BOARD_PROFILES))
+    validate.add_argument(
+        "--board", required=True, choices=tuple(BOARD_PROFILES))
     validate.add_argument("--firmware", required=True, type=Path)
     validate.add_argument("--elf", required=True, type=Path)
     validate.add_argument("--dictionary", required=True, type=Path)

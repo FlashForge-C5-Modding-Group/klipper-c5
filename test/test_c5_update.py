@@ -1416,13 +1416,14 @@ class SelectionContractTests(unittest.TestCase):
         with mock.patch.object(TOOL, "_prepare_package_output",
                                side_effect=AssertionError("published")):
             for value in invalid:
-                with self.subTest(value=value), self.assertRaises(TOOL.ToolError):
+                with (self.subTest(value=value),
+                      self.assertRaises(TOOL.ToolError)):
                     TOOL.package_update("template", value, "output")
         normalized = TOOL._normalize_firmware_inputs({
             "levelBoard": valid, "eBoard": valid})
         self.assertEqual(list(normalized), ["eBoard", "levelBoard"])
 
-    def test_cli_rejects_missing_unknown_and_duplicate_selection_without_output(self):
+    def test_cli_rejects_invalid_selection_without_output(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "Creator5Pro-invalid.tgz"
