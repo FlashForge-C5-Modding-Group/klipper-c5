@@ -4,6 +4,7 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include "autoconf.h" // CONFIG_WANT_TRIGGER_ANALOG
 #include "basecmd.h" // oid_alloc
 #include "board/gpio.h" // struct gpio_adc
 #include "board/irq.h" // irq_disable
@@ -18,8 +19,6 @@ struct analog_in {
     struct gpio_adc pin;
     uint8_t invalid_count, range_check_count;
     uint8_t state, sample_count;
-    uint8_t bytes_per_report, data_count;
-    uint8_t data[48];
     struct trigger_analog *ta;
 };
 
@@ -86,21 +85,16 @@ command_query_analog_in(uint32_t *args)
     a->sample_count = args[3];
     a->state = a->sample_count + 1;
     a->rest_time = args[4];
-    a->bytes_per_report = args[5];
-    a->data_count = 0;
-    a->min_value = args[6];
-    a->max_value = args[7];
-    a->range_check_count = args[8];
+    a->min_value = args[5];
+    a->max_value = args[6];
+    a->range_check_count = args[7];
     if (! a->sample_count)
         return;
-    if (a->bytes_per_report > ARRAY_SIZE(a->data))
-        shutdown("Invalid analog_in bytes_per_report");
     sched_add_timer(&a->timer);
 }
 DECL_COMMAND(command_query_analog_in,
              "query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c"
-             " rest_ticks=%u bytes_per_report=%c"
-             " min_value=%hu max_value=%hu range_check_count=%c");
+             " rest_ticks=%u min_value=%hu max_value=%hu range_check_count=%c");
 
 void
 command_analog_in_attach_trigger_analog(uint32_t *args) {
@@ -111,8 +105,6 @@ command_analog_in_attach_trigger_analog(uint32_t *args) {
 DECL_COMMAND(command_analog_in_attach_trigger_analog,
     "analog_in_attach_trigger_analog oid=%c trigger_analog_oid=%c");
 #endif
-
-#define BYTES_PER_SAMPLE 2
 
 void
 analog_in_task(void)
@@ -134,15 +126,8 @@ analog_in_task(void)
         a->state++;
         irq_enable();
         trigger_analog_update(a->ta, value);
-        uint8_t *d = &a->data[a->data_count];
-        d[0] = value;
-        d[1] = value >> 8;
-        a->data_count += BYTES_PER_SAMPLE;
-        if (a->data_count + BYTES_PER_SAMPLE > a->bytes_per_report) {
-            sendf("analog_in_state oid=%c next_clock=%u values=%*s"
-                  , oid, next_begin_time, a->data_count, a->data);
-            a->data_count = 0;
-        }
+        sendf("analog_in_state oid=%c next_clock=%u value=%hu",
+              oid, next_begin_time, value);
     }
 }
 DECL_TASK(analog_in_task);

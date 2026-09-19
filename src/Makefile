@@ -8,7 +8,9 @@ endstop-src-$(CONFIG_C5_LEVELBOARD) := c5_endstop.c
 endstop-src-$(CONFIG_C5_EBOARD) := c5_endstop.c
 src-$(CONFIG_HAVE_GPIO) += initial_pins.c gpiocmds.c stepper.c \
     $(endstop-src-y) trsync.c
-src-$(CONFIG_WANT_ADC) += adccmds.c
+adccmds-src-y := adccmds.c
+adccmds-src-$(CONFIG_C5_EBOARD) := c5_adccmds.c
+src-$(CONFIG_WANT_ADC) += $(adccmds-src-y)
 src-$(CONFIG_WANT_SPI) += spicmds.c
 src-$(CONFIG_WANT_I2C) += i2ccmds.c
 src-$(CONFIG_WANT_HARD_PWM) += pwmcmds.c
