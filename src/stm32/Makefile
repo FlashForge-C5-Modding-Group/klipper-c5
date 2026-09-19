@@ -17,7 +17,7 @@ dirs-$(CONFIG_MACH_STM32L4) += lib/stm32l4
 
 MCU := $(shell echo $(CONFIG_MCU))
 MCU_HEADER_DEFINE := $(shell echo $(CONFIG_MCU) | tr a-z A-Z | tr X x)
-ifeq ($(CONFIG_C5_EBOARD),y)
+ifeq ($(CONFIG_MACH_N32G45x),y)
 MCU_HEADER_DEFINE := STM32F103xE
 endif
 
@@ -25,7 +25,7 @@ CFLAGS-$(CONFIG_HAVE_LIMITED_CODE_SIZE) += -Os
 CFLAGS-$(CONFIG_MACH_STM32F0) += -mcpu=cortex-m0 -Ilib/stm32f0/include
 CFLAGS-$(CONFIG_MACH_STM32F103) += -mcpu=cortex-m3
 CFLAGS-$(CONFIG_MACH_N32G45x) += -mcpu=cortex-m4 -Ilib/n32g45x/include
-CFLAGS-$(CONFIG_MACH_N32G430F8S7) += -mcpu=cortex-m4
+CFLAGS-$(CONFIG_MACH_N32G430) += -mcpu=cortex-m4
 CFLAGS-$(CONFIG_MACH_STM32F1) += -Ilib/stm32f1/include
 CFLAGS-$(CONFIG_MACH_STM32F2) += -mcpu=cortex-m3 -Ilib/stm32f2/include
 CFLAGS-$(CONFIG_MACH_STM32F4) += -mcpu=cortex-m4 -Ilib/stm32f4/include
@@ -44,9 +44,9 @@ $(OUT)klipper.elf: $(OUT)src/generic/armcm_link.ld
 src-y += stm32/watchdog.c stm32/clockline.c stm32/dfu_reboot.c
 src-y += generic/crc16_ccitt.c
 reset-src-y := generic/armcm_reset.c
-reset-src-$(CONFIG_MACH_N32G430F8S7) := stm32/n32g430_reset.c
+reset-src-$(CONFIG_C5_LEVELBOARD) := stm32/n32g430_reset.c
 src-y += generic/armcm_boot.c generic/armcm_irq.c $(reset-src-y)
-src-$(CONFIG_MACH_N32G430F8S7) += stm32/n32g430.c
+src-$(CONFIG_MACH_N32G430) += stm32/n32g430.c
 src-$(CONFIG_C5_LEVELBOARD) += stm32/c5_levelboard.c
 src-$(CONFIG_MACH_STM32F0) += stm32/stm32f0.c ../lib/stm32f0/system_stm32f0xx.c
 src-$(CONFIG_MACH_STM32F1) += stm32/stm32f1.c ../lib/stm32f1/system_stm32f1xx.c
@@ -63,7 +63,7 @@ timer-src-$(CONFIG_MACH_STM32G0) := generic/timer_irq.c stm32/stm32f0_timer.c
 gpio-src-y := stm32/gpio.c stm32/gpioperiph.c
 gpio-src-$(CONFIG_MACH_STM32F1) := stm32/gpio.c
 gpio-src-$(CONFIG_MACH_STM32H7) := stm32/stm32h7_gpio.c stm32/gpioperiph.c
-gpio-src-$(CONFIG_MACH_N32G430F8S7) := stm32/gpio.c stm32/n32g430_gpio.c
+gpio-src-$(CONFIG_MACH_N32G430) := stm32/gpio.c stm32/n32g430_gpio.c
 src-y += $(timer-src-y) $(gpio-src-y)
 adc-src-y := stm32/adc.c
 adc-src-$(CONFIG_MACH_STM32F0) := stm32/stm32f0_adc.c
@@ -121,9 +121,13 @@ ifeq ($(CONFIG_C5_EBOARD),y)
 serialflash:
 	@echo "serialflash is unsupported for C5 eBoard; use the stock IAP update path" >&2
 	@false
-else ifeq ($(CONFIG_MACH_N32G430F8S7),y)
+else ifeq ($(CONFIG_C5_LEVELBOARD),y)
 serialflash:
-	@echo "serialflash is unsupported for N32G430F8S7; preserve the reserved lower flash" >&2
+	@echo "serialflash is unsupported for C5 levelBoard; use the stock IAP update path" >&2
+	@false
+else ifeq ($(CONFIG_MACH_N32G430),y)
+serialflash:
+	@echo "serialflash is unsupported for N32G430; no serial flashing transport is implemented" >&2
 	@false
 else
 serialflash: $(OUT)klipper.bin

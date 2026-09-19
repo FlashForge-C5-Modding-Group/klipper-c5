@@ -4,7 +4,7 @@
 
 #include "autoconf.h" // CONFIG_MACH_STM32F1
 
-#if CONFIG_MACH_N32G430F8S7
+#if CONFIG_MACH_N32G430
 #include "n32g430.h"
 #elif CONFIG_MACH_STM32F0
 #include "stm32f0xx.h"

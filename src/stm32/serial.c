@@ -10,7 +10,7 @@
 #include "command.h" // DECL_CONSTANT_STR
 #include "internal.h" // enable_pclock
 #include "sched.h" // DECL_INIT
-#if CONFIG_MACH_N32G430F8S7
+#if CONFIG_MACH_N32G430
 #define GPIO_MODE_FLAGS GPIO_HIGH_SPEED
 #define GPIO_TX_PULLUP 1
 #else
@@ -22,13 +22,14 @@
 // Select the configured serial port
 #if CONFIG_STM32_SERIAL_USART1
   #if CONFIG_C5_LEVELBOARD || CONFIG_C5_EBOARD
+    // Stock C5 compatibility metadata; physical USART1 is on PA9/PA10.
     DECL_CONSTANT_STR("RESERVE_PINS_serial", "PH10,PH9");
   #else
     DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA10,PA9");
   #endif
   #define GPIO_Rx GPIO('A', 10)
   #define GPIO_Tx GPIO('A', 9)
-  #if CONFIG_MACH_N32G430F8S7
+  #if CONFIG_MACH_N32G430
     #define GPIO_AF_MODE 5
   #else
     #define GPIO_AF_MODE 7
