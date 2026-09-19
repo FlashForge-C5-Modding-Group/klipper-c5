@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # This file may be distributed under the terms of the GNU GPLv3 license.
-"""Build and validate a Creator 5 Pro levelBoard firmware update."""
+"""Build, validate, and package Creator 5 firmware updates."""
 
 import argparse
 import bz2
@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import lzma
+from collections.abc import Mapping
 import os
 from pathlib import Path
 import re
@@ -22,25 +23,12 @@ import tarfile
 import zlib
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-APP_START = 0x08004000
-APP_END = 0x08010000
-RAM_START = 0x20000000
-RAM_END = 0x20004000
-NORMALIZATION = "application-48k-ff-fill-v1"
 MAX_LAYER_BYTES = 256 * 1024 * 1024
 MAX_TOTAL_EXPANDED = 512 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 10000
 MAX_ARCHIVE_DEPTH = 8
 _ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz",
                      ".tar.bz2", ".tbz", ".tbz2", ".gz", ".xz", ".bz2")
-SEED_CONFIG = (
-    "CONFIG_MACH_STM32=y\n"
-    "CONFIG_MACH_N32G430F8S7=y\n"
-    "CONFIG_STM32_CLOCK_REF_8M=y\n"
-    "CONFIG_SERIAL=y\n"
-    "CONFIG_STM32_SERIAL_USART1=y\n"
-    "CONFIG_C5_LEVELBOARD=y\n"
-)
 
 CANONICAL_PLAINTEXT_SHA256 = (
     "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616")
@@ -66,6 +54,29 @@ class ToolError(Exception):
     def __init__(self, message, exit_code=2):
         super().__init__(message)
         self.exit_code = exit_code
+def _profile(board):
+    try:
+        return BOARD_PROFILES[board]
+    except (KeyError, TypeError):
+        raise ToolError("unknown or unimplemented board: %s" % board)
+
+
+def _canonical_boards(boards):
+    if isinstance(boards, (str, bytes)):
+        raise ToolError("board selection must be a sequence")
+    try:
+        selected = list(boards)
+    except TypeError:
+        raise ToolError("board selection must be a sequence")
+    if not selected:
+        raise ToolError("at least one board must be selected")
+    seen = set()
+    for board in selected:
+        _profile(board)
+        if board in seen:
+            raise ToolError("duplicate board selection: %s" % board)
+        seen.add(board)
+    return tuple(board for board in BOARD_PROFILES if board in seen)
 
 
 def sanitize_diagnostic(message, secret=None):
@@ -106,8 +117,9 @@ def _hex_context(line_number, message):
     raise ToolError("Intel HEX line %d: %s" % (line_number, message))
 
 
-def parse_ihex(data):
-    """Parse and strictly validate a levelBoard Intel HEX byte string."""
+def parse_ihex(board, data):
+    """Parse and strictly validate a selected-board Intel HEX byte string."""
+    profile = _profile(board)
     if isinstance(data, str):
         try:
             data = data.encode("ascii")
@@ -165,7 +177,8 @@ def parse_ihex(data):
             end_absolute = absolute + count
             if end_absolute > 0x100000000:
                 _hex_context(number, "32-bit address arithmetic overflow")
-            if count and (absolute < APP_START or end_absolute > APP_END):
+            if count and (absolute < profile["app_start"] or
+                          end_absolute > profile["app_end"]):
                 _hex_context(
     number, "data address range 0x%08x..0x%08x is outside application range" %
      (absolute, end_absolute - 1))
@@ -201,7 +214,7 @@ def parse_ihex(data):
                 _hex_context(number, "duplicate start linear address record")
             start_linear = int.from_bytes(payload, "big")
             start_target = start_linear & ~1
-            if not APP_START <= start_target < APP_END:
+            if not profile["app_start"] <= start_target < profile["app_end"]:
                 _hex_context(
     number, "start linear address is outside application range")
         elif kind in (2, 3):
@@ -215,19 +228,16 @@ def parse_ihex(data):
         raise ToolError("Intel HEX is missing EOF record")
     if not memory:
         raise ToolError("Intel HEX contains no application data")
-    missing_vectors = [
-    address for address in range(
-        APP_START,
-        APP_START +
-         8) if address not in memory]
+    missing_vectors = [address for address in range(
+        profile["app_start"], profile["app_start"] + 8)
+        if address not in memory]
     if missing_vectors:
         raise ToolError(
             "Intel HEX is missing vector bytes at application base")
     stack_pointer, reset_handler = struct.unpack(
-    "<II", bytes(
-        memory[address] for address in range(
-            APP_START, APP_START + 8)))
-    if not RAM_START <= stack_pointer <= RAM_END:
+        "<II", bytes(memory[address] for address in range(
+            profile["app_start"], profile["app_start"] + 8)))
+    if not profile["ram_start"] <= stack_pointer <= profile["ram_end"]:
         raise ToolError("stack pointer 0x%08x is outside SRAM" % stack_pointer)
     if stack_pointer & 7:
         raise ToolError(
@@ -238,7 +248,7 @@ def parse_ihex(data):
     "reset handler 0x%08x does not set the Thumb bit" %
      reset_handler)
     reset_target = reset_handler & ~1
-    if not APP_START <= reset_target < APP_END:
+    if not profile["app_start"] <= reset_target < profile["app_end"]:
         raise ToolError(
     "reset target 0x%08x is outside application range" %
      reset_target)
@@ -257,11 +267,12 @@ def parse_ihex(data):
     intervals.append([start, previous + 1])
     holes = [[left[1], right[0]] for left, right in zip(
         intervals, intervals[1:]) if left[1] != right[0]]
-    if intervals[-1][1] < APP_END:
-        holes.append([intervals[-1][1], APP_END])
-    normalized = bytearray(b"\xff" * (APP_END - APP_START))
+    if intervals[-1][1] < profile["app_end"]:
+        holes.append([intervals[-1][1], profile["app_end"]])
+    normalized = bytearray(
+        b"\xff" * (profile["app_end"] - profile["app_start"]))
     for address, value in memory.items():
-        normalized[address - APP_START] = value
+        normalized[address - profile["app_start"]] = value
     return {
         "memory": memory,
         "mapped_byte_count": len(memory),
@@ -271,77 +282,151 @@ def parse_ihex(data):
         "reset_handler": reset_handler,
         "reset_target": reset_target,
         "start_linear_address": start_linear,
-        "normalization": NORMALIZATION,
+        "normalization": profile["normalization"],
         "normalized_sha256": hashlib.sha256(normalized).hexdigest(),
     }
 
 
-REQUIRED_CONFIG = {
-    "MACH_STM32": "y",
-    "MACH_N32G430F8S7": "y",
-    "C5_LEVELBOARD": "y",
-    "MCU": "stm32f103xe",
-    "STM32_SERIAL_USART1": "y",
-    "FLASH_APPLICATION_ADDRESS": "0x08004000",
-    "FLASH_BOOT_ADDRESS": "0x08000000",
-    "FLASH_SIZE": "0x10000",
-    "RAM_START": "0x20000000",
-    "RAM_SIZE": "0x4000",
-    "CLOCK_FREQ": "128000000",
-    "CLOCK_REF_FREQ": "8000000",
-    "SERIAL_BAUD": "230400",
-    "SERIAL_RX_BUFFER_SIZE": "384",
-}
-
-REQUIRED_CONSTANTS = {
-    "ADC_MAX": 4095,
-    "CLOCK_FREQ": 128000000,
-    "RECEIVE_WINDOW": 384,
-    "RESERVE_PINS_serial": "PH10,PH9",
-    "SERIAL_BAUD": 230400,
-    "STATS_SUMSQ_BASE": 256,
-}
-
-REQUIRED_COMMANDS = {
-    "identify offset=%u count=%c",
-    "set_trigger_threshold threshold=%i",
-    "get_mcu_version",
-    "get_basic_param num=%u",
-    "remove_peel action=%u",
-    "clear_shutdown",
-    "emergency_stop",
-    "get_uptime",
-    "get_clock",
-    "finalize_config crc=%u",
-    "get_config",
-    "allocate_oids count=%c",
-    "stepper_stop_on_trigger oid=%c trsync_oid=%c",
-    "endstop_recover_state oid=%c",
-    "endstop_query_state oid=%c",
-    "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c "
-    "rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
-    "config_endstop oid=%c pin=%c pull_up=%c",
-    "trsync_trigger oid=%c reason=%c",
-    "trsync_set_timeout oid=%c clock=%u",
-    "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
-    "config_trsync oid=%c",
-    "reset",
-}
-
-REQUIRED_RESPONSES = {
-    "identify_response offset=%u data=%.*s",
-    "trigger_threshold threshold=%i",
-    "mcu_version year=%u date=%u version=%u",
-    "param_value value=%u reserve=%u",
-    "peel_data value=%i",
-    "uptime high=%u clock=%u",
-    "clock clock=%u",
-    "config is_config=%c crc=%u is_shutdown=%c move_count=%hu",
-    "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c",
-    "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
-    "starting",
-    "is_shutdown static_string_id=%hu",
-    "shutdown clock=%u static_string_id=%hu",
+BOARD_PROFILES = {
+    "eBoard": {
+        "firmware_name": "eBoard.hex",
+        "app_start": 0x08010000, "app_end": 0x08040000,
+        "ram_start": 0x20000000, "ram_end": 0x20020000,
+        "normalization": "application-192k-ff-fill-v1",
+        "seed_config": (
+            "CONFIG_MACH_STM32=y\n" "CONFIG_MACH_N32G455=y\n"
+            "CONFIG_C5_EBOARD=y\n" "CONFIG_STM32_CLOCK_REF_12M=y\n"
+            "CONFIG_STM32_SERIAL_USART1=y\n" "CONFIG_WANT_ADC=y\n"
+            "CONFIG_WANT_HARD_PWM=y\n" "CONFIG_WANT_SPI=y\n"
+            "CONFIG_WANT_LIS2DW=y\n"),
+        "required_config": {
+            "MACH_STM32": "y", "MACH_N32G455": "y", "C5_EBOARD": "y",
+            "MCU": "stm32f103xe", "STM32_SERIAL_USART1": "y",
+            "WANT_ADC": "y", "WANT_HARD_PWM": "y", "WANT_SPI": "y",
+            "WANT_LIS2DW": "y", "FLASH_APPLICATION_ADDRESS": "0x08010000",
+            "FLASH_BOOT_ADDRESS": "0x08000000", "FLASH_SIZE": "0x40000",
+            "RAM_START": "0x20000000", "RAM_SIZE": "0x20000",
+            "CLOCK_FREQ": "144000000", "CLOCK_REF_FREQ": "12000000",
+            "SERIAL_BAUD": "460800", "SERIAL_RX_BUFFER_SIZE": "384",
+        },
+        "forbidden_config": {"C5_LEVELBOARD", "MACH_N32G430F8S7"},
+        "required_constants": {
+            "MCU": "stm32f103xe", "ADC_MAX": 4095, "CLOCK_FREQ": 144000000,
+            "PWM_MAX": 32768, "RECEIVE_WINDOW": 384,
+            "RESERVE_PINS_serial": "PH10,PH9", "SERIAL_BAUD": 460800,
+            "STATS_SUMSQ_BASE": 256,
+        },
+        "required_commands": {
+            "identify offset=%u count=%c", "allocate_oids count=%c", "get_config",
+            "finalize_config crc=%u", "get_clock", "get_uptime",
+            "emergency_stop", "clear_shutdown", "reset",
+            "config_stepper oid=%c step_pin=%c dir_pin=%c invert_step=%c step_pulse_ticks=%u",
+            "queue_step oid=%c interval=%u count=%hu add=%hi",
+            "set_next_step_dir oid=%c dir=%c", "reset_step_clock oid=%c clock=%u",
+            "stepper_get_position oid=%c",
+            "stepper_stop_on_trigger oid=%c trsync_oid=%c",
+            "config_endstop oid=%c pin=%c pull_up=%c",
+            "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
+            "endstop_query_state oid=%c", "endstop_recover_state oid=%c",
+            "config_trsync oid=%c",
+            "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
+            "trsync_set_timeout oid=%c clock=%u", "trsync_trigger oid=%c reason=%c",
+            "config_digital_out oid=%c pin=%u value=%c default_value=%c max_duration=%u",
+            "set_digital_out_pwm_cycle oid=%c cycle_ticks=%u",
+            "queue_digital_out oid=%c clock=%u on_ticks=%u",
+            "update_digital_out oid=%c value=%c",
+            "config_pwm_out oid=%c pin=%u cycle_ticks=%u value=%hu default_value=%hu max_duration=%u",
+            "queue_pwm_out oid=%c clock=%u value=%hu",
+            "config_analog_in oid=%c pin=%u",
+            "query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu range_check_count=%c",
+            "config_spi oid=%c pin=%u cs_active_high=%c",
+            "spi_set_bus oid=%c spi_bus=%u mode=%u rate=%u",
+            "spi_transfer oid=%c data=%*s", "spi_send oid=%c data=%*s",
+            "config_spi_shutdown oid=%c spi_oid=%c shutdown_msg=%*s",
+            "config_lis2dw oid=%c bus_oid=%c bus_oid_type=%c lis_chip_type=%c",
+            "query_lis2dw oid=%c rest_ticks=%u", "query_lis2dw_status oid=%c",
+            "get_mcu_version", "set_trigger_threshold threshold=%i",
+            "get_basic_param num=%u", "remove_peel action=%u",
+            "pa_action action=%u pc=%u", "get_emcu_pa_value",
+        },
+        "required_responses": {
+            "identify_response offset=%u data=%.*s",
+            "config is_config=%c crc=%u is_shutdown=%c move_count=%hu",
+            "clock clock=%u", "uptime high=%u clock=%u",
+            "stats count=%u sum=%u sumsq=%u", "starting",
+            "is_shutdown static_string_id=%hu",
+            "shutdown clock=%u static_string_id=%hu",
+            "stepper_position oid=%c pos=%i",
+            "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c",
+            "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
+            "analog_in_state oid=%c next_clock=%u value=%hu",
+            "spi_transfer_response oid=%c response=%*s",
+            "sensor_bulk_data oid=%c sequence=%hu data=%*s",
+            "sensor_bulk_status oid=%c clock=%u query_ticks=%u next_sequence=%hu buffered=%u possible_overflows=%hu",
+            "mcu_version year=%u date=%u version=%u",
+            "trigger_threshold threshold=%i", "param_value value=%u reserve=%u",
+            "peel_data value=%i", "pa_value value=%u",
+        },
+        "forbidden_commands": {"config_reset"},
+        "forbidden_responses": {"endstop_recover_state", "pa_action"},
+        "forbidden_format_names": {"Levelboard"},
+    },
+    "levelBoard": {
+        "firmware_name": "levelBoard.hex",
+        "app_start": 0x08004000, "app_end": 0x08010000,
+        "ram_start": 0x20000000, "ram_end": 0x20004000,
+        "normalization": "application-48k-ff-fill-v1",
+        "seed_config": (
+            "CONFIG_MACH_STM32=y\n" "CONFIG_MACH_N32G430F8S7=y\n"
+            "CONFIG_STM32_CLOCK_REF_8M=y\n" "CONFIG_SERIAL=y\n"
+            "CONFIG_STM32_SERIAL_USART1=y\n" "CONFIG_C5_LEVELBOARD=y\n"),
+        "required_config": {
+            "MACH_STM32": "y", "MACH_N32G430F8S7": "y",
+            "C5_LEVELBOARD": "y", "MCU": "stm32f103xe",
+            "STM32_SERIAL_USART1": "y",
+            "FLASH_APPLICATION_ADDRESS": "0x08004000",
+            "FLASH_BOOT_ADDRESS": "0x08000000", "FLASH_SIZE": "0x10000",
+            "RAM_START": "0x20000000", "RAM_SIZE": "0x4000",
+            "CLOCK_FREQ": "128000000", "CLOCK_REF_FREQ": "8000000",
+            "SERIAL_BAUD": "230400", "SERIAL_RX_BUFFER_SIZE": "384",
+        },
+        "forbidden_config": {"MACH_STM32F1", "MACH_N32G45x"},
+        "required_constants": {
+            "ADC_MAX": 4095, "CLOCK_FREQ": 128000000,
+            "RECEIVE_WINDOW": 384, "RESERVE_PINS_serial": "PH10,PH9",
+            "SERIAL_BAUD": 230400, "STATS_SUMSQ_BASE": 256,
+        },
+        "required_commands": {
+            "identify offset=%u count=%c", "set_trigger_threshold threshold=%i",
+            "get_mcu_version", "get_basic_param num=%u",
+            "remove_peel action=%u", "clear_shutdown", "emergency_stop",
+            "get_uptime", "get_clock", "finalize_config crc=%u",
+            "get_config", "allocate_oids count=%c",
+            "stepper_stop_on_trigger oid=%c trsync_oid=%c",
+            "endstop_recover_state oid=%c", "endstop_query_state oid=%c",
+            "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
+            "config_endstop oid=%c pin=%c pull_up=%c",
+            "trsync_trigger oid=%c reason=%c", "trsync_set_timeout oid=%c clock=%u",
+            "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
+            "config_trsync oid=%c", "reset",
+        },
+        "required_responses": {
+            "identify_response offset=%u data=%.*s",
+            "trigger_threshold threshold=%i",
+            "mcu_version year=%u date=%u version=%u",
+            "param_value value=%u reserve=%u", "peel_data value=%i",
+            "uptime high=%u clock=%u", "clock clock=%u",
+            "config is_config=%c crc=%u is_shutdown=%c move_count=%hu",
+            "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c",
+            "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
+            "starting", "is_shutdown static_string_id=%hu",
+            "shutdown clock=%u static_string_id=%hu",
+        },
+        "forbidden_commands": {"config_reset", "config_analog_in",
+                                 "query_analog_in"},
+        "forbidden_responses": {"endstop_recover_state"},
+        "forbidden_format_names": {"Levelboard"},
+    },
 }
 
 
@@ -406,7 +491,8 @@ def _version(program):
     return value[:240]
 
 
-def _load_resolved_config(config_path):
+def _load_resolved_config(board, config_path):
+    profile = _profile(board)
     module_path = REPO_ROOT / "lib" / "kconfiglib"
     sys.path.insert(0, str(module_path))
     old_srctree = os.environ.get("srctree")
@@ -417,14 +503,14 @@ def _load_resolved_config(config_path):
                                    warn=False)
         kconf.load_config(str(config_path))
         values = {}
-        for name in REQUIRED_CONFIG:
+        for name in profile["required_config"]:
             symbol = kconf.syms.get(name)
             if symbol is None:
                 raise ToolError(
     "required Kconfig symbol is missing: %s" %
      name)
             values[name] = symbol.str_value
-        for forbidden in ("MACH_STM32F1", "MACH_N32G45x"):
+        for forbidden in profile["forbidden_config"]:
             symbol = kconf.syms.get(forbidden)
             if symbol is not None and symbol.str_value == "y":
                 raise ToolError(
@@ -443,7 +529,7 @@ def _load_resolved_config(config_path):
             sys.path.remove(str(module_path))
         except ValueError:
             pass
-    for name, expected in REQUIRED_CONFIG.items():
+    for name, expected in profile["required_config"].items():
         actual = values[name]
         if name in (
     "FLASH_APPLICATION_ADDRESS",
@@ -463,14 +549,14 @@ def _load_resolved_config(config_path):
     return values
 
 
-def _load_resolved_config_text(config_text):
+def _load_resolved_config_text(board, config_text):
     if not isinstance(config_text, str) or not config_text:
         raise ToolError("dictionary Kconfig is missing or invalid")
     try:
         with tempfile.TemporaryDirectory() as temp:
             config_path = Path(temp) / ".config"
             config_path.write_text(config_text, encoding="utf-8", newline="\n")
-            return _load_resolved_config(config_path)
+            return _load_resolved_config(board, config_path)
     except OSError:
         raise ToolError("unable to validate dictionary Kconfig")
 
@@ -523,7 +609,8 @@ def _redact_dictionary_metadata(value):
     return value
 
 
-def _load_dictionary(data):
+def _load_dictionary(board, data):
+    profile = _profile(board)
     try:
         raw = json.loads(data.decode("utf-8"))
     except (AttributeError, UnicodeDecodeError, ValueError) as exc:
@@ -546,12 +633,12 @@ def _load_dictionary(data):
         except ValueError:
             pass
     constants = parser.get_constants()
-    for name, expected in REQUIRED_CONSTANTS.items():
+    for name, expected in profile["required_constants"].items():
         if constants.get(name) != expected:
             raise ToolError(
     "dictionary constant %s does not match required value" %
      name)
-    resolved_config = _load_resolved_config_text(parser.get_kconfig())
+    resolved_config = _load_resolved_config_text(board, parser.get_kconfig())
     raw_tables = {"command": raw.get("commands", {}),
                   "response": raw.get("responses", {}),
                   "output": raw.get("output", {})}
@@ -591,8 +678,8 @@ def _load_dictionary(data):
             raise ToolError(
                 "dictionary message membership conflicts with MessageParser")
         message_types[expected_type].add(msgformat)
-    missing_commands = REQUIRED_COMMANDS - message_types["command"]
-    missing_responses = REQUIRED_RESPONSES - message_types["response"]
+    missing_commands = profile["required_commands"] - message_types["command"]
+    missing_responses = profile["required_responses"] - message_types["response"]
     if missing_commands:
         raise ToolError(
     "dictionary is missing required command membership: %s" %
@@ -605,17 +692,18 @@ def _load_dictionary(data):
                                 for item in message_types["command"]}
     response_names = {item.split(" ", 1)[0]
                                  for item in message_types["response"]}
-    for forbidden in ("config_reset", "config_analog_in", "query_analog_in"):
+    for forbidden in profile["forbidden_commands"]:
         if forbidden in command_names:
             raise ToolError(
-    "forbidden dictionary command is present: %s" %
-     forbidden)
-    if "endstop_recover_state" in response_names:
-        raise ToolError(
-            "forbidden dictionary response is present: endstop_recover_state")
+                "forbidden dictionary command is present: %s" % forbidden)
+    for forbidden in profile["forbidden_responses"]:
+        if forbidden in response_names:
+            raise ToolError(
+                "forbidden dictionary response is present: %s" % forbidden)
     all_formats = set().union(*message_types.values())
-    if any(item.split(" ", 1)[0] == "Levelboard" for item in all_formats):
-        raise ToolError("forbidden Levelboard dictionary format is present")
+    forbidden_names = profile["forbidden_format_names"]
+    if any(item.split(" ", 1)[0] in forbidden_names for item in all_formats):
+        raise ToolError("forbidden dictionary format name is present")
     if raw.get("commands", {}).get("identify offset=%u count=%c") != 1:
         raise ToolError("bootstrap identify message ID is not 1")
     if raw.get("responses", {}).get(
@@ -624,7 +712,7 @@ def _load_dictionary(data):
     version, build_versions = parser.get_version_info()
     return {
     "constants": {
-        name: constants[name] for name in sorted(REQUIRED_CONSTANTS)},
+        name: constants[name] for name in sorted(profile["required_constants"])},
         "version": _redact_dictionary_metadata(version),
         "build_versions": _redact_dictionary_metadata(build_versions),
         "kconfig": "[redacted: validated separately]",
@@ -646,12 +734,13 @@ def _read_input_file(value):
     if not data:
         raise ToolError("firmware input is empty: %s" % name)
     return path, data
-def validate_firmware(firmware, elf, dictionary, cross_prefix="arm-none-eabi-",
-                      openssl="openssl"):
+def _validate_firmware(board, firmware, elf, dictionary,
+                       cross_prefix="arm-none-eabi-", openssl="openssl"):
+    profile = _profile(board)
     firmware, exact_hex = _read_input_file(firmware)
     elf, elf_data = _read_input_file(elf)
     dictionary, dictionary_data = _read_input_file(dictionary)
-    image = parse_ihex(exact_hex)
+    image = parse_ihex(board, exact_hex)
     objdump = _tool_path(cross_prefix + "objdump")
     nm = _tool_path(cross_prefix + "nm")
     env = os.environ.copy()
@@ -682,13 +771,16 @@ def validate_firmware(firmware, elf, dictionary, cross_prefix="arm-none-eabi-",
         if not size or "ALLOC" not in flags:
             continue
         vma_end = section["vma"] + size
-        in_flash = (APP_START <= section["vma"] and vma_end <= APP_END)
-        in_ram = (RAM_START <= section["vma"] and vma_end <= RAM_END)
+        in_flash = (profile["app_start"] <= section["vma"] and
+                    vma_end <= profile["app_end"])
+        in_ram = (profile["ram_start"] <= section["vma"] and
+                  vma_end <= profile["ram_end"])
         has_load_image = "CONTENTS" in flags and "LOAD" in flags
         if has_load_image:
             if vma_end > 0x100000000 or (not in_flash and not in_ram):
-                if (RAM_START <= section["vma"] <= RAM_END or
-                        section["vma"] < RAM_START < vma_end):
+                if (profile["ram_start"] <= section["vma"] <=
+                        profile["ram_end"] or
+                        section["vma"] < profile["ram_start"] < vma_end):
                     raise ToolError(
     "RAM section %s crosses SRAM bounds" %
      section["name"])
@@ -696,8 +788,9 @@ def validate_firmware(firmware, elf, dictionary, cross_prefix="arm-none-eabi-",
     "allocated section %s is outside flash and SRAM" %
      section["name"])
             end = section["lma"] + size
-            if (end > 0x100000000 or section["lma"] < APP_START or
-                    end > APP_END):
+            if (end > 0x100000000 or
+                    section["lma"] < profile["app_start"] or
+                    end > profile["app_end"]):
                 raise ToolError(
     "ELF load section %s crosses application flash bounds" %
      section["name"])
@@ -749,11 +842,12 @@ def validate_firmware(firmware, elf, dictionary, cross_prefix="arm-none-eabi-",
     if embedded != dictionary_data:
         raise ToolError(
             "supplied dictionary does not match embedded dictionary")
-    dictionary_report = _load_dictionary(dictionary_data)
+    dictionary_report = _load_dictionary(board, dictionary_data)
     report = {key: value for key, value in image.items() if key != "memory"}
     report.update({
-        "bounds": {"application": [APP_START, APP_END],
-                   "sram": [RAM_START, RAM_END]},
+        "bounds": {
+            "application": [profile["app_start"], profile["app_end"]],
+            "sram": [profile["ram_start"], profile["ram_end"]]},
         "hex_sha256": hashlib.sha256(exact_hex).hexdigest(),
         "elf_sha256": hashlib.sha256(elf_data).hexdigest(),
         "dictionary_sha256": hashlib.sha256(dictionary_data).hexdigest(),
@@ -768,13 +862,17 @@ def validate_firmware(firmware, elf, dictionary, cross_prefix="arm-none-eabi-",
             "openssl": _version(openssl),
         },
     })
+    return report, exact_hex
+
+
+def validate_firmware(board, firmware, elf, dictionary,
+                      cross_prefix="arm-none-eabi-", openssl="openssl"):
+    report, unused_exact_hex = _validate_firmware(
+        board, firmware, elf, dictionary, cross_prefix, openssl)
     return report
 
 
-def build_firmware(output_dir, jobs=1, cross_prefix="arm-none-eabi-",
-                   openssl="openssl"):
-    if not isinstance(jobs, int) or jobs < 1:
-        raise ToolError("jobs must be a positive integer")
+def _preflight_build_output(output_dir):
     output = validate_output_root(output_dir)
     try:
         if output.exists():
@@ -782,11 +880,22 @@ def build_firmware(output_dir, jobs=1, cross_prefix="arm-none-eabi-",
                 raise ToolError("build output path is not a directory")
             if any(output.iterdir()):
                 raise ToolError("build output directory is not empty")
-        else:
-            output.mkdir(parents=True)
     except ToolError:
         raise
     except (OSError, RuntimeError):
+        raise ToolError("unable to prepare build output directory")
+    return output
+
+
+def build_firmware(board, output_dir, jobs=1, cross_prefix="arm-none-eabi-",
+                   openssl="openssl"):
+    profile = _profile(board)
+    if not isinstance(jobs, int) or jobs < 1:
+        raise ToolError("jobs must be a positive integer")
+    output = _preflight_build_output(output_dir)
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError:
         raise ToolError("unable to prepare build output directory")
     try:
         python_path = Path(sys.executable).resolve()
@@ -811,7 +920,7 @@ def build_firmware(output_dir, jobs=1, cross_prefix="arm-none-eabi-",
     config = output / ".config"
     products_dir = output
     try:
-        config.write_text(SEED_CONFIG, encoding="ascii", newline="\n")
+        config.write_text(profile["seed_config"], encoding="ascii", newline="\n")
     except OSError:
         raise ToolError("unable to write build configuration")
     make_out = str(products_dir) + os.sep
@@ -822,12 +931,12 @@ def build_firmware(output_dir, jobs=1, cross_prefix="arm-none-eabi-",
     common = [make, "OUT=" + make_out, "KCONFIG_CONFIG=" + str(config),
               "PYTHON=" + str(python_path), "CROSS_PREFIX=" + cross_prefix]
     _run(common + ["olddefconfig"], "make olddefconfig", env=env)
-    resolved = _load_resolved_config(config)
+    resolved = _load_resolved_config(board, config)
     _run(common + ["-j%d" % jobs, "all"], "firmware build", env=env)
     elf = output / "klipper.elf"
     binary = output / "klipper.bin"
     dictionary = output / "klipper.dict"
-    firmware = output / "levelBoard.hex"
+    firmware = output / profile["firmware_name"]
     for path in (elf, binary, dictionary):
         try:
             valid = path.is_file() and bool(path.stat().st_size)
@@ -841,11 +950,11 @@ def build_firmware(output_dir, jobs=1, cross_prefix="arm-none-eabi-",
     try:
         valid_firmware = firmware.is_file() and bool(firmware.stat().st_size)
     except OSError:
-        raise ToolError("unable to inspect levelBoard.hex", 3)
+        raise ToolError("unable to inspect %s" % profile["firmware_name"], 3)
     if not valid_firmware:
-        raise ToolError("objcopy did not produce levelBoard.hex", 3)
+        raise ToolError("objcopy did not produce %s" % profile["firmware_name"], 3)
     validation = validate_firmware(
-    firmware, elf, dictionary, cross_prefix, openssl)
+        board, firmware, elf, dictionary, cross_prefix, openssl)
     validation["resolved_config"] = resolved
     return {
         "stage": "build",
@@ -1775,24 +1884,33 @@ def _write_gnu_tar(entries):
 
 def _build_reduced_plaintext(profile, firmware_data, shell="sh",
                               md5sum="md5sum"):
+    selected_boards = _canonical_boards(firmware_data)
+    if set(firmware_data) != set(selected_boards):
+        raise ToolError("invalid firmware data selection")
+    for board in selected_boards:
+        if not isinstance(firmware_data[board], bytes):
+            raise ToolError("firmware data must be bytes for %s" % board)
     control = profile["control"]
-    retained = {"./IAPCommand", "./levelBoard.hex", "./mcu.img",
-                "./md5sum.list", "./run.sh", "./Update"}
+    firmware_paths = {"./" + BOARD_PROFILES[board]["firmware_name"]
+                      for board in selected_boards}
+    retained = {"./IAPCommand", "./mcu.img", "./md5sum.list",
+                "./run.sh", "./Update"} | firmware_paths
     checksum_paths = [path for path, unused in profile["checksum_entries"]
                       if path in retained and path != "./md5sum.list"]
     if set(checksum_paths) != retained - {"./md5sum.list"}:
         raise ToolError("retained control checksum order is incomplete")
     control_data = {
         "./IAPCommand": control["./IAPCommand"]["_data"],
-        "./levelBoard.hex": firmware_data,
         "./mcu.img": control["./mcu.img"]["_data"],
         "./run.sh": control["./run.sh"]["_data"],
         "./Update": control["./Update"]["_data"],
     }
+    for board in selected_boards:
+        control_data["./" + BOARD_PROFILES[board]["firmware_name"]] = (
+            firmware_data[board])
     checksum_data = b"".join(
         hashlib.md5(control_data[path]).hexdigest().encode("ascii") +
-        b"  " + path.encode("ascii") + b"\n"
-        for path in checksum_paths)
+        b"  " + path.encode("ascii") + b"\n" for path in checksum_paths)
     _verify_md5(control_data, checksum_data, md5sum)
     control_data["./md5sum.list"] = checksum_data
     control_entries = [(member, control_data[member["path"]])
@@ -1801,7 +1919,6 @@ def _build_reduced_plaintext(profile, firmware_data, shell="sh",
     control_tar = _write_gnu_tar(control_entries)
     if control_tar[257:265] != b"ustar  \0":
         raise ToolError("generated control archive is not GNU tar")
-
     transformed_installer = _suppress_update_other(
         profile["outer"]["./runFirmwareExe.sh"]["_data"])
     _check_shell_syntax(transformed_installer, shell)
@@ -1822,14 +1939,12 @@ def _build_reduced_plaintext(profile, firmware_data, shell="sh",
     evidence = {
         "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
         "outer_order": [member["path"] for member, unused in outer_entries],
-        "control_order": [member["path"]
-                          for member, unused in control_entries],
+        "control_order": [member["path"] for member, unused in control_entries],
         "outer_metadata": {member["path"]: _member_metadata(member)
                            for member, unused in outer_entries},
         "control_metadata": {member["path"]: _member_metadata(member)
                              for member, unused in control_entries},
-        "outer_data": outer_data,
-        "control_data": control_data,
+        "outer_data": outer_data, "control_data": control_data,
         "control_path": control_path,
     }
     return plaintext, evidence
@@ -1853,7 +1968,8 @@ def _manifest_member(label, member):
     }
 
 
-def _assert_reduced_profile(model, evidence, md5sum="md5sum"):
+def _assert_reduced_profile(model, evidence, selected_boards, md5sum="md5sum"):
+    selected_boards = _canonical_boards(selected_boards)
     if (model.get("format") != "tar" or
             model.get("sha256") != evidence["plaintext_sha256"]):
         raise ToolError("generated plaintext archive hash mismatch")
@@ -1865,7 +1981,10 @@ def _assert_reduced_profile(model, evidence, md5sum="md5sum"):
         raise ToolError("generated outer archive has invalid member type or "
                         "root convention")
     outer = {member["path"]: member for member in members}
-    if set(outer) != set(evidence["outer_data"]):
+    expected_outer = {evidence["control_path"], "./end.img", "./play",
+                      "./runFirmwareExe.sh", "./start.img"}
+    if (set(outer) != expected_outer or
+            set(evidence["outer_data"]) != expected_outer):
         raise ToolError("generated outer archive allowlist mismatch")
     for path in evidence["outer_order"]:
         _assert_member(outer[path], evidence["outer_metadata"][path],
@@ -1884,13 +2003,18 @@ def _assert_reduced_profile(model, evidence, md5sum="md5sum"):
         raise ToolError("generated control archive has invalid member type or "
                         "root convention")
     control = {member["path"]: member for member in control_members}
-    if set(control) != set(evidence["control_data"]):
+    expected_hex_paths = ["./" + BOARD_PROFILES[board]["firmware_name"]
+                          for board in selected_boards]
+    expected_control = {"./IAPCommand", "./mcu.img", "./md5sum.list",
+                        "./run.sh", "./Update"} | set(expected_hex_paths)
+    if (set(control) != expected_control or
+            set(evidence["control_data"]) != expected_control):
         raise ToolError("generated control archive allowlist mismatch")
     for path in evidence["control_order"]:
         _assert_member(control[path], evidence["control_metadata"][path],
                        evidence["control_data"][path], path)
-    if [path for path in control if path.lower().endswith(".hex")] != [
-            "./levelBoard.hex"]:
+    if [path for path in control if path.lower().endswith(".hex")] != (
+            expected_hex_paths):
         raise ToolError(
             "generated package contains unrelated firmware payload")
     if control["./Update"]["size"] != 0:
@@ -1907,12 +2031,14 @@ def _assert_reduced_profile(model, evidence, md5sum="md5sum"):
     }
     control_labels = {
         "./IAPCommand": "IAPCommand",
-        "./levelBoard.hex": "levelBoard firmware",
         "./mcu.img": "control display image",
         "./md5sum.list": "checksum list",
         "./run.sh": "control script",
         "./Update": "Update marker",
     }
+    for board in selected_boards:
+        control_labels["./" + BOARD_PROFILES[board]["firmware_name"]] = (
+            board + " firmware")
     return {
         "outer": [_manifest_member(outer_labels[path], outer[path])
                   for path in evidence["outer_order"]],
@@ -2045,23 +2171,28 @@ def _repository_state():
     return {"commit": commit, "dirty": bool(status.stdout.strip())}
 
 
-def _create_manifest(firmware_report, template_plaintext_hash, plaintext,
+def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
                      ciphertext, members, shell, md5sum):
-    firmware = json.loads(json.dumps(firmware_report))
-    firmware.setdefault("dictionary", {})["kconfig"] = (
-        "[redacted: validated separately]")
-    tools = dict(firmware.get("tools", {}))
+    firmwares = {}
+    tools = {}
+    for board in _canonical_boards(firmware_reports):
+        firmware = json.loads(json.dumps(firmware_reports[board]))
+        firmware.setdefault("dictionary", {})["kconfig"] = (
+            "[redacted: validated separately]")
+        if not tools:
+            tools = dict(firmware.get("tools", {}))
+        firmware.pop("tools", None)
+        firmwares[board] = firmware
     tools["sh"] = _version(shell)
     tools["md5sum"] = _version(md5sum)
     timestamp = datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0).isoformat().replace("+00:00", "Z")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": _repository_state(),
         "build_timestamp_utc": timestamp,
         "tools": tools,
-        "resolved_config": firmware["resolved_config"],
-        "firmware": firmware,
+        "firmwares": firmwares,
         "template_plaintext_sha256": template_plaintext_hash,
         "output": {
             "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
@@ -2088,16 +2219,48 @@ def _create_manifest(firmware_report, template_plaintext_hash, plaintext,
     }
 
 
-def package_update(template, firmware, elf, dictionary, output,
+def _normalize_firmware_inputs(firmware_inputs):
+    if not isinstance(firmware_inputs, Mapping):
+        raise ToolError("firmware inputs must be a mapping")
+    boards = _canonical_boards(firmware_inputs.keys())
+    normalized = {}
+    required_roles = {"firmware", "elf", "dictionary"}
+    for board in boards:
+        products = firmware_inputs[board]
+        if not isinstance(products, Mapping):
+            raise ToolError("firmware entry for %s must be a mapping" % board)
+        roles = set(products)
+        if roles != required_roles:
+            missing = sorted(required_roles - roles)
+            extra = sorted(roles - required_roles)
+            detail = (("missing " + ", ".join(missing)) if missing else
+                      ("extra " + ", ".join(extra)))
+            raise ToolError("firmware roles for %s are invalid: %s" %
+                            (board, detail))
+        for role in required_roles:
+            if not isinstance(products[role], (str, os.PathLike)):
+                raise ToolError(
+                    "firmware path for %s/%s is invalid" % (board, role))
+        normalized[board] = {role: products[role] for role in
+                             ("firmware", "elf", "dictionary")}
+    return normalized
+
+
+def package_update(template, firmware_inputs, output,
                    cross_prefix="arm-none-eabi-", openssl="openssl"):
-    output = _prepare_package_output(
-        output, (template, firmware, elf, dictionary))
-    firmware_report = validate_firmware(
-        firmware, elf, dictionary, cross_prefix, openssl)
-    unused, firmware_data = _read_input_file(firmware)
-    if (hashlib.sha256(firmware_data).hexdigest() !=
-            firmware_report["hex_sha256"]):
-        raise ToolError("firmware changed after validation")
+    firmware_inputs = _normalize_firmware_inputs(firmware_inputs)
+    input_paths = [template]
+    for products in firmware_inputs.values():
+        input_paths.extend(products.values())
+    output = _prepare_package_output(output, input_paths)
+    firmware_reports = {}
+    firmware_data = {}
+    for board, products in firmware_inputs.items():
+        report, exact_hex = _validate_firmware(
+            board, products["firmware"], products["elf"],
+            products["dictionary"], cross_prefix, openssl)
+        firmware_reports[board] = report
+        firmware_data[board] = exact_hex
     try:
         template_data = _read_archive_input(template)
     except OSError:
@@ -2114,12 +2277,12 @@ def package_update(template, firmware, elf, dictionary, output,
     md5sum_path = _program_path("md5sum", "md5sum")
     profile = _canonical_template_profile(
         template_model["payload"], md5sum_path)
+    selected_boards = tuple(firmware_inputs)
     plaintext, evidence = _build_reduced_plaintext(
         profile, firmware_data, shell_path, md5sum_path)
     constructed_model = _inspect_archive_model(plaintext)
     member_summary = _assert_reduced_profile(
-        constructed_model, evidence, md5sum_path)
-
+        constructed_model, evidence, selected_boards, md5sum_path)
     ciphertext = openssl_crypt(plaintext, False, openssl)
     with tempfile.TemporaryDirectory(prefix="c5-update-verify-") as temp:
         candidate = Path(temp) / "candidate.tgz"
@@ -2130,36 +2293,53 @@ def package_update(template, firmware, elf, dictionary, output,
                 verified_model.get("_payload") != plaintext):
             raise ToolError("fresh package decryption differs from plaintext")
         verified_summary = _assert_reduced_profile(
-            verified_model["payload"], evidence, md5sum_path)
+            verified_model["payload"], evidence, selected_boards, md5sum_path)
     if verified_summary != member_summary:
         raise ToolError("fresh package reinspection differs from construction")
     manifest = _create_manifest(
-        firmware_report, hashlib.sha256(template_plaintext).hexdigest(),
+        firmware_reports, hashlib.sha256(template_plaintext).hexdigest(),
         plaintext, ciphertext, verified_summary, shell_path, md5sum_path)
     manifest_data = (json.dumps(manifest, sort_keys=True, indent=2) +
                      "\n").encode("utf-8")
     _publish_outputs(output, ciphertext, manifest_data)
     return {
-        "stage": "package",
-        "package": output.name,
+        "stage": "package", "package": output.name,
         "manifest": output.name + ".manifest.json",
         "ciphertext_sha256": manifest["output"]["ciphertext_sha256"],
         "plaintext_sha256": manifest["output"]["plaintext_sha256"],
-        "firmware_hex_sha256": firmware_report["hex_sha256"],
-        "firmware_normalized_sha256": firmware_report["normalized_sha256"],
+        "firmwares": {board: {
+            "hex_sha256": firmware_reports[board]["hex_sha256"],
+            "normalized_sha256": firmware_reports[board]["normalized_sha256"],
+        } for board in firmware_inputs},
         "validation": manifest["validation"],
     }
 
 
-def run_all_stages(template, output_dir, output, jobs=1,
+def run_all_stages(boards, template, output_dir, output, jobs=1,
                    cross_prefix="arm-none-eabi-", openssl="openssl"):
-    _prepare_package_output(output, (template,))
-    build_dir = Path(output_dir) / "build"
-    build_report = build_firmware(build_dir, jobs, cross_prefix, openssl)
+    boards = _canonical_boards(boards)
+    root = validate_output_root(output_dir)
+    build_root = root / "build"
+    build_dirs = {board: build_root / board for board in boards}
+    firmware_inputs = {board: {
+        "firmware": build_dirs[board] / BOARD_PROFILES[board]["firmware_name"],
+        "elf": build_dirs[board] / "klipper.elf",
+        "dictionary": build_dirs[board] / "klipper.dict",
+    } for board in boards}
+    output_path = _prepare_package_output(
+        output, [template] + [path for products in firmware_inputs.values()
+                             for path in products.values()])
+    if _inside(output_path, build_root.resolve(strict=False)):
+        raise ToolError("package output must be outside the build subtree")
+    for board in boards:
+        _preflight_build_output(build_dirs[board])
+    build_reports = {}
+    for board in boards:
+        build_reports[board] = build_firmware(
+            board, build_dirs[board], jobs, cross_prefix, openssl)
     package_report = package_update(
-        template, build_dir / "levelBoard.hex", build_dir / "klipper.elf",
-        build_dir / "klipper.dict", output, cross_prefix, openssl)
-    return {"stage": "all", "build": build_report,
+        template, firmware_inputs, output, cross_prefix, openssl)
+    return {"stage": "all", "builds": build_reports,
             "package": package_report}
 
 
@@ -2172,18 +2352,34 @@ def _add_global(parser):
     "--openssl",
     default="openssl",
      help="OpenSSL executable")
+def _cli_firmware_inputs(groups):
+    boards = []
+    for group in groups:
+        board = group[0]
+        _profile(board)
+        if board in boards:
+            raise ToolError("duplicate board selection: %s" % board)
+        boards.append(board)
+    ordered = _canonical_boards(boards)
+    by_board = {group[0]: group[1:] for group in groups}
+    return {board: {
+        "firmware": Path(by_board[board][0]),
+        "elf": Path(by_board[board][1]),
+        "dictionary": Path(by_board[board][2]),
+    } for board in ordered}
 
 
 def create_argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     _add_global(parser)
     sub = parser.add_subparsers(dest="command", required=True)
-    build = sub.add_parser(
-    "build", help="build and validate C5 levelBoard firmware")
+    build = sub.add_parser("build", help="build and validate C5 firmware")
+    build.add_argument("--board", required=True, choices=tuple(BOARD_PROFILES))
     build.add_argument("--output-dir", required=True, type=Path)
     build.add_argument("--jobs", type=int, default=1)
     validate = sub.add_parser("validate",
-     help="validate firmware representations")
+                              help="validate firmware representations")
+    validate.add_argument("--board", required=True, choices=tuple(BOARD_PROFILES))
     validate.add_argument("--firmware", required=True, type=Path)
     validate.add_argument("--elf", required=True, type=Path)
     validate.add_argument("--dictionary", required=True, type=Path)
@@ -2191,15 +2387,15 @@ def create_argument_parser():
     inspect.add_argument("--input", required=True, type=Path)
     inspect.add_argument("--decrypt", action="store_true")
     inspect.add_argument("--extract-temp", action="store_true")
-    package = sub.add_parser(
-    "package",
-     help="create an encrypted update package")
+    package = sub.add_parser("package",
+                             help="create an encrypted update package")
     package.add_argument("--template", required=True, type=Path)
-    package.add_argument("--firmware", required=True, type=Path)
-    package.add_argument("--elf", required=True, type=Path)
-    package.add_argument("--dictionary", required=True, type=Path)
+    package.add_argument("--firmware", required=True, action="append", nargs=4,
+                         metavar=("BOARD", "HEX", "ELF", "DICT"))
     package.add_argument("--output", required=True, type=Path)
     all_cmd = sub.add_parser("all", help="build, validate, and package")
+    all_cmd.add_argument("--board", required=True, action="append",
+                         choices=tuple(BOARD_PROFILES))
     all_cmd.add_argument("--template", required=True, type=Path)
     all_cmd.add_argument("--output-dir", required=True, type=Path)
     all_cmd.add_argument("--output", required=True, type=Path)
@@ -2216,33 +2412,27 @@ def main(argv=None):
     args = create_argument_parser().parse_args(argv)
     try:
         if args.command == "build":
-            _json_print(
-    build_firmware(
-        args.output_dir,
-        args.jobs,
-        args.cross_prefix,
-         args.openssl))
+            _json_print(build_firmware(
+                args.board, args.output_dir, args.jobs, args.cross_prefix,
+                args.openssl))
         elif args.command == "validate":
-            _json_print(
-    validate_firmware(
-        args.firmware,
-        args.elf,
-        args.dictionary,
-        args.cross_prefix,
-         args.openssl))
+            _json_print(validate_firmware(
+                args.board, args.firmware, args.elf, args.dictionary,
+                args.cross_prefix, args.openssl))
         elif args.command == "inspect":
             archive_data = _read_archive_input(args.input)
             _json_print(inspect_archive(
                 archive_data, decrypt=args.decrypt,
                 extract_temp=args.extract_temp, openssl=args.openssl))
         elif args.command == "package":
+            firmware_inputs = _cli_firmware_inputs(args.firmware)
             _json_print(package_update(
-                args.template, args.firmware, args.elf, args.dictionary,
-                args.output, args.cross_prefix, args.openssl))
+                args.template, firmware_inputs, args.output,
+                args.cross_prefix, args.openssl))
         elif args.command == "all":
             _json_print(run_all_stages(
-                args.template, args.output_dir, args.output, args.jobs,
-                args.cross_prefix, args.openssl))
+                args.board, args.template, args.output_dir, args.output,
+                args.jobs, args.cross_prefix, args.openssl))
         else:
             raise ToolError("unknown stage")
         return 0
