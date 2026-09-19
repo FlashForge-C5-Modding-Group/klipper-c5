@@ -10,18 +10,9 @@
 #include "gpio.h" // gpio_out_setup
 #include "internal.h" // gpio_peripheral
 #include "sched.h" // sched_shutdown
-#if CONFIG_C5_LEVELBOARD
-uint8_t c5_levelboard_eddy_state(void);
-#endif
 
 
-#if CONFIG_MACH_N32G430F8S7
-DECL_ENUMERATION_RANGE("pin", "PA0", GPIO('A', 0), 8);
-DECL_ENUMERATION("pin", "PA9", GPIO('A', 9));
-DECL_ENUMERATION("pin", "PA10", GPIO('A', 10));
-DECL_ENUMERATION("pin", "PB1", GPIO('B', 1));
-DECL_ENUMERATION("pin", "PD0", GPIO('D', 0));
-#else
+#if !CONFIG_MACH_N32G430
 DECL_ENUMERATION_RANGE("pin", "PA0", GPIO('A', 0), 16);
 DECL_ENUMERATION_RANGE("pin", "PB0", GPIO('B', 0), 16);
 DECL_ENUMERATION_RANGE("pin", "PC0", GPIO('C', 0), 16);
@@ -46,6 +37,7 @@ DECL_ENUMERATION_RANGE("pin", "PI0", GPIO('I', 0), 16);
 #endif
 
 
+#if !CONFIG_MACH_N32G430
 static GPIO_TypeDef * const digital_regs[] = {
     ['A' - 'A'] = GPIOA, GPIOB, GPIOC,
 #ifdef GPIOD
@@ -67,18 +59,11 @@ static GPIO_TypeDef * const digital_regs[] = {
     ['I' - 'A'] = GPIOI,
 #endif
 };
-#if CONFIG_MACH_N32G430F8S7
-static const uint16_t digital_pin_masks[] = {
-    ['A' - 'A'] = 0x06ff,
-    ['B' - 'A'] = 0x0002,
-    ['D' - 'A'] = 0x0001,
-};
-#endif
 
 
 // Convert a register and bit location back to an integer pin identifier
-static int
-regs_to_pin(GPIO_TypeDef *regs, uint32_t bit)
+int
+gpio_regs_to_pin(GPIO_TypeDef *regs, uint32_t bit)
 {
     int i;
     for (i=0; i<ARRAY_SIZE(digital_regs); i++)
@@ -94,13 +79,9 @@ gpio_pin_to_regs(uint32_t pin)
     uint32_t port = GPIO2PORT(pin);
     if (port >= ARRAY_SIZE(digital_regs) || !digital_regs[port])
         shutdown("Not a valid pin");
-#if CONFIG_MACH_N32G430F8S7
-    if (port >= ARRAY_SIZE(digital_pin_masks)
-        || !(digital_pin_masks[port] & GPIO2BIT(pin)))
-        shutdown("Not a valid pin");
-#endif
     return digital_regs[port];
 }
+#endif
 
 struct gpio_out
 gpio_out_setup(uint32_t pin, uint32_t val)
@@ -116,7 +97,7 @@ void
 gpio_out_reset(struct gpio_out g, uint32_t val)
 {
     GPIO_TypeDef *regs = g.regs;
-    int pin = regs_to_pin(regs, g.bit);
+    int pin = gpio_regs_to_pin(regs, g.bit);
     irqstatus_t flag = irq_save();
     if (val)
         regs->BSRR = g.bit;
@@ -165,7 +146,7 @@ void
 gpio_in_reset(struct gpio_in g, int32_t pull_up)
 {
     GPIO_TypeDef *regs = g.regs;
-    int pin = regs_to_pin(regs, g.bit);
+    int pin = gpio_regs_to_pin(regs, g.bit);
     irqstatus_t flag = irq_save();
     gpio_peripheral(pin, GPIO_INPUT, pull_up);
     irq_restore(flag);
@@ -174,10 +155,6 @@ gpio_in_reset(struct gpio_in g, int32_t pull_up)
 uint8_t
 gpio_in_read(struct gpio_in g)
 {
-#if CONFIG_C5_LEVELBOARD
-    if (g.regs == GPIOD && g.bit == GPIO2BIT(GPIO('D', 0)))
-        return c5_levelboard_eddy_state();
-#endif
     GPIO_TypeDef *regs = g.regs;
     return !!(regs->IDR & g.bit);
 }

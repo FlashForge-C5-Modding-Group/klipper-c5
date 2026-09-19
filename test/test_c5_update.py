@@ -22,37 +22,32 @@ import unittest
 import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL_PATH = ROOT / "scripts" / "build_c5_levelboard_update.py"
+TOOL_PATH = ROOT / "scripts" / "build_c5_update.py"
 SPEC = importlib.util.spec_from_file_location("c5_update", TOOL_PATH)
 TOOL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TOOL)
 
-APP_START = 0x08004000
-APP_END = 0x08010000
+LEVEL_PROFILE = TOOL.BOARD_PROFILES["levelBoard"]
+APP_START = LEVEL_PROFILE["app_start"]
+APP_END = LEVEL_PROFILE["app_end"]
+
 def dictionary_data(kconfig=None, version="test-version",
-                    build_versions="test-tools"):
-    commands = {
-    name: index for index,
-    name in enumerate(
-        sorted(
-            TOOL.REQUIRED_COMMANDS -
-            {"identify offset=%u count=%c"}),
-             2)}
+                    build_versions="test-tools", board="levelBoard"):
+    profile = TOOL.BOARD_PROFILES[board]
+    commands = {name: index for index, name in enumerate(
+        sorted(profile["required_commands"] -
+               {"identify offset=%u count=%c"}), 2)}
     commands["identify offset=%u count=%c"] = 1
     first_response = max(commands.values()) + 1
-    responses = {name: index for index, name in
-                 enumerate(sorted(TOOL.REQUIRED_RESPONSES -
-                                  {"identify_response offset=%u data=%.*s"}),
-                           first_response)}
+    responses = {name: index for index, name in enumerate(
+        sorted(profile["required_responses"] -
+               {"identify_response offset=%u data=%.*s"}), first_response)}
     responses["identify_response offset=%u data=%.*s"] = 0
     value = {
-        "commands": commands,
-        "responses": responses,
-        "output": {},
-        "config": dict(TOOL.REQUIRED_CONSTANTS),
-        "kconfig": TOOL.SEED_CONFIG if kconfig is None else kconfig,
-        "version": version,
-        "build_versions": build_versions,
+        "commands": commands, "responses": responses, "output": {},
+        "config": dict(profile["required_constants"]),
+        "kconfig": profile["seed_config"] if kconfig is None else kconfig,
+        "version": version, "build_versions": build_versions,
     }
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
 
@@ -63,10 +58,16 @@ def record(kind, address=0, payload=b""):
                    ).hex().upper().encode() + b"\n"
 
 
-def ihex(records=(), sp=0x20004000, reset=APP_START + 9, eof=True):
-    data = record(4, payload=struct.pack(">H", APP_START >> 16))
+def ihex(records=(), sp=None, reset=None, eof=True, board="levelBoard"):
+    profile = TOOL.BOARD_PROFILES[board]
+    app_start = profile["app_start"]
+    if sp is None:
+        sp = profile["ram_end"]
+    if reset is None:
+        reset = app_start + 9
+    data = record(4, payload=struct.pack(">H", app_start >> 16))
     vectors = struct.pack("<II", sp, reset)
-    data += record(0, APP_START & 0xffff, vectors + b"\x00\xbf\x00\xbf")
+    data += record(0, app_start & 0xffff, vectors + b"\x00\xbf\x00\xbf")
     for entry in records:
         data += entry
     if eof:
@@ -108,7 +109,7 @@ def corrupt_tar_name(value, replacement):
 
 class IntelHexTests(unittest.TestCase):
     def parse(self, value):
-        return TOOL.parse_ihex(value)
+        return TOOL.parse_ihex("levelBoard", value)
 
     def assert_rejected(self, value, *words):
         with self.assertRaises(TOOL.ToolError) as raised:
@@ -253,22 +254,41 @@ class FoundationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("usage:", result.stdout.lower())
         parsed = TOOL.create_argument_parser().parse_args(
-            ["build", "--output-dir", "x"])
+            ["build", "--board", "levelBoard", "--output-dir", "x"])
         self.assertEqual((parsed.cross_prefix, parsed.openssl,
                          parsed.jobs), ("arm-none-eabi-", "openssl", 1))
 
     def test_expected_input_error_has_exit_two_without_traceback(self):
         result = self.run_cli(
-    "validate",
-    "--firmware",
-    "missing.hex",
-    "--elf",
-    "missing.elf",
-    "--dictionary",
-     "missing.dict")
+            "validate", "--board", "levelBoard",
+            "--firmware", "missing.hex",
+            "--elf", "missing.elf",
+            "--dictionary", "missing.dict")
         self.assertEqual(result.returncode, 2)
         self.assertNotIn("traceback", result.stderr.lower())
         self.assertEqual(result.stdout, "")
+
+    def test_package_commands_reject_dirty_repository_before_work(self):
+        dirty = {"commit": "a" * 40, "dirty": True}
+        commands = (
+            (["package", "--template", "template.tgz",
+              "--firmware", "levelBoard", "firmware.hex", "firmware.elf",
+              "firmware.dict", "--output", "Creator5Pro-test.tgz"],
+             "package_update"),
+            (["all", "--board", "levelBoard", "--template", "template.tgz",
+              "--output-dir", "build", "--output",
+              "Creator5Pro-test.tgz"],
+             "run_all_stages"),
+        )
+        for arguments, operation_name in commands:
+            with self.subTest(command=arguments[0]), \
+                    mock.patch.object(TOOL, "_repository_state",
+                                      return_value=dirty), \
+                    mock.patch.object(TOOL, operation_name) as operation, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(TOOL.main(arguments), 2)
+                self.assertIn("dirty repository", stderr.getvalue())
+                operation.assert_not_called()
 
     def test_output_root_policy_accepts_external_or_out_only(self):
         with tempfile.TemporaryDirectory() as outside:
@@ -293,7 +313,8 @@ class FoundationTests(unittest.TestCase):
             sentinel = output / "keep.txt"
             sentinel.write_text("owned")
             with self.assertRaisesRegex(TOOL.ToolError, "not empty") as raised:
-                TOOL.build_firmware(output, 1, "missing-toolchain-", "openssl")
+                TOOL.build_firmware(
+                    "levelBoard", output, 1, "missing-toolchain-", "openssl")
             self.assertEqual(raised.exception.exit_code, 2)
             self.assertEqual(sentinel.read_text(), "owned")
 
@@ -342,7 +363,9 @@ class FoundationTests(unittest.TestCase):
             parent = Path(temp) / "regular-file"
             parent.write_text("not a directory")
             output = parent / "build"
-            result = self.run_cli("build", "--output-dir", str(output))
+            result = self.run_cli(
+                "build", "--board", "levelBoard",
+                "--output-dir", str(output))
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertNotIn("traceback", result.stderr.lower())
             self.assertNotIn(str(Path(temp)), result.stderr)
@@ -356,9 +379,10 @@ class FoundationTests(unittest.TestCase):
             except OSError:
                 self.skipTest("symlink creation unavailable")
             for arguments in (
-                    ("build", "--output-dir", str(loop / "build")),
-                    ("validate", "--firmware", str(loop), "--elf",
-                     "missing.elf",
+                    ("build", "--board", "levelBoard",
+                     "--output-dir", str(loop / "build")),
+                    ("validate", "--board", "levelBoard",
+                     "--firmware", str(loop), "--elf", "missing.elf",
                      "--dictionary", "missing.dict")):
                 with self.subTest(command=arguments[0]):
                     result = self.run_cli(*arguments)
@@ -369,15 +393,6 @@ class FoundationTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_seed_config_is_exact(self):
-        self.assertEqual(TOOL.SEED_CONFIG, (
-            "CONFIG_MACH_STM32=y\n"
-            "CONFIG_MACH_N32G430F8S7=y\n"
-            "CONFIG_STM32_CLOCK_REF_8M=y\n"
-            "CONFIG_SERIAL=y\n"
-            "CONFIG_STM32_SERIAL_USART1=y\n"
-            "CONFIG_C5_LEVELBOARD=y\n"
-        ))
 
     def test_sanitizer_redacts_paths_and_secret(self):
         secret = "test-generated-secret"
@@ -396,9 +411,12 @@ Idx Name          Size      VMA       LMA       File off  Algn
             TOOL._parse_sections(output, 1024)
 
     def test_dictionary_uses_resolved_kconfig_not_literal_lines(self):
-        contradictory = TOOL.SEED_CONFIG + "CONFIG_MACH_STM32F103=y\n"
+        contradictory = (
+            TOOL.BOARD_PROFILES["levelBoard"]["seed_config"] +
+            "CONFIG_MACH_STM32F103=y\n")
         with self.assertRaisesRegex(TOOL.ToolError, "Kconfig|hardware"):
-            TOOL._load_dictionary(dictionary_data(kconfig=contradictory))
+            TOOL._load_dictionary(
+                "levelBoard", dictionary_data(kconfig=contradictory))
 
     def test_dictionary_membership_uses_message_parser_classification(self):
         value = json.loads(dictionary_data())
@@ -408,15 +426,16 @@ Idx Name          Size      VMA       LMA       File off  Algn
         with self.assertRaisesRegex(TOOL.ToolError,
                                     "response|membership|conflicting "
                                     "message ID"):
-            TOOL._load_dictionary(json.dumps(value).encode())
+            TOOL._load_dictionary("levelBoard", json.dumps(value).encode())
     def test_dictionary_rejects_conflicting_ids_and_nonoutput_names(self):
         value = json.loads(dictionary_data())
-        responses = sorted(TOOL.REQUIRED_RESPONSES -
-                           {"identify_response offset=%u data=%.*s"})
+        responses = sorted(
+            TOOL.BOARD_PROFILES["levelBoard"]["required_responses"] -
+            {"identify_response offset=%u data=%.*s"})
         value["responses"][responses[1]] = value["responses"][responses[0]]
         with self.assertRaisesRegex(
                 TOOL.ToolError, "conflicting.*ID|ID.*conflict"):
-            TOOL._load_dictionary(json.dumps(value).encode())
+            TOOL._load_dictionary("levelBoard", json.dumps(value).encode())
 
         value = json.loads(dictionary_data())
         next_id = max(value["responses"].values()) + 1
@@ -424,12 +443,13 @@ Idx Name          Size      VMA       LMA       File off  Algn
         value["responses"]["duplicate value=%c"] = next_id + 1
         with self.assertRaisesRegex(
                 TOOL.ToolError, "conflicting.*name|name.*conflict"):
-            TOOL._load_dictionary(json.dumps(value).encode())
+            TOOL._load_dictionary("levelBoard", json.dumps(value).encode())
 
     def test_dictionary_metadata_paths_are_explicitly_redacted(self):
-        report = TOOL._load_dictionary(dictionary_data(
-            version="version[/private/build/tree]",
-            build_versions=r"v@C:\private\toolchain"))
+        report = TOOL._load_dictionary(
+            "levelBoard", dictionary_data(
+                version="version[/private/build/tree]",
+                build_versions=r"v@C:\private\toolchain"))
         self.assertEqual(report["version"], "[redacted: unsafe metadata]")
         self.assertEqual(
     report["build_versions"],
@@ -443,7 +463,7 @@ Idx Name          Size      VMA       LMA       File off  Algn
         with contextlib.redirect_stderr(captured):
             with self.assertRaisesRegex(
                     TOOL.ToolError, "invalid protocol dictionary"):
-                TOOL._load_dictionary(json.dumps(value).encode())
+                TOOL._load_dictionary("levelBoard", json.dumps(value).encode())
         self.assertEqual(captured.getvalue(), "")
 
 
@@ -530,8 +550,8 @@ SECTIONS {
     def run_cli(self, firmware="firmware.hex", elf="firmware.elf",
                 dictionary="firmware.dict"):
         return subprocess.run(
-            [sys.executable, str(TOOL_PATH), "validate", "--firmware",
-             firmware,
+            [sys.executable, str(TOOL_PATH), "validate",
+             "--board", "levelBoard", "--firmware", firmware,
              "--elf", elf, "--dictionary", dictionary],
             cwd=self.directory, text=True, capture_output=True)
 
@@ -607,8 +627,8 @@ SECTIONS {
         return subprocess.run(
             [sys.executable, str(TOOL_PATH), "--openssl",
              shutil.which("openssl"), "package", "--template", str(template),
-             "--firmware", "firmware.hex", "--elf", "firmware.elf",
-             "--dictionary", "firmware.dict", "--output", str(output)],
+             "--firmware", "levelBoard", "firmware.hex", "firmware.elf",
+             "firmware.dict", "--output", str(output)],
             cwd=self.directory, text=True, capture_output=True)
 
 
@@ -619,12 +639,16 @@ class RealFirmwareTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workspace = tempfile.TemporaryDirectory()
-        cls.output = Path(cls.workspace.name) / "build"
+        workspace = Path(cls.workspace.name)
+        cls.output = workspace / "levelBoard"
+        cls.eboard_output = workspace / "eBoard"
         cls.repo_config = ROOT / ".config"
         cls.config_before = (cls.repo_config.read_bytes()
                              if cls.repo_config.exists() else None)
-        cls.build_report = TOOL.build_firmware(cls.output, 1, "arm-none-eabi-",
-                                               "openssl")
+        cls.build_report = TOOL.build_firmware(
+            "levelBoard", cls.output, 1, "arm-none-eabi-", "openssl")
+        cls.eboard_build_report = TOOL.build_firmware(
+            "eBoard", cls.eboard_output, 1, "arm-none-eabi-", "openssl")
 
     @classmethod
     def tearDownClass(cls):
@@ -647,7 +671,8 @@ class RealFirmwareTests(unittest.TestCase):
         APP_START, APP_END])
         self.assertEqual(firmware["constants"]["RECEIVE_WINDOW"], 384)
         self.assertEqual(firmware["constants"]["SERIAL_BAUD"], 230400)
-        self.assertEqual(firmware["resolved_config"]["MCU"], "stm32f103xe")
+        self.assertEqual(firmware["resolved_config"]["MCU"],
+                         "n32g430f8s7")
         self.assertNotIn(str(self.output), json.dumps(self.build_report))
 
     def test_mutated_dictionary_is_rejected_as_not_embedded(self):
@@ -664,9 +689,10 @@ class RealFirmwareTests(unittest.TestCase):
             ":"),
              sort_keys=True))
         with self.assertRaisesRegex(TOOL.ToolError, "embedded dictionary"):
-            TOOL.validate_firmware(self.output / paths["firmware"],
-                                   self.output / paths["elf"], mutated,
-                                   "arm-none-eabi-", "openssl")
+            TOOL.validate_firmware(
+                "levelBoard", self.output / paths["firmware"],
+                self.output / paths["elf"], mutated,
+                "arm-none-eabi-", "openssl")
 
     def test_data_flash_load_crossing_application_limit_is_rejected(self):
         paths = self.build_report["products"]
@@ -679,9 +705,10 @@ class RealFirmwareTests(unittest.TestCase):
     str(changed)],
      check=True)
         with self.assertRaisesRegex(TOOL.ToolError, "section .data.*crosses"):
-            TOOL.validate_firmware(self.output / paths["firmware"], changed,
-                                   self.output / paths["dictionary"],
-                                   "arm-none-eabi-", "openssl")
+            TOOL.validate_firmware(
+                "levelBoard", self.output / paths["firmware"], changed,
+                self.output / paths["dictionary"],
+                "arm-none-eabi-", "openssl")
 
     def test_mutated_hex_load_byte_is_rejected_as_elf_mismatch(self):
         paths = self.build_report["products"]
@@ -698,11 +725,66 @@ class RealFirmwareTests(unittest.TestCase):
         mutated.write_bytes(b"".join(lines))
         with self.assertRaisesRegex(
                 TOOL.ToolError, "ELF.*mismatch|mismatch.*ELF"):
-            TOOL.validate_firmware(mutated, self.output / paths["elf"],
-                                   self.output / paths["dictionary"],
-                                   "arm-none-eabi-", "openssl")
+            TOOL.validate_firmware(
+                "levelBoard", mutated, self.output / paths["elf"],
+                self.output / paths["dictionary"],
+                "arm-none-eabi-", "openssl")
 
+    def test_actual_eboard_build_and_cross_board_rejections(self):
+        paths = self.eboard_build_report["products"]
+        self.assertEqual(paths["firmware"], "eBoard.hex")
+        for key in ("elf", "bin", "firmware", "dictionary", "config"):
+            self.assertTrue((self.eboard_output / paths[key]).is_file(), key)
+        report = self.eboard_build_report["firmware"]
+        self.assertEqual(report["bounds"]["application"],
+                         [0x08010000, 0x08040000])
+        self.assertEqual(report["constants"]["SERIAL_BAUD"], 460800)
+        level_paths = self.build_report["products"]
+        with self.assertRaises(TOOL.ToolError):
+            TOOL.validate_firmware(
+                "levelBoard", self.eboard_output / paths["firmware"],
+                self.eboard_output / paths["elf"],
+                self.eboard_output / paths["dictionary"])
+        with self.assertRaises(TOOL.ToolError):
+            TOOL.validate_firmware(
+                "eBoard", self.output / level_paths["firmware"],
+                self.output / level_paths["elf"],
+                self.output / level_paths["dictionary"])
 
+    def test_package_rejects_cross_board_and_cross_role_products(self):
+        level = self.build_report["products"]
+        eboard = self.eboard_build_report["products"]
+        triples = [
+            ("eBoard", self.output, level),
+            ("levelBoard", self.eboard_output, eboard),
+        ]
+        mixed_roles = [
+            {
+                "firmware": self.eboard_output / eboard["firmware"],
+                "elf": self.output / level["elf"],
+                "dictionary": self.eboard_output / eboard["dictionary"],
+            },
+            {
+                "firmware": self.eboard_output / eboard["firmware"],
+                "elf": self.eboard_output / eboard["elf"],
+                "dictionary": self.output / level["dictionary"],
+            },
+        ]
+        cases = []
+        for board, directory, products in triples:
+            cases.append((board, {role: directory / products[role]
+                                  for role in ("firmware", "elf",
+                                               "dictionary")}))
+        cases.extend(("eBoard", products) for products in mixed_roles)
+        root = self.output.parent
+        for index, (board, products) in enumerate(cases):
+            output = root / ("Creator5Pro-cross-%d.tgz" % index)
+            with self.subTest(board=board, index=index), self.assertRaises(
+                    TOOL.ToolError):
+                TOOL.package_update(root / "template.tgz",
+                                    {board: products}, output)
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".manifest.json").exists())
 class ArchiveInspectionTests(unittest.TestCase):
     def inspect(self, value, **kwargs):
         return TOOL.inspect_archive(value, **kwargs)
@@ -1131,15 +1213,17 @@ class PackageTransformationTests(unittest.TestCase):
         unused, profile = self._template()
         replacement = ihex()
         first, evidence = TOOL._build_reduced_plaintext(
-            profile, replacement, shutil.which("sh"), shutil.which("md5sum"))
+            profile, {"levelBoard": replacement}, shutil.which("sh"),
+            shutil.which("md5sum"))
         second, second_evidence = TOOL._build_reduced_plaintext(
-            profile, replacement, shutil.which("sh"), shutil.which("md5sum"))
+            profile, {"levelBoard": replacement}, shutil.which("sh"),
+            shutil.which("md5sum"))
         self.assertEqual(first, second)
         self.assertEqual(evidence["plaintext_sha256"],
                          second_evidence["plaintext_sha256"])
         model = TOOL._inspect_archive_model(first)
-        summary = TOOL._assert_reduced_profile(model, evidence,
-                                               shutil.which("md5sum"))
+        summary = TOOL._assert_reduced_profile(
+            model, evidence, ["levelBoard"], shutil.which("md5sum"))
         self.assertEqual([item["label"] for item in summary["outer"]], [
             "control package", "end image", "play helper",
             "outer installer", "start image"])
@@ -1160,6 +1244,37 @@ class PackageTransformationTests(unittest.TestCase):
         self.assertEqual(values["./md5sum.list"],
                          self._checksum_list(values, retained_order))
 
+    def test_reducer_supports_eboard_and_canonical_combined_order(self):
+        unused, profile = self._template()
+        eboard = ihex(board="eBoard")
+        levelboard = ihex()
+        shell = shutil.which("sh")
+        md5sum = shutil.which("md5sum")
+
+        eboard_plain, eboard_evidence = TOOL._build_reduced_plaintext(
+            profile, {"eBoard": eboard}, shell, md5sum)
+        TOOL._assert_reduced_profile(
+            TOOL._inspect_archive_model(eboard_plain), eboard_evidence,
+            ["eBoard"], md5sum)
+        self.assertIn(b"eBoard.hex", eboard_plain)
+        self.assertNotIn(b"levelBoard.hex", eboard_plain)
+
+        forward, forward_evidence = TOOL._build_reduced_plaintext(
+            profile, {"eBoard": eboard, "levelBoard": levelboard},
+            shell, md5sum)
+        reverse, reverse_evidence = TOOL._build_reduced_plaintext(
+            profile, {"levelBoard": levelboard, "eBoard": eboard},
+            shell, md5sum)
+        self.assertEqual(forward, reverse)
+        self.assertEqual(forward_evidence["control_order"],
+                         reverse_evidence["control_order"])
+        summary = TOOL._assert_reduced_profile(
+            TOOL._inspect_archive_model(forward), forward_evidence,
+            ["levelBoard", "eBoard"], md5sum)
+        firmware_labels = [item["label"] for item in summary["control"]
+                           if item["label"].endswith(" firmware")]
+        self.assertEqual(firmware_labels,
+                         ["eBoard firmware", "levelBoard firmware"])
     def test_hash_gate_rejects_noncanonical_template(self):
         outer, unused = self._template()
         with self.assertRaisesRegex(TOOL.ToolError,
@@ -1216,24 +1331,30 @@ class PackageTransformationTests(unittest.TestCase):
             TOOL._check_shell_syntax(b"#!/bin/sh\nif true; then\n",
                                      shutil.which("sh"))
 
-    def test_manifest_is_schema_one_sanitized_and_marks_hardware(
-            self):
+    def test_manifest_is_schema_two_sanitized_and_marks_hardware(self):
         report = {
-            "resolved_config": dict(TOOL.REQUIRED_CONFIG),
+            "resolved_config": dict(
+                TOOL.BOARD_PROFILES["levelBoard"]["required_config"]),
             "dictionary": {"kconfig": "/private/template/location"},
-            "tools": {"python": "test-python", "openssl": "test-openssl"},
+            "tools": {"python": "test-python",
+                      "openssl": "test-openssl"},
         }
+        repository = {"commit": "a" * 40, "dirty": False}
         manifest = TOOL._create_manifest(
-            report, TOOL.CANONICAL_PLAINTEXT_SHA256, b"plain", b"cipher",
-            {"outer": [], "control": []}, shutil.which("sh"),
-            shutil.which("md5sum"))
+            {"levelBoard": report}, TOOL.CANONICAL_PLAINTEXT_SHA256,
+            b"plain", b"cipher", {"outer": [], "control": []},
+            shutil.which("sh"), shutil.which("md5sum"), repository)
         serialized = json.dumps(manifest)
-        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertFalse(manifest["validation"]["hardware_verified"])
-        self.assertEqual(manifest["firmware"]["dictionary"]["kconfig"],
-                         "[redacted: validated separately]")
+        self.assertEqual(
+            manifest["firmwares"]["levelBoard"]["dictionary"]["kconfig"],
+            "[redacted: validated separately]")
+        self.assertNotIn("resolved_config", manifest)
+        self.assertNotIn("firmware", manifest)
         self.assertNotIn("/private/template/location", serialized)
         self.assertNotIn("control-fixture.tar.xz", serialized)
+        self.assertEqual(manifest["repository"], repository)
         self.assertRegex(manifest["repository"]["commit"], r"^[0-9a-f]{40}$")
 
     def test_package_cli_validation_failure_publishes_nothing(self):
@@ -1245,9 +1366,8 @@ class PackageTransformationTests(unittest.TestCase):
             result = subprocess.run([
                 sys.executable, str(TOOL_PATH), "package",
                 "--template", str(template),
-                "--firmware", str(root / "missing.hex"),
-                "--elf", str(root / "missing.elf"),
-                "--dictionary", str(root / "missing.dict"),
+                "--firmware", "levelBoard", str(root / "missing.hex"),
+                str(root / "missing.elf"), str(root / "missing.dict"),
                 "--output", str(output)], cwd=ROOT, text=True,
                 capture_output=True)
             self.assertEqual(result.returncode, 2, result.stderr)
@@ -1257,5 +1377,182 @@ class PackageTransformationTests(unittest.TestCase):
             self.assertNotIn(str(root), result.stderr)
 
 
+class SelectionContractTests(unittest.TestCase):
+    def test_package_rejects_dirty_firmware_before_reading_template(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "Creator5Pro-test.tgz"
+            products = {
+                "firmware": root / "firmware.hex",
+                "elf": root / "firmware.elf",
+                "dictionary": root / "firmware.dict",
+            }
+            report = {"dictionary": {
+                "version": "v0.13.0-1-gabcdef12-dirty-20260919_test"}}
+            with mock.patch.object(
+                    TOOL, "_validate_firmware",
+                    return_value=(report, b"firmware")):
+                with self.assertRaisesRegex(
+                        TOOL.ToolError, "dirty firmware.*levelBoard"):
+                    TOOL.package_update(
+                        root / "template.tgz", {"levelBoard": products},
+                        output)
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".manifest.json").exists())
+
+    def test_profiles_advertise_physical_mcu_identity(self):
+        expected = {
+            "eBoard": "n32g455ccl7",
+            "levelBoard": "n32g430f8s7",
+        }
+        for board, identity in expected.items():
+            profile = TOOL.BOARD_PROFILES[board]
+            self.assertEqual(profile["required_config"]["MCU"], identity)
+            self.assertEqual(profile["required_constants"]["MCU"], identity)
+
+    def test_profiles_are_canonical_and_complete(self):
+        self.assertEqual(list(TOOL.BOARD_PROFILES), ["eBoard", "levelBoard"])
+        expected = {
+            "firmware_name", "app_start", "app_end", "ram_start",
+            "ram_end", "normalization", "seed_config",
+            "required_config", "forbidden_config",
+            "required_constants", "required_commands",
+            "required_responses", "forbidden_commands",
+            "forbidden_responses", "forbidden_format_names",
+        }
+        for profile in TOOL.BOARD_PROFILES.values():
+            self.assertEqual(set(profile), expected)
+
+    def test_package_cli_accepts_explicit_firmware_groups(self):
+        args = TOOL.create_argument_parser().parse_args([
+            "package", "--template", "template.tgz",
+            "--firmware", "levelBoard", "l.hex", "l.elf", "l.dict",
+            "--firmware", "eBoard", "e.hex", "e.elf", "e.dict",
+            "--output", "Creator5Pro-test.tgz",
+        ])
+        self.assertEqual([group[0] for group in args.firmware],
+                         ["levelBoard", "eBoard"])
+
+    def test_public_apis_reject_invalid_selection_before_tools(self):
+        with mock.patch.object(TOOL, "_tool_path",
+                               side_effect=AssertionError("tool ran")):
+            with self.assertRaises(TOOL.ToolError):
+                TOOL.build_firmware("stock", Path("unused"))
+            with self.assertRaises(TOOL.ToolError):
+                TOOL.package_update(Path("template"), {}, Path("output"))
+            with self.assertRaises(TOOL.ToolError):
+                TOOL.run_all_stages(["eBoard", "eBoard"],
+                                    Path("template"), Path("build"),
+                                    Path("output"))
+
+    def test_ihex_profile_is_explicit(self):
+        level = TOOL.parse_ihex("levelBoard", ihex())
+        self.assertEqual(level["normalization"],
+                         "application-48k-ff-fill-v1")
+    def test_eboard_hex_and_dictionary_profiles_are_distinct(self):
+        parsed = TOOL.parse_ihex("eBoard", ihex(board="eBoard"))
+        self.assertEqual(parsed["normalization"],
+                         "application-192k-ff-fill-v1")
+        self.assertEqual(parsed["stack_pointer"], 0x20020000)
+        eboard_dictionary = dictionary_data(board="eBoard")
+        report = TOOL._load_dictionary("eBoard", eboard_dictionary)
+        self.assertEqual(report["constants"]["SERIAL_BAUD"], 460800)
+        with self.assertRaises(TOOL.ToolError):
+            TOOL._load_dictionary("levelBoard", eboard_dictionary)
+        with self.assertRaises(TOOL.ToolError):
+            TOOL._load_dictionary("eBoard", dictionary_data())
+
+    def test_public_package_mapping_validation_precedes_external_work(self):
+        valid = {"firmware": "f.hex", "elf": "f.elf",
+                 "dictionary": "f.dict"}
+        invalid = [
+            {}, {"stock": valid}, {"eBoard": "not-a-mapping"},
+            {"eBoard": {"firmware": "f.hex", "elf": "f.elf"}},
+            {"eBoard": dict(valid, extra="x")},
+        ]
+        with mock.patch.object(TOOL, "_prepare_package_output",
+                               side_effect=AssertionError("published")):
+            for value in invalid:
+                with (self.subTest(value=value),
+                      self.assertRaises(TOOL.ToolError)):
+                    TOOL.package_update("template", value, "output")
+        normalized = TOOL._normalize_firmware_inputs({
+            "levelBoard": valid, "eBoard": valid})
+        self.assertEqual(list(normalized), ["eBoard", "levelBoard"])
+
+    def test_cli_rejects_invalid_selection_without_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "Creator5Pro-invalid.tgz"
+            base = [sys.executable, str(TOOL_PATH), "package",
+                    "--template", str(root / "template.tgz")]
+            cases = [
+                base + ["--output", str(output)],
+                base + ["--firmware", "stock", "a", "b", "c",
+                        "--output", str(output)],
+                base + ["--firmware", "eBoard", "a", "b", "c",
+                        "--firmware", "eBoard", "d", "e", "f",
+                        "--output", str(output)],
+            ]
+            for command in cases:
+                result = subprocess.run(command, cwd=ROOT, text=True,
+                                        capture_output=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(output.exists())
+                self.assertFalse(Path(str(output) + ".manifest.json").exists())
+
+    def test_all_preflights_every_build_directory_before_first_build(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            occupied = root / "all" / "build" / "levelBoard"
+            occupied.mkdir(parents=True)
+            sentinel = occupied / "owned"
+            sentinel.write_text("keep")
+            starts = []
+
+            def build_stub(board, output_dir, *unused):
+                starts.append(board)
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                (Path(output_dir) / "started").write_text(board)
+
+            output = root / "Creator5Pro-preflight.tgz"
+            with mock.patch.object(TOOL, "build_firmware", build_stub):
+                with self.assertRaisesRegex(TOOL.ToolError, "not empty"):
+                    TOOL.run_all_stages(
+                        ["levelBoard", "eBoard"], root / "template.tgz",
+                        root / "all", output)
+            self.assertEqual(starts, [])
+            self.assertEqual(sentinel.read_text(), "keep")
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".manifest.json").exists())
+
+    def test_all_later_build_failure_keeps_builds_but_publishes_nothing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            started = []
+
+            def build_stub(board, output_dir, *unused):
+                directory = Path(output_dir)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "started").write_text(board)
+                started.append(board)
+                if board == "levelBoard":
+                    raise TOOL.ToolError("injected later build failure", 3)
+                return {"stage": "build"}
+
+            output = root / "Creator5Pro-later-failure.tgz"
+            with mock.patch.object(TOOL, "build_firmware", build_stub):
+                with self.assertRaisesRegex(TOOL.ToolError, "later build"):
+                    TOOL.run_all_stages(
+                        ["levelBoard", "eBoard"], root / "template.tgz",
+                        root / "all", output)
+            self.assertEqual(started, ["eBoard", "levelBoard"])
+            for board in started:
+                self.assertEqual(
+                    (root / "all" / "build" / board / "started").read_text(),
+                    board)
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".manifest.json").exists())
 if __name__ == "__main__":
     unittest.main(verbosity=2)

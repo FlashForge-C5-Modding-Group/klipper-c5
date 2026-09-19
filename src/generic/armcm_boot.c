@@ -109,10 +109,9 @@ reset_handler_stage_two(void)
 
 // Initial code entry point - invoked by the processor after a reset
 // Reset interrupts and stack to take control from bootloaders
-// Keep the symbol visible to the linker under LTO so that the N32G430
-// image entry points at the real reset handler instead of image base.
-#if CONFIG_MACH_N32G430F8S7
-#define ARMCM_ENTRY_ATTR __attribute__((externally_visible))
+// Keep ResetHandler visible when the linker uses it as the image entry point.
+#if CONFIG_ARMCM_EXPLICIT_RESET_ENTRY
+#define ARMCM_ENTRY_ATTR __visible
 #else
 #define ARMCM_ENTRY_ATTR
 #endif

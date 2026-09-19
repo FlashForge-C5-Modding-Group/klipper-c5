@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define N32G430_GPIO_DRIVE_4MA 0x400
+
 // Cortex-M4 core configuration used by the repository CMSIS core.
 #define __CM4_REV                 0x0001U
 #define __MPU_PRESENT             1U

@@ -1,12 +1,20 @@
-// Handling of end stops.
+// Creator 5 end stop handling.
 //
 // Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include "autoconf.h" // CONFIG_C5_LEVELBOARD
 #include "basecmd.h" // oid_alloc
 #include "board/gpio.h" // struct gpio
+#include "board/internal.h" // GPIO
 #include "board/irq.h" // irq_disable
+#if CONFIG_C5_LEVELBOARD
+#include "c5_levelboard.h" // c5_levelboard_cancel
+#endif
+#if CONFIG_C5_EBOARD
+#include "c5_eboard.h" // c5_eboard_arm
+#endif
 #include "command.h" // DECL_COMMAND
 #include "sched.h" // struct timer
 #include "trsync.h" // trsync_do_trigger
@@ -22,13 +30,28 @@ struct endstop {
 enum { ESF_PIN_HIGH=1<<0, ESF_HOMING=1<<1 };
 
 static uint_fast8_t endstop_oversample_event(struct timer *t);
+static uint_fast8_t endstop_oversample_event_with_value(struct timer *t,
+                                                        uint8_t val);
+
+static uint8_t
+c5_endstop_read(struct gpio_in pin)
+{
+#if CONFIG_C5_LEVELBOARD
+    if (pin.regs == GPIOD && pin.bit == GPIO2BIT(GPIO('D', 0)))
+        return c5_levelboard_eddy_state();
+#elif CONFIG_C5_EBOARD
+    if (pin.regs == GPIOG && pin.bit == GPIO2BIT(GPIO('G', 0)))
+        return c5_eboard_eddy_state();
+#endif
+    return gpio_in_read(pin);
+}
 
 // Timer callback for an end stop
 static uint_fast8_t
 endstop_event(struct timer *t)
 {
     struct endstop *e = container_of(t, struct endstop, time);
-    uint8_t val = gpio_in_read(e->pin);
+    uint8_t val = c5_endstop_read(e->pin);
     uint32_t nextwake = e->time.waketime + e->rest_time;
     if ((val ? ~e->flags : e->flags) & ESF_PIN_HIGH) {
         // No match - reschedule for the next attempt
@@ -37,15 +60,18 @@ endstop_event(struct timer *t)
     }
     e->nextwake = nextwake;
     e->time.func = endstop_oversample_event;
+#if CONFIG_C5_LEVELBOARD
+    return endstop_oversample_event_with_value(t, val);
+#else
     return endstop_oversample_event(t);
+#endif
 }
 
 // Timer callback for an end stop that is sampling extra times
 static uint_fast8_t
-endstop_oversample_event(struct timer *t)
+endstop_oversample_event_with_value(struct timer *t, uint8_t val)
 {
     struct endstop *e = container_of(t, struct endstop, time);
-    uint8_t val = gpio_in_read(e->pin);
     if ((val ? ~e->flags : e->flags) & ESF_PIN_HIGH) {
         // No longer matching - reschedule for the next attempt
         e->time.func = endstop_event;
@@ -61,6 +87,13 @@ endstop_oversample_event(struct timer *t)
     e->trigger_count = count;
     e->time.waketime += e->sample_time;
     return SF_RESCHEDULE;
+}
+
+static uint_fast8_t
+endstop_oversample_event(struct timer *t)
+{
+    struct endstop *e = container_of(t, struct endstop, time);
+    return endstop_oversample_event_with_value(t, c5_endstop_read(e->pin));
 }
 
 void
@@ -84,8 +117,14 @@ command_endstop_home(uint32_t *args)
         // Disable end stop checking
         e->ts = NULL;
         e->flags = 0;
+#if CONFIG_C5_LEVELBOARD
+        c5_levelboard_cancel();
+#endif
         return;
     }
+#if CONFIG_C5_EBOARD
+    c5_eboard_arm();
+#endif
     e->rest_time = args[4];
     e->time.func = endstop_event;
     e->trigger_count = e->sample_count;
@@ -99,6 +138,24 @@ DECL_COMMAND(command_endstop_home,
              " rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c");
 
 void
+command_endstop_recover_state(uint32_t *args)
+{
+    struct endstop *e = oid_lookup(args[0], command_config_endstop);
+    irq_disable();
+    sched_del_timer(&e->time);
+    e->trigger_count = e->sample_count;
+    e->flags = 0;
+    e->ts = NULL;
+#if CONFIG_C5_LEVELBOARD
+    c5_levelboard_recover();
+#elif CONFIG_C5_EBOARD
+    c5_eboard_arm();
+#endif
+    irq_enable();
+}
+DECL_COMMAND(command_endstop_recover_state, "endstop_recover_state oid=%c");
+
+void
 command_endstop_query_state(uint32_t *args)
 {
     uint8_t oid = args[0];
@@ -110,6 +167,6 @@ command_endstop_query_state(uint32_t *args)
     irq_enable();
 
     sendf("endstop_state oid=%c homing=%c next_clock=%u pin_value=%c"
-          , oid, !!(eflags & ESF_HOMING), nextwake, gpio_in_read(e->pin));
+          , oid, !!(eflags & ESF_HOMING), nextwake, c5_endstop_read(e->pin));
 }
 DECL_COMMAND(command_endstop_query_state, "endstop_query_state oid=%c");
