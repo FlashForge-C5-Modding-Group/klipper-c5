@@ -11,6 +11,9 @@
 #if CONFIG_C5_LEVELBOARD
 #include "c5_levelboard.h" // c5_levelboard_cancel
 #endif
+#if CONFIG_C5_EBOARD
+#include "c5_eboard.h" // c5_eboard_arm
+#endif
 #include "command.h" // DECL_COMMAND
 #include "sched.h" // struct timer
 #include "trsync.h" // trsync_do_trigger
@@ -105,6 +108,9 @@ command_endstop_home(uint32_t *args)
 #endif
         return;
     }
+#if CONFIG_C5_EBOARD
+    c5_eboard_arm();
+#endif
     e->rest_time = args[4];
     e->time.func = endstop_event;
     e->trigger_count = e->sample_count;
@@ -117,7 +123,7 @@ DECL_COMMAND(command_endstop_home,
              "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c"
              " rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c");
 
-#if CONFIG_C5_LEVELBOARD
+#if CONFIG_C5_LEVELBOARD || CONFIG_C5_EBOARD
 void
 command_endstop_recover_state(uint32_t *args)
 {
@@ -127,7 +133,11 @@ command_endstop_recover_state(uint32_t *args)
     e->trigger_count = e->sample_count;
     e->flags = 0;
     e->ts = NULL;
+#if CONFIG_C5_LEVELBOARD
     c5_levelboard_recover();
+#elif CONFIG_C5_EBOARD
+    c5_eboard_arm();
+#endif
     irq_enable();
 }
 DECL_COMMAND(command_endstop_recover_state, "endstop_recover_state oid=%c");

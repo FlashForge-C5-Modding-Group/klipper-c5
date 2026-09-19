@@ -96,6 +96,8 @@ src-$(CONFIG_USBCANBUS) += stm32/chipid.c generic/usb_canbus.c
 src-$(CONFIG_WANT_HARD_PWM) += stm32/hard_pwm.c
 src-$(CONFIG_HAVE_GPIO_SDIO) += stm32/sdio.c
 
+src-$(CONFIG_C5_EBOARD) += stm32/c5_eboard.c
+
 # Binary output file rules
 target-y += $(OUT)klipper.bin
 
@@ -112,7 +114,11 @@ flash: $(OUT)klipper.bin lib/hidflash/hid-flash
 	@echo "  Flashing $< to $(FLASH_DEVICE)"
 	$(Q)$(PYTHON) ./scripts/flash_usb.py -t $(CONFIG_MCU) -d "$(FLASH_DEVICE)" -s "$(CONFIG_FLASH_APPLICATION_ADDRESS)" $(if $(NOSUDO),--no-sudo) $(OUT)klipper.bin
 
-ifeq ($(CONFIG_MACH_N32G430F8S7),y)
+ifeq ($(CONFIG_C5_EBOARD),y)
+serialflash:
+	@echo "serialflash is unsupported for C5 eBoard; use the stock IAP update path" >&2
+	@false
+else ifeq ($(CONFIG_MACH_N32G430F8S7),y)
 serialflash:
 	@echo "serialflash is unsupported for N32G430F8S7; preserve the reserved lower flash" >&2
 	@false

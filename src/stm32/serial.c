@@ -21,7 +21,7 @@
 
 // Select the configured serial port
 #if CONFIG_STM32_SERIAL_USART1
-  #if CONFIG_C5_LEVELBOARD
+  #if CONFIG_C5_LEVELBOARD || CONFIG_C5_EBOARD
     DECL_CONSTANT_STR("RESERVE_PINS_serial", "PH10,PH9");
   #else
     DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA10,PA9");

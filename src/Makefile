@@ -2,6 +2,7 @@
 
 src-y += sched.c command.c basecmd.c debugcmds.c
 src-$(CONFIG_C5_LEVELBOARD) += c5_levelboard.c
+src-$(CONFIG_C5_EBOARD) += c5_eboard.c c5_eboard_pa.c
 src-$(CONFIG_HAVE_GPIO) += initial_pins.c gpiocmds.c stepper.c endstop.c \
     trsync.c
 src-$(CONFIG_WANT_ADC) += adccmds.c

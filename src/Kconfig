@@ -52,6 +52,7 @@ config SERIAL
 config SERIAL_BAUD
     depends on SERIAL
     int "Baud rate for serial port" if LOW_LEVEL_OPTIONS
+    default 460800 if C5_EBOARD
     default 230400 if C5_LEVELBOARD
     default 250000
     help
@@ -60,7 +61,7 @@ config SERIAL_BAUD
 config SERIAL_RX_BUFFER_SIZE
     int
     depends on SERIAL
-    default 384 if C5_LEVELBOARD
+    default 384 if C5_EBOARD || C5_LEVELBOARD
     default 192
 
 
