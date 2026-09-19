@@ -128,8 +128,10 @@ c5_tmc_boot_write(const uint8_t *data, uint_fast8_t length)
 void
 c5_eboard_hardware_init(void)
 {
-    *n32_rcc_cfg2() |= N32_RCC_CFG2_SYSCLK_TIM18;
+    gpio_peripheral(GPIO('B', 8), GPIO_OUTPUT, 0);
+    GPIOB->BSRR = GPIO2BIT(GPIO('B', 8));
 
+    *n32_rcc_cfg2() |= N32_RCC_CFG2_SYSCLK_TIM18;
     enable_pclock(TIM8_BASE);
     TIM8->PSC = 0;
     TIM8->ARR = 0xffff;
@@ -197,11 +199,17 @@ c5_eboard_hardware_init(void)
     armcm_enable_irq(USART3_IRQHandler, USART3_IRQn, 14);
     DMA1_Channel3->CCR |= 1u;
 
+    // TMC UART write: sync, slave, register | 0x80, big-endian data, CRC.
     static const uint8_t tmc_init[][8] = {
+        // GCONF (0x00) = 0x000001d0
         { 0x05, 0x00, 0x80, 0x00, 0x00, 0x01, 0xd0, 0xce },
+        // IHOLD_IRUN (0x10) = 0x000a0c0c
         { 0x05, 0x00, 0x90, 0x00, 0x0a, 0x0c, 0x0c, 0x1d },
+        // TPOWERDOWN (0x11) = 0x00000080
         { 0x05, 0x00, 0x91, 0x00, 0x00, 0x00, 0x80, 0xc0 },
+        // CHOPCONF (0x6c) = 0x140082c3
         { 0x05, 0x00, 0xec, 0x14, 0x00, 0x82, 0xc3, 0x23 },
+        // PWMCONF (0x70) = 0xc80d174b
         { 0x05, 0x00, 0xf0, 0xc8, 0x0d, 0x17, 0x4b, 0x77 },
     };
     for (uint_fast8_t i = 0; i < sizeof(tmc_init) / sizeof(tmc_init[0]); i++)
