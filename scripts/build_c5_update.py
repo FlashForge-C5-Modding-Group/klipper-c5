@@ -301,7 +301,7 @@ BOARD_PROFILES = {
             "CONFIG_WANT_LIS2DW=y\n"),
         "required_config": {
             "MACH_STM32": "y", "MACH_N32G455": "y", "C5_EBOARD": "y",
-            "MCU": "stm32f103xe", "STM32_SERIAL_USART1": "y",
+            "MCU": "n32g455ccl7", "STM32_SERIAL_USART1": "y",
             "WANT_ADC": "y", "WANT_HARD_PWM": "y", "WANT_SPI": "y",
             "WANT_LIS2DW": "y", "FLASH_APPLICATION_ADDRESS": "0x08010000",
             "FLASH_BOOT_ADDRESS": "0x08000000", "FLASH_SIZE": "0x40000",
@@ -311,7 +311,7 @@ BOARD_PROFILES = {
         },
         "forbidden_config": {"C5_LEVELBOARD", "MACH_N32G430F8S7"},
         "required_constants": {
-            "MCU": "stm32f103xe", "ADC_MAX": 4095, "CLOCK_FREQ": 144000000,
+            "MCU": "n32g455ccl7", "ADC_MAX": 4095, "CLOCK_FREQ": 144000000,
             "PWM_MAX": 32768, "RECEIVE_WINDOW": 384,
             "RESERVE_PINS_serial": "PH10,PH9", "SERIAL_BAUD": 460800,
             "STATS_SUMSQ_BASE": 256,
@@ -393,7 +393,7 @@ BOARD_PROFILES = {
             "CONFIG_STM32_SERIAL_USART1=y\n" "CONFIG_C5_LEVELBOARD=y\n"),
         "required_config": {
             "MACH_STM32": "y", "MACH_N32G430F8S7": "y",
-            "C5_LEVELBOARD": "y", "MCU": "stm32f103xe",
+            "C5_LEVELBOARD": "y", "MCU": "n32g430f8s7",
             "STM32_SERIAL_USART1": "y",
             "FLASH_APPLICATION_ADDRESS": "0x08004000",
             "FLASH_BOOT_ADDRESS": "0x08000000", "FLASH_SIZE": "0x10000",
@@ -403,7 +403,8 @@ BOARD_PROFILES = {
         },
         "forbidden_config": {"MACH_STM32F1", "MACH_N32G45x"},
         "required_constants": {
-            "ADC_MAX": 4095, "CLOCK_FREQ": 128000000,
+            "MCU": "n32g430f8s7", "ADC_MAX": 4095,
+            "CLOCK_FREQ": 128000000,
             "RECEIVE_WINDOW": 384, "RESERVE_PINS_serial": "PH10,PH9",
             "SERIAL_BAUD": 230400, "STATS_SUMSQ_BASE": 256,
         },

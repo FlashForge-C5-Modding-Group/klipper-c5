@@ -649,7 +649,8 @@ class RealFirmwareTests(unittest.TestCase):
         APP_START, APP_END])
         self.assertEqual(firmware["constants"]["RECEIVE_WINDOW"], 384)
         self.assertEqual(firmware["constants"]["SERIAL_BAUD"], 230400)
-        self.assertEqual(firmware["resolved_config"]["MCU"], "stm32f103xe")
+        self.assertEqual(firmware["resolved_config"]["MCU"],
+                         "n32g430f8s7")
         self.assertNotIn(str(self.output), json.dumps(self.build_report))
 
     def test_mutated_dictionary_is_rejected_as_not_embedded(self):
@@ -1353,6 +1354,16 @@ class PackageTransformationTests(unittest.TestCase):
 
 
 class SelectionContractTests(unittest.TestCase):
+    def test_profiles_advertise_physical_mcu_identity(self):
+        expected = {
+            "eBoard": "n32g455ccl7",
+            "levelBoard": "n32g430f8s7",
+        }
+        for board, identity in expected.items():
+            profile = TOOL.BOARD_PROFILES[board]
+            self.assertEqual(profile["required_config"]["MCU"], identity)
+            self.assertEqual(profile["required_constants"]["MCU"], identity)
+
     def test_profiles_are_canonical_and_complete(self):
         self.assertEqual(list(TOOL.BOARD_PROFILES), ["eBoard", "levelBoard"])
         expected = {

@@ -196,7 +196,7 @@ config HAVE_STM32_USBCANBUS
 
 config MCU
     string
-    default "stm32f103xe" if C5_EBOARD
+    default "n32g455ccl7" if C5_EBOARD
     default "stm32f031x6" if MACH_STM32F031
     default "stm32f042x6" if MACH_STM32F042
     default "stm32f070xb" if MACH_STM32F070
@@ -219,7 +219,7 @@ config MCU
     default "stm32h743xx" if MACH_STM32H743
     default "stm32h750xx" if MACH_STM32H750
     default "stm32l412xx" if MACH_STM32L412
-    default "stm32f103xe" if C5_LEVELBOARD
+    default "n32g430f8s7" if C5_LEVELBOARD
     default "n32g430f8s7" if MACH_N32G430F8S7
     default "stm32f103xe" if MACH_N32G45x
 
