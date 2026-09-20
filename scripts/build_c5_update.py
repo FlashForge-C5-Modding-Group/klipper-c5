@@ -309,7 +309,9 @@ BOARD_PROFILES = {
             "CLOCK_FREQ": "144000000", "CLOCK_REF_FREQ": "12000000",
             "SERIAL_BAUD": "460800", "SERIAL_RX_BUFFER_SIZE": "384",
         },
-        "forbidden_config": {"C5_LEVELBOARD", "MACH_N32G430F8S7"},
+        "forbidden_config": {
+            "C5_HEATERBOARD", "C5_LEVELBOARD", "MACH_N32G430F8S7",
+        },
         "required_constants": {
             "MCU": "n32g455ccl7", "ADC_MAX": 4095, "CLOCK_FREQ": 144000000,
             "PWM_MAX": 32768, "RECEIVE_WINDOW": 384,
@@ -382,6 +384,80 @@ BOARD_PROFILES = {
         "forbidden_responses": {"endstop_recover_state", "pa_action"},
         "forbidden_format_names": {"Levelboard"},
     },
+    "heaterBoard": {
+        "firmware_name": "heaterBoard.hex",
+        "app_start": 0x08010000, "app_end": 0x08080000,
+        "ram_start": 0x20000000, "ram_end": 0x20020000,
+        "normalization": "application-448k-ff-fill-v1",
+        "seed_config": (
+            "CONFIG_MACH_STM32=y\n" "CONFIG_MACH_N32G455=y\n"
+            "CONFIG_C5_HEATERBOARD=y\n"
+            "CONFIG_STM32_CLOCK_REF_12M=y\n"
+            "CONFIG_STM32_SERIAL_USART1=y\n" "CONFIG_WANT_ADC=y\n"
+            "CONFIG_WANT_BUTTONS=y\n"),
+        "required_config": {
+            "MACH_STM32": "y", "MACH_N32G455": "y",
+            "C5_HEATERBOARD": "y", "MCU": "n32g455rel7",
+            "STM32_SERIAL_USART1": "y", "WANT_ADC": "y",
+            "WANT_BUTTONS": "y", "WANT_HARD_PWM": "y",
+            "ARMCM_FLASH_SIZE_IS_TOTAL": "y",
+            "ARMCM_EXPLICIT_RESET_ENTRY": "y",
+            "FLASH_APPLICATION_ADDRESS": "0x08010000",
+            "FLASH_BOOT_ADDRESS": "0x08000000", "FLASH_SIZE": "0x80000",
+            "RAM_START": "0x20000000", "RAM_SIZE": "0x20000",
+            "CLOCK_FREQ": "144000000", "CLOCK_REF_FREQ": "12000000",
+            "SERIAL_BAUD": "230400", "SERIAL_RX_BUFFER_SIZE": "384",
+        },
+        "forbidden_config": {
+            "C5_EBOARD", "C5_LEVELBOARD", "MACH_N32G430F8S7",
+        },
+        "required_constants": {
+            "MCU": "n32g455rel7", "ADC_MAX": 4095, "PWM_MAX": 32768,
+            "CLOCK_FREQ": 144000000, "RECEIVE_WINDOW": 384,
+            "RESERVE_PINS_serial": "PH10,PH9", "SERIAL_BAUD": 230400,
+            "STATS_SUMSQ_BASE": 256,
+        },
+        "required_commands": {
+            "identify offset=%u count=%c", "allocate_oids count=%c",
+            "get_config", "finalize_config crc=%u", "get_clock",
+            "get_uptime", "emergency_stop", "clear_shutdown", "reset",
+            ("config_digital_out oid=%c pin=%u value=%c default_value=%c "
+             "max_duration=%u"),
+            "set_digital_out_pwm_cycle oid=%c cycle_ticks=%u",
+            "queue_digital_out oid=%c clock=%u on_ticks=%u",
+            "update_digital_out oid=%c value=%c",
+            "set_digital_out pin=%u value=%c",
+            "config_analog_in oid=%c pin=%u",
+            ("query_analog_in oid=%c clock=%u sample_ticks=%u "
+             "sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu "
+             "range_check_count=%c"),
+            "config_buttons oid=%c button_count=%c",
+            "buttons_add oid=%c pos=%c pin=%u pull_up=%c",
+            ("buttons_query oid=%c clock=%u rest_ticks=%u "
+             "retransmit_count=%c invert=%c"),
+            "buttons_ack oid=%c count=%c", "get_mcu_version",
+            "set_trigger_threshold threshold=%i", "get_basic_param num=%u",
+            "pa_action action=%u pc=%u", "get_emcu_pa_value",
+            "remove_peel action=%u",
+        },
+        "required_responses": {
+            "identify_response offset=%u data=%.*s",
+            "config is_config=%c crc=%u is_shutdown=%c move_count=%hu",
+            "clock clock=%u", "uptime high=%u clock=%u",
+            "stats count=%u sum=%u sumsq=%u", "starting",
+            "is_shutdown static_string_id=%hu",
+            "shutdown clock=%u static_string_id=%hu",
+            "analog_in_state oid=%c next_clock=%u value=%hu",
+            "buttons_state oid=%c ack_count=%c state=%*s",
+            "mcu_version year=%u date=%u version=%u",
+        },
+        "forbidden_commands": {"config_reset"},
+        "forbidden_responses": {
+            "trigger_threshold", "param_value", "pa_value", "peel_data",
+            "pa_action",
+        },
+        "forbidden_format_names": {"Eboard", "Eheaterboard", "Levelboard"},
+    },
     "levelBoard": {
         "firmware_name": "levelBoard.hex",
         "app_start": 0x08004000, "app_end": 0x08010000,
@@ -401,7 +477,9 @@ BOARD_PROFILES = {
             "CLOCK_FREQ": "128000000", "CLOCK_REF_FREQ": "8000000",
             "SERIAL_BAUD": "230400", "SERIAL_RX_BUFFER_SIZE": "384",
         },
-        "forbidden_config": {"MACH_STM32F1", "MACH_N32G45x"},
+        "forbidden_config": {
+            "C5_HEATERBOARD", "MACH_STM32F1", "MACH_N32G45x",
+        },
         "required_constants": {
             "MCU": "n32g430f8s7", "ADC_MAX": 4095,
             "CLOCK_FREQ": 128000000,

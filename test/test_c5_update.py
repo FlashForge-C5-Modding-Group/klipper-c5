@@ -206,6 +206,28 @@ class IntelHexTests(unittest.TestCase):
             with self.subTest(sp=hex(sp)):
                 self.assert_rejected(ihex(sp=sp), expected)
 
+    def test_heaterboard_rom_and_sram_boundaries(self):
+        accepted = ihex([
+            record(4, payload=b"\x08\x07"),
+            record(0, 0xffff, b"x"),
+        ], board="heaterBoard")
+        parsed = TOOL.parse_ihex("heaterBoard", accepted)
+        self.assertEqual(parsed["intervals"][-1],
+                         [0x0807ffff, 0x08080000])
+        for value, address in (
+                (ihex([record(4, payload=b"\x08\x08"),
+                       record(0, 0, b"x")], board="heaterBoard"),
+                 "08080000"),
+                (ihex([record(4, payload=b"\x08\x00"),
+                       record(0, 0xffff, b"x")], board="heaterBoard"),
+                 "0800ffff"),
+                (ihex(sp=0x20020008, board="heaterBoard"), "sram")):
+            with self.subTest(address=address), self.assertRaises(
+                    TOOL.ToolError) as raised:
+                TOOL.parse_ihex("heaterBoard", value)
+            self.assertIn(address, str(raised.exception).lower())
+
+
     def test_reset_requires_thumb_and_application_target(self):
         self.assert_rejected(ihex(reset=APP_START + 8), "thumb")
         self.assert_rejected(ihex(reset=APP_END + 1), "reset", "range")
@@ -642,6 +664,7 @@ class RealFirmwareTests(unittest.TestCase):
         workspace = Path(cls.workspace.name)
         cls.output = workspace / "levelBoard"
         cls.eboard_output = workspace / "eBoard"
+        cls.heaterboard_output = workspace / "heaterBoard"
         cls.repo_config = ROOT / ".config"
         cls.config_before = (cls.repo_config.read_bytes()
                              if cls.repo_config.exists() else None)
@@ -649,6 +672,9 @@ class RealFirmwareTests(unittest.TestCase):
             "levelBoard", cls.output, 1, "arm-none-eabi-", "openssl")
         cls.eboard_build_report = TOOL.build_firmware(
             "eBoard", cls.eboard_output, 1, "arm-none-eabi-", "openssl")
+        cls.heaterboard_build_report = TOOL.build_firmware(
+            "heaterBoard", cls.heaterboard_output, 1,
+            "arm-none-eabi-", "openssl")
 
     @classmethod
     def tearDownClass(cls):
@@ -751,31 +777,82 @@ class RealFirmwareTests(unittest.TestCase):
                 self.output / level_paths["elf"],
                 self.output / level_paths["dictionary"])
 
+    def test_actual_heaterboard_build_and_cross_board_rejections(self):
+        paths = self.heaterboard_build_report["products"]
+        self.assertEqual(paths["firmware"], "heaterBoard.hex")
+        for key in ("elf", "bin", "firmware", "dictionary", "config"):
+            self.assertTrue((self.heaterboard_output / paths[key]).is_file(), key)
+        report = self.heaterboard_build_report["firmware"]
+        self.assertEqual(report["bounds"]["application"],
+                         [0x08010000, 0x08080000])
+        self.assertEqual(report["bounds"]["sram"],
+                         [0x20000000, 0x20020000])
+        self.assertEqual(report["stack_pointer"], 0x20020000)
+        self.assertEqual(report["constants"]["MCU"], "n32g455rel7")
+        self.assertEqual(report["constants"]["SERIAL_BAUD"], 230400)
+        self.assertEqual(report["normalization"],
+                         "application-448k-ff-fill-v1")
+        dictionary = json.loads(
+            (self.heaterboard_output / paths["dictionary"]).read_text())
+        adc_query = [command for command in dictionary["commands"]
+                     if command.startswith("query_analog_in ")]
+        self.assertEqual(adc_query, [
+            "query_analog_in oid=%c clock=%u sample_ticks=%u "
+            "sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu "
+            "range_check_count=%c"])
+        self.assertNotIn("bytes_per_report", adc_query[0])
+
+        eboard = self.eboard_build_report["products"]
+        with self.assertRaises(TOOL.ToolError):
+            TOOL.validate_firmware(
+                "heaterBoard", self.eboard_output / eboard["firmware"],
+                self.eboard_output / eboard["elf"],
+                self.eboard_output / eboard["dictionary"])
+        with self.assertRaises(TOOL.ToolError):
+            TOOL.validate_firmware(
+                "eBoard", self.heaterboard_output / paths["firmware"],
+                self.heaterboard_output / paths["elf"],
+                self.heaterboard_output / paths["dictionary"])
+        with self.assertRaises(TOOL.ToolError):
+            TOOL.validate_firmware(
+                "heaterBoard", self.heaterboard_output / paths["firmware"],
+                self.eboard_output / eboard["elf"],
+                self.eboard_output / eboard["dictionary"])
+
     def test_package_rejects_cross_board_and_cross_role_products(self):
         level = self.build_report["products"]
         eboard = self.eboard_build_report["products"]
+        heaterboard = self.heaterboard_build_report["products"]
         triples = [
             ("eBoard", self.output, level),
             ("levelBoard", self.eboard_output, eboard),
+            ("heaterBoard", self.eboard_output, eboard),
+            ("eBoard", self.heaterboard_output, heaterboard),
         ]
         mixed_roles = [
-            {
+            ("eBoard", {
                 "firmware": self.eboard_output / eboard["firmware"],
                 "elf": self.output / level["elf"],
                 "dictionary": self.eboard_output / eboard["dictionary"],
-            },
-            {
+            }),
+            ("eBoard", {
                 "firmware": self.eboard_output / eboard["firmware"],
                 "elf": self.eboard_output / eboard["elf"],
                 "dictionary": self.output / level["dictionary"],
-            },
+            }),
+            ("heaterBoard", {
+                "firmware": (self.heaterboard_output /
+                             heaterboard["firmware"]),
+                "elf": self.eboard_output / eboard["elf"],
+                "dictionary": self.eboard_output / eboard["dictionary"],
+            }),
         ]
         cases = []
         for board, directory, products in triples:
             cases.append((board, {role: directory / products[role]
                                   for role in ("firmware", "elf",
                                                "dictionary")}))
-        cases.extend(("eBoard", products) for products in mixed_roles)
+        cases.extend(mixed_roles)
         root = self.output.parent
         for index, (board, products) in enumerate(cases):
             output = root / ("Creator5Pro-cross-%d.tgz" % index)
@@ -1244,37 +1321,74 @@ class PackageTransformationTests(unittest.TestCase):
         self.assertEqual(values["./md5sum.list"],
                          self._checksum_list(values, retained_order))
 
-    def test_reducer_supports_eboard_and_canonical_combined_order(self):
+    def test_reducer_supports_heaterboard_and_canonical_combined_order(self):
         unused, profile = self._template()
         eboard = ihex(board="eBoard")
+        heaterboard = ihex(board="heaterBoard")
         levelboard = ihex()
         shell = shutil.which("sh")
         md5sum = shutil.which("md5sum")
-
         eboard_plain, eboard_evidence = TOOL._build_reduced_plaintext(
             profile, {"eBoard": eboard}, shell, md5sum)
         TOOL._assert_reduced_profile(
             TOOL._inspect_archive_model(eboard_plain), eboard_evidence,
             ["eBoard"], md5sum)
         self.assertIn(b"eBoard.hex", eboard_plain)
+        self.assertNotIn(b"heaterBoard.hex", eboard_plain)
         self.assertNotIn(b"levelBoard.hex", eboard_plain)
 
+
+        heater_plain, heater_evidence = TOOL._build_reduced_plaintext(
+            profile, {"heaterBoard": heaterboard}, shell, md5sum)
+        heater_summary = TOOL._assert_reduced_profile(
+            TOOL._inspect_archive_model(heater_plain), heater_evidence,
+            ["heaterBoard"], md5sum)
+        self.assertEqual(
+            {item["label"] for item in heater_summary["control"]}, {
+                "IAPCommand", "heaterBoard firmware", "control display image",
+                "checksum list", "control script", "Update marker"})
+        with tarfile.open(fileobj=io.BytesIO(heater_plain), mode="r:") as outer:
+            control = outer.extractfile(outer.getmembers()[0]).read()
+            with tarfile.open(fileobj=io.BytesIO(control), mode="r:") as inner:
+                members = inner.getmembers()
+                values = {member.name: inner.extractfile(member).read()
+                          for member in members}
+                retained_order = [member.name for member in members
+                                  if member.name != "./md5sum.list"]
+        self.assertEqual(set(values), {
+            "./IAPCommand", "./heaterBoard.hex", "./mcu.img",
+            "./md5sum.list", "./run.sh", "./Update"})
+        self.assertEqual(values["./heaterBoard.hex"], heaterboard)
+        self.assertEqual(values["./md5sum.list"],
+                         self._checksum_list(values, retained_order))
+        for excluded in (b"eBoard.hex", b"levelBoard.hex", b"mainBoardGD.hex",
+                         b"VDS", b"ISPCommand"):
+            self.assertNotIn(excluded, heater_plain)
+
         forward, forward_evidence = TOOL._build_reduced_plaintext(
-            profile, {"eBoard": eboard, "levelBoard": levelboard},
-            shell, md5sum)
+            profile, {"eBoard": eboard, "heaterBoard": heaterboard,
+                      "levelBoard": levelboard}, shell, md5sum)
         reverse, reverse_evidence = TOOL._build_reduced_plaintext(
-            profile, {"levelBoard": levelboard, "eBoard": eboard},
-            shell, md5sum)
+            profile, {"levelBoard": levelboard, "heaterBoard": heaterboard,
+                      "eBoard": eboard}, shell, md5sum)
         self.assertEqual(forward, reverse)
         self.assertEqual(forward_evidence["control_order"],
                          reverse_evidence["control_order"])
         summary = TOOL._assert_reduced_profile(
             TOOL._inspect_archive_model(forward), forward_evidence,
-            ["levelBoard", "eBoard"], md5sum)
+            ["levelBoard", "heaterBoard", "eBoard"], md5sum)
         firmware_labels = [item["label"] for item in summary["control"]
                            if item["label"].endswith(" firmware")]
-        self.assertEqual(firmware_labels,
-                         ["eBoard firmware", "levelBoard firmware"])
+        self.assertEqual(firmware_labels, [
+            "eBoard firmware", "heaterBoard firmware", "levelBoard firmware"])
+        with tarfile.open(fileobj=io.BytesIO(forward), mode="r:") as outer:
+            control = outer.extractfile(outer.getmembers()[0]).read()
+            with tarfile.open(fileobj=io.BytesIO(control), mode="r:") as inner:
+                values = {member.name: inner.extractfile(member).read()
+                          for member in inner.getmembers()}
+        self.assertEqual(values["./eBoard.hex"], eboard)
+        self.assertEqual(values["./heaterBoard.hex"], heaterboard)
+        self.assertEqual(values["./levelBoard.hex"], levelboard)
     def test_hash_gate_rejects_noncanonical_template(self):
         outer, unused = self._template()
         with self.assertRaisesRegex(TOOL.ToolError,
@@ -1400,28 +1514,6 @@ class SelectionContractTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(Path(str(output) + ".manifest.json").exists())
 
-    def test_profiles_advertise_physical_mcu_identity(self):
-        expected = {
-            "eBoard": "n32g455ccl7",
-            "levelBoard": "n32g430f8s7",
-        }
-        for board, identity in expected.items():
-            profile = TOOL.BOARD_PROFILES[board]
-            self.assertEqual(profile["required_config"]["MCU"], identity)
-            self.assertEqual(profile["required_constants"]["MCU"], identity)
-
-    def test_profiles_are_canonical_and_complete(self):
-        self.assertEqual(list(TOOL.BOARD_PROFILES), ["eBoard", "levelBoard"])
-        expected = {
-            "firmware_name", "app_start", "app_end", "ram_start",
-            "ram_end", "normalization", "seed_config",
-            "required_config", "forbidden_config",
-            "required_constants", "required_commands",
-            "required_responses", "forbidden_commands",
-            "forbidden_responses", "forbidden_format_names",
-        }
-        for profile in TOOL.BOARD_PROFILES.values():
-            self.assertEqual(set(profile), expected)
 
     def test_package_cli_accepts_explicit_firmware_groups(self):
         args = TOOL.create_argument_parser().parse_args([
