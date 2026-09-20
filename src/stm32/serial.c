@@ -21,7 +21,7 @@
 
 // Select the configured serial port
 #if CONFIG_STM32_SERIAL_USART1
-  #if CONFIG_C5_LEVELBOARD || CONFIG_C5_EBOARD
+  #if CONFIG_C5_LEVELBOARD || CONFIG_C5_EBOARD || CONFIG_C5_HEATERBOARD
     // Stock C5 compatibility metadata; physical USART1 is on PA9/PA10.
     DECL_CONSTANT_STR("RESERVE_PINS_serial", "PH10,PH9");
   #else
