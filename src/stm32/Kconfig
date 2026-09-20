@@ -130,6 +130,13 @@ config C5_EBOARD
     select ARMCM_EXPLICIT_RESET_ENTRY
     default n
 
+config C5_HEATERBOARD
+    bool "Creator 5 heaterBoard compatibility"
+    depends on MACH_N32G455 && !C5_EBOARD
+    select ARMCM_FLASH_SIZE_IS_TOTAL
+    select ARMCM_EXPLICIT_RESET_ENTRY
+    default n
+
 config ARMCM_FLASH_SIZE_IS_TOTAL
     bool
 
@@ -199,6 +206,7 @@ config HAVE_STM32_USBCANBUS
 
 config MCU
     string
+    default "n32g455rel7" if C5_HEATERBOARD
     default "n32g455ccl7" if C5_EBOARD
     default "stm32f031x6" if MACH_STM32F031
     default "stm32f042x6" if MACH_STM32F042
@@ -227,6 +235,7 @@ config MCU
 
 config CLOCK_FREQ
     int
+    default 144000000 if C5_HEATERBOARD
     default 144000000 if C5_EBOARD
     default 48000000 if MACH_STM32F0
     default 64000000 if MACH_STM32F103 && STM32_CLOCK_REF_INTERNAL
@@ -250,6 +259,7 @@ config CLOCK_FREQ
 
 config FLASH_SIZE
     hex
+    default 0x80000 if C5_HEATERBOARD
     default 0x40000 if C5_EBOARD
     default 0x10000 if MACH_N32G430F8S7
     default 0x8000 if MACH_STM32F031 || MACH_STM32F042 || MACH_STM32F070x6 || MACH_STM32F103x6
@@ -273,6 +283,7 @@ config RAM_START
 
 config RAM_SIZE
     hex
+    default 0x20000 if C5_HEATERBOARD
     default 0x20000 if C5_EBOARD
     default 0x4000 if MACH_N32G430F8S7
     default 0x1000 if MACH_STM32F031
@@ -323,6 +334,7 @@ config STM32_DFU_ROM_ADDRESS
 
 choice
     prompt "Bootloader offset"
+    default STM32_FLASH_START_10000 if C5_HEATERBOARD
     default STM32_FLASH_START_10000 if C5_EBOARD
     default STM32_FLASH_START_4000 if C5_LEVELBOARD
     default STM32_FLASH_START_0000 if MACH_N32G430F8S7
@@ -356,7 +368,7 @@ choice
 
     config STM32_FLASH_START_0000
         bool "No bootloader"
-        depends on !C5_LEVELBOARD && !C5_EBOARD
+        depends on !C5_LEVELBOARD && !C5_EBOARD && !C5_HEATERBOARD
 endchoice
 config FLASH_APPLICATION_ADDRESS
     hex
@@ -386,8 +398,8 @@ config ARMCM_RAM_VECTORTABLE
 ######################################################################
 
 choice
-    prompt "Clock Reference" if LOW_LEVEL_OPTIONS || C5_EBOARD
-    default STM32_CLOCK_REF_12M if C5_EBOARD
+    prompt "Clock Reference" if LOW_LEVEL_OPTIONS || C5_EBOARD || C5_HEATERBOARD
+    default STM32_CLOCK_REF_12M if C5_EBOARD || C5_HEATERBOARD
     config STM32_CLOCK_REF_8M
         bool "8 MHz crystal"
     config STM32_CLOCK_REF_12M
@@ -435,7 +447,7 @@ config STM32F0_TRIM
 
 choice
     prompt "Communication interface"
-    default STM32_SERIAL_USART1 if C5_EBOARD
+    default STM32_SERIAL_USART1 if C5_EBOARD || C5_HEATERBOARD
     config STM32_USB_PA11_PA12
         bool "USB (on PA11/PA12)" if HAVE_STM32_USBFS || HAVE_STM32_USBOTG
         select USBSERIAL
