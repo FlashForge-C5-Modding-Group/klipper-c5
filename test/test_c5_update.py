@@ -31,21 +31,137 @@ LEVEL_PROFILE = TOOL.BOARD_PROFILES["levelBoard"]
 APP_START = LEVEL_PROFILE["app_start"]
 APP_END = LEVEL_PROFILE["app_end"]
 
+MAINBOARD_REQUIRED_CONSTANTS = {
+    "MCU": "gd32h737vgt6", "ADC_MAX": 4095,
+    "CLOCK_FREQ": 600000000, "RECEIVE_WINDOW": 384,
+    "RESERVE_PINS_serial": "PA10,PA9", "SERIAL_BAUD": 230400,
+    "STATS_SUMSQ_BASE": 256,
+}
+
+MAINBOARD_REQUIRED_COMMANDS = {
+    "identify offset=%u count=%c", "allocate_oids count=%c", "get_config",
+    "finalize_config crc=%u", "get_clock", "get_uptime",
+    "emergency_stop", "clear_shutdown", "reset",
+    "debug_nop", "debug_ping data=%*s",
+    "debug_read order=%c addr=%u", "debug_write order=%c addr=%u val=%u",
+    ("config_stepper oid=%c step_pin=%c dir_pin=%c invert_step=%c "
+     "step_pulse_ticks=%u"),
+    "queue_step oid=%c interval=%u count=%hu add=%hi",
+    "set_next_step_dir oid=%c dir=%c",
+    "reset_step_clock oid=%c clock=%u", "stepper_get_position oid=%c",
+    "stepper_stop_on_trigger oid=%c trsync_oid=%c",
+    "config_endstop oid=%c pin=%c pull_up=%c",
+    ("endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c "
+     "rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c"),
+    "endstop_query_state oid=%c", "config_trsync oid=%c",
+    ("trsync_start oid=%c report_clock=%u report_ticks=%u "
+     "expire_reason=%c"),
+    "trsync_set_timeout oid=%c clock=%u",
+    "trsync_trigger oid=%c reason=%c",
+    ("config_digital_out oid=%c pin=%u value=%c default_value=%c "
+     "max_duration=%u"),
+    "set_digital_out_pwm_cycle oid=%c cycle_ticks=%u",
+    "queue_digital_out oid=%c clock=%u on_ticks=%u",
+    "update_digital_out oid=%c value=%c",
+    "set_digital_out pin=%u value=%c", "config_analog_in oid=%c pin=%u",
+    ("query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c "
+     "rest_ticks=%u min_value=%hu max_value=%hu range_check_count=%c"),
+    "config_buttons oid=%c button_count=%c",
+    "buttons_add oid=%c pos=%c pin=%u pull_up=%c",
+    ("buttons_query oid=%c clock=%u rest_ticks=%u retransmit_count=%c "
+     "invert=%c"),
+    "buttons_ack oid=%c count=%c",
+    "config_mclib oid=%c stepper=%u rs=%u ls=%u km=%u",
+    "mclib_config_microstep oid=%c interpolate=%c mstep=%u",
+    "mclib_config_stalldetect oid=%c stallthrs=%u",
+    "mclib_set_current oid=%c run_current=%u hold_current=%u",
+    "mclib_set_pid_params oid=%c kp=%u ki=%u",
+    ("mclib_set_resonance_damp oid=%c tdx=%c amp=%u phase1=%u "
+     "phase2=%u"),
+    "mclib_identify_motor oid=%c umax=%u umin=%u",
+    "get_mcu_version", "remove_peel action=%u",
+    "pa_action action=%u pc=%u", "get_emcu_pa_value",
+}
+
+MAINBOARD_REQUIRED_RESPONSES = {
+    "identify_response offset=%u data=%.*s",
+    "config is_config=%c crc=%u is_shutdown=%c move_count=%hu",
+    "clock clock=%u", "uptime high=%u clock=%u",
+    "stats count=%u sum=%u sumsq=%u", "starting",
+    "is_shutdown static_string_id=%hu",
+    "shutdown clock=%u static_string_id=%hu", "pong data=%*s",
+    "debug_result val=%u", "stepper_position oid=%c pos=%i",
+    "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c",
+    "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
+    "analog_in_state oid=%c next_clock=%u value=%hu",
+    "buttons_state oid=%c ack_count=%c state=%*s",
+    "mcu_version year=%u date=%u version=%u", "pa_value value=%u",
+}
+
+MAINBOARD_OPTIONAL_GENERIC_RESPONSES = {
+    "sensor_bulk_data oid=%c sequence=%hu data=%*s",
+    ("sensor_bulk_status oid=%c clock=%u query_ticks=%u "
+     "next_sequence=%hu buffered=%u possible_overflows=%hu"),
+}
+MAINBOARD_STEPPER_ENUM = {
+    "stepper_x": 0, "stepper_y": 1, "stepper_z": 2, "extruder": 3,
+}
+
+
+def mainboard_pin_enumeration():
+    pins = {"PA%d" % pin: pin for pin in range(11)}
+    pins.update({"PA%d" % pin: pin for pin in range(13, 16)})
+    for port, base in (("B", 16), ("C", 32), ("D", 48), ("E", 64)):
+        pins.update({"P%s%d" % (port, pin): base + pin
+                     for pin in range(16)})
+    pins.update({"PH2": 114, "PH3": 115})
+    pins.update({"PJ%d" % pin: 144 + pin for pin in range(16)})
+    return pins
+
+
+MAINBOARD_REQUIRED_ENUMERATIONS = {
+    "stepper": MAINBOARD_STEPPER_ENUM,
+    "pin": mainboard_pin_enumeration(),
+}
+def require_mainboard_profile(case):
+    if "mainBoardGD" not in TOOL.BOARD_PROFILES:
+        case.fail("mainBoardGD builder profile is not implemented")
+    return TOOL.BOARD_PROFILES["mainBoardGD"]
+
+
+def mainboard_dictionary_data(kconfig=None, commands=None, responses=None,
+                              enumerations=None, constants=None, output=None):
+    return dictionary_data(
+        kconfig=kconfig, board="mainBoardGD", commands=commands,
+        responses=responses, enumerations=enumerations, constants=constants,
+        output=output)
+
 def dictionary_data(kconfig=None, version="test-version",
-                    build_versions="test-tools", board="levelBoard"):
+                    build_versions="test-tools", board="levelBoard",
+                    commands=None, responses=None, enumerations=None,
+                    constants=None, output=None):
     profile = TOOL.BOARD_PROFILES[board]
+    command_formats = (profile["required_commands"] if commands is None
+                       else commands)
     commands = {name: index for index, name in enumerate(
-        sorted(profile["required_commands"] -
-               {"identify offset=%u count=%c"}), 2)}
-    commands["identify offset=%u count=%c"] = 1
+        sorted(set(command_formats) - {"identify offset=%u count=%c"}), 2)}
+    if "identify offset=%u count=%c" in command_formats:
+        commands["identify offset=%u count=%c"] = 1
     first_response = max(commands.values()) + 1
+    response_formats = (profile["required_responses"] if responses is None
+                        else responses)
     responses = {name: index for index, name in enumerate(
-        sorted(profile["required_responses"] -
+        sorted(set(response_formats) -
                {"identify_response offset=%u data=%.*s"}), first_response)}
-    responses["identify_response offset=%u data=%.*s"] = 0
+    if "identify_response offset=%u data=%.*s" in response_formats:
+        responses["identify_response offset=%u data=%.*s"] = 0
     value = {
-        "commands": commands, "responses": responses, "output": {},
-        "config": dict(profile["required_constants"]),
+        "commands": commands, "responses": responses,
+        "output": {} if output is None else output,
+        "config": dict(profile["required_constants"] if constants is None
+                       else constants),
+        "enumerations": dict(profile.get("required_enumerations", {}) if
+                             enumerations is None else enumerations),
         "kconfig": profile["seed_config"] if kconfig is None else kconfig,
         "version": version, "build_versions": build_versions,
     }
@@ -59,6 +175,8 @@ def record(kind, address=0, payload=b""):
 
 
 def ihex(records=(), sp=None, reset=None, eof=True, board="levelBoard"):
+    if board == "mainBoardGD" and board not in TOOL.BOARD_PROFILES:
+        raise AssertionError("mainBoardGD builder profile is not implemented")
     profile = TOOL.BOARD_PROFILES[board]
     app_start = profile["app_start"]
     if sp is None:
@@ -226,8 +344,57 @@ class IntelHexTests(unittest.TestCase):
                     TOOL.ToolError) as raised:
                 TOOL.parse_ihex("heaterBoard", value)
             self.assertIn(address, str(raised.exception).lower())
+    def test_mainboard_uses_no_offset_vectors_and_full_flash_range(self):
+        require_mainboard_profile(self)
+        parsed = TOOL.parse_ihex(
+            "mainBoardGD", ihex(board="mainBoardGD"))
+        self.assertEqual(parsed["stack_pointer"], 0x24080000)
+        self.assertEqual(parsed["reset_handler"], 0x08000009)
+        self.assertEqual(parsed["intervals"][0],
+                         [0x08000000, 0x0800000c])
+        self.assertEqual(parsed["holes"][-1][1], 0x08100000)
+        self.assertEqual(parsed["normalization"],
+                         "application-1024k-ff-fill-v1")
+        upper = ihex([
+            record(4, payload=b"\x08\x0f"),
+            record(0, 0xffff, b"x"),
+        ], board="mainBoardGD")
+        upper_report = TOOL.parse_ihex("mainBoardGD", upper)
+        self.assertEqual(upper_report["intervals"][-1],
+                         [0x080fffff, 0x08100000])
+        for value, address in (
+                (ihex([record(4, payload=b"\x07\xff"),
+                       record(0, 0xffff, b"x")], board="mainBoardGD"),
+                 "07ffffff"),
+                (ihex([record(4, payload=b"\x08\x10"),
+                       record(0, 0, b"x")], board="mainBoardGD"),
+                 "08100000")):
+            with self.subTest(address=address), self.assertRaises(
+                    TOOL.ToolError) as raised:
+                TOOL.parse_ihex("mainBoardGD", value)
+            self.assertIn(address, str(raised.exception).lower())
 
-
+    def test_mainboard_axi_stack_pointer_bounds_and_reset_target(self):
+        require_mainboard_profile(self)
+        for sp in (0x24000008, 0x24080000):
+            with self.subTest(accepted=hex(sp)):
+                parsed = TOOL.parse_ihex(
+                    "mainBoardGD", ihex(sp=sp, board="mainBoardGD"))
+                self.assertEqual(parsed["stack_pointer"], sp)
+        for sp, word in ((0x23fffff8, "(?i:sram)"),
+                         (0x24080008, "(?i:sram)"),
+                         (0x24000004, "(?i:align)")):
+            with self.subTest(rejected=hex(sp)), self.assertRaisesRegex(
+                    TOOL.ToolError, word):
+                TOOL.parse_ihex(
+                    "mainBoardGD", ihex(sp=sp, board="mainBoardGD"))
+        for reset, word in ((0x08000008, "(?i:thumb)"),
+                            (0x08100001, "(?i:reset)")):
+            with self.subTest(reset=hex(reset)), self.assertRaisesRegex(
+                    TOOL.ToolError, word):
+                TOOL.parse_ihex(
+                    "mainBoardGD",
+                    ihex(reset=reset, board="mainBoardGD"))
     def test_reset_requires_thumb_and_application_target(self):
         self.assert_rejected(ihex(reset=APP_START + 8), "thumb")
         self.assert_rejected(ihex(reset=APP_END + 1), "reset", "range")
@@ -489,6 +656,173 @@ Idx Name          Size      VMA       LMA       File off  Algn
         self.assertEqual(captured.getvalue(), "")
 
 
+class MainboardProfileTests(unittest.TestCase):
+    def setUp(self):
+        require_mainboard_profile(self)
+    def test_profile_has_exact_target_dictionary_and_updater_contract(self):
+        profile = require_mainboard_profile(self)
+        self.assertEqual(profile["firmware_name"], "mainBoardGD.hex")
+        self.assertEqual((profile["app_start"], profile["app_end"]),
+                         (0x08000000, 0x08100000))
+        self.assertEqual((profile["ram_start"], profile["ram_end"]),
+                         (0x24000000, 0x24080000))
+        self.assertEqual(profile["normalization"],
+                         "application-1024k-ff-fill-v1")
+        self.assertEqual(profile["updater_name"], "ISPCommand")
+        self.assertEqual(profile["required_constants"],
+                         MAINBOARD_REQUIRED_CONSTANTS)
+        self.assertEqual(profile["required_commands"],
+                         MAINBOARD_REQUIRED_COMMANDS)
+        self.assertEqual(profile["required_responses"],
+                         MAINBOARD_REQUIRED_RESPONSES)
+        self.assertEqual(profile["required_enumerations"],
+                         MAINBOARD_REQUIRED_ENUMERATIONS)
+        required_config = {
+            "MACH_STM32": "y", "MACH_GD32H7": "y",
+            "MACH_GD32H737VGT6": "y", "C5_MAINBOARDGD": "y",
+            "MCU": "gd32h737vgt6", "STM32_CLOCK_REF_25M": "y",
+            "GD32_SERIAL_USART0": "y", "WANT_ADC": "y",
+            "WANT_BUTTONS": "y", "INLINE_STEPPER_HACK": "y",
+            "HAVE_STEPPER_OPTIMIZED_BOTH_EDGE": "n",
+            "WANT_STEPPER_OPTIMIZED_BOTH_EDGE": "n",
+            "ARMCM_FLASH_SIZE_IS_TOTAL": "y",
+            "ARMCM_EXPLICIT_RESET_ENTRY": "y",
+            "FLASH_APPLICATION_ADDRESS": "0x08000000",
+            "FLASH_BOOT_ADDRESS": "0x08000000", "FLASH_SIZE": "0x100000",
+            "RAM_START": "0x24000000", "RAM_SIZE": "0x80000",
+            "STACK_SIZE": "4096", "CLOCK_FREQ": "600000000",
+            "CLOCK_REF_FREQ": "25000000", "SERIAL_BAUD": "230400",
+            "SERIAL_RX_BUFFER_SIZE": "384",
+        }
+        self.assertEqual(profile["required_config"], required_config)
+        self.assertTrue({
+            "C5_EBOARD", "C5_HEATERBOARD", "C5_LEVELBOARD", "MACH_STM32H7",
+        }.issubset(profile["forbidden_config"]))
+        fixture = ROOT / "test" / "configs" / "c5-mainboardgd.config"
+        self.assertEqual(
+            TOOL._load_resolved_config("mainBoardGD", fixture),
+            TOOL._load_resolved_config_text(
+                "mainBoardGD", profile["seed_config"]))
+        for board in ("eBoard", "heaterBoard", "levelBoard"):
+            self.assertEqual(TOOL.BOARD_PROFILES[board]["updater_name"],
+                             "IAPCommand")
+
+    def test_dictionary_accepts_exact_constants_formats_and_enumerations(self):
+        report = TOOL._load_dictionary(
+            "mainBoardGD", dictionary_data(board="mainBoardGD"))
+        self.assertEqual(report["constants"], MAINBOARD_REQUIRED_CONSTANTS)
+        self.assertEqual(report["resolved_config"]["MCU"],
+                         "gd32h737vgt6")
+        self.assertEqual(
+            report["resolved_config"]["HAVE_STEPPER_OPTIMIZED_BOTH_EDGE"],
+            "n")
+        self.assertEqual(
+            report["resolved_config"]["WANT_STEPPER_OPTIMIZED_BOTH_EDGE"],
+            "n")
+
+    def test_dictionary_accepts_upstream_generic_sensor_bulk_responses(self):
+        report = TOOL._load_dictionary(
+            "mainBoardGD", mainboard_dictionary_data(
+                responses=(MAINBOARD_REQUIRED_RESPONSES |
+                           MAINBOARD_OPTIONAL_GENERIC_RESPONSES)))
+        self.assertEqual(report["constants"], MAINBOARD_REQUIRED_CONSTANTS)
+
+    def test_dictionary_rejects_each_omitted_required_interface(self):
+        for msgformat in sorted(MAINBOARD_REQUIRED_COMMANDS):
+            with self.subTest(kind="command", msgformat=msgformat), \
+                    self.assertRaisesRegex(TOOL.ToolError,
+                                           "missing required command"):
+                TOOL._load_dictionary(
+                    "mainBoardGD", mainboard_dictionary_data(
+                        commands=MAINBOARD_REQUIRED_COMMANDS - {msgformat}))
+        for msgformat in sorted(MAINBOARD_REQUIRED_RESPONSES):
+            with self.subTest(kind="response", msgformat=msgformat), \
+                    self.assertRaisesRegex(TOOL.ToolError,
+                                           "missing required response"):
+                TOOL._load_dictionary(
+                    "mainBoardGD", mainboard_dictionary_data(
+                        responses=MAINBOARD_REQUIRED_RESPONSES - {msgformat}))
+
+    def test_dictionary_requires_exact_pin_and_four_slot_motor_names(self):
+        TOOL._load_dictionary("mainBoardGD", mainboard_dictionary_data())
+        variants = []
+        for enum_name, member in (("stepper", "extruder"),
+                                  ("pin", "PJ15")):
+            missing = {name: dict(values) for name, values in
+                       MAINBOARD_REQUIRED_ENUMERATIONS.items()}
+            missing[enum_name].pop(member)
+            variants.append(("missing-" + member, missing))
+        renamed = {name: dict(values) for name, values in
+                   MAINBOARD_REQUIRED_ENUMERATIONS.items()}
+        renamed["stepper"]["stepper_e"] = renamed["stepper"].pop("extruder")
+        variants.append(("renamed-extruder", renamed))
+        extra = {name: dict(values) for name, values in
+                 MAINBOARD_REQUIRED_ENUMERATIONS.items()}
+        extra["pin"]["PA11"] = 11
+        variants.append(("unapproved-pa11", extra))
+        for name, enumerations in variants:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    TOOL.ToolError,
+                    "dictionary enumeration (pin|stepper) does not match"):
+                TOOL._load_dictionary(
+                    "mainBoardGD", mainboard_dictionary_data(
+                        enumerations=enumerations))
+
+    def test_dictionary_rejects_wrong_constants_and_other_board_contracts(self):
+        for name in sorted(MAINBOARD_REQUIRED_CONSTANTS):
+            constants = dict(MAINBOARD_REQUIRED_CONSTANTS)
+            value = constants[name]
+            constants[name] = value + 1 if isinstance(value, int) else value + "x"
+            with self.subTest(constant=name), self.assertRaisesRegex(
+                    TOOL.ToolError, "dictionary constant"):
+                TOOL._load_dictionary(
+                    "mainBoardGD", mainboard_dictionary_data(
+                        constants=constants))
+        for board in ("eBoard", "heaterBoard", "levelBoard"):
+            with self.subTest(mainboard_as=board), self.assertRaises(
+                    TOOL.ToolError):
+                TOOL._load_dictionary(board, mainboard_dictionary_data())
+            with self.subTest(board_as_mainboard=board), self.assertRaises(
+                    TOOL.ToolError):
+                TOOL._load_dictionary(
+                    "mainBoardGD", dictionary_data(board=board))
+
+    def test_dictionary_rejects_omitted_stock_interfaces(self):
+        modern_adc = (
+            "query_analog_in oid=%c clock=%u sample_ticks=%u sample_count=%c "
+            "rest_ticks=%u bytes_per_report=%c min_value=%hu max_value=%hu "
+            "range_check_count=%c")
+        forbidden = (
+            ("commands", "get_basic_param num=%u"),
+            ("commands", "set_trigger_threshold threshold=%i"),
+            ("commands", modern_adc),
+            ("commands", ("config_lis2dw oid=%c bus_oid=%c "
+                          "bus_oid_type=%c lis_chip_type=%c")),
+            ("commands", "query_lis2dw oid=%c rest_ticks=%u"),
+            ("commands", "query_lis2dw_status oid=%c"),
+            ("responses", "param_value value=%u reserve=%u"),
+            ("responses", "trigger_threshold threshold=%i"),
+            ("responses", "peel_data value=%i"),
+            ("output", "GDMainboard close=%hu Close_num=%hu Temp_waketime=%hu"),
+        )
+        for table, msgformat in forbidden:
+            value = json.loads(mainboard_dictionary_data())
+            value[table][msgformat] = max(
+                set(value["commands"].values()) |
+                set(value["responses"].values()) |
+                set(value["output"].values()) | {0}) + 1
+            with self.subTest(table=table, msgformat=msgformat), \
+                    self.assertRaises(TOOL.ToolError):
+                TOOL._load_dictionary(
+                    "mainBoardGD", json.dumps(value).encode())
+        constants = dict(MAINBOARD_REQUIRED_CONSTANTS,
+                         STEPPER_OPTIMIZED_EDGE=1)
+        with self.assertRaises(TOOL.ToolError):
+            TOOL._load_dictionary(
+                "mainBoardGD",
+                mainboard_dictionary_data(constants=constants))
+
+
 SYNTHETIC_TOOL_NAMES = tuple("arm-none-eabi-" + name for name in
                              ("as", "ld", "objcopy", "objdump", "nm", "gcc"))
 
@@ -638,21 +972,27 @@ SECTIONS {
                 template = Path(temp) / "template.tgz"
                 template.write_bytes(
                     TOOL.openssl_crypt(plain, decrypt=False, openssl=openssl))
-                result = self.run_cli_package(template, output)
-            self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("unsupported canonical template", result.stderr)
+                stderr = io.StringIO()
+                with mock.patch.object(
+                        TOOL, "_repository_state",
+                        return_value={"commit": "a" * 40, "dirty": False}), \
+                        contextlib.redirect_stderr(stderr), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    returncode = TOOL.main([
+                        "--openssl", openssl, "package",
+                        "--template", str(template),
+                        "--firmware", "levelBoard",
+                        str(self.directory / "firmware.hex"),
+                        str(self.directory / "firmware.elf"),
+                        str(self.directory / "firmware.dict"),
+                        "--output", str(output),
+                    ])
+            diagnostic = stderr.getvalue()
+            self.assertEqual(returncode, 2, diagnostic)
+            self.assertIn("unsupported canonical template", diagnostic)
             self.assertFalse(output.exists())
             self.assertFalse(Path(str(output) + ".manifest.json").exists())
-            self.assertNotIn(secret, result.stderr)
-
-    def run_cli_package(self, template, output):
-        return subprocess.run(
-            [sys.executable, str(TOOL_PATH), "--openssl",
-             shutil.which("openssl"), "package", "--template", str(template),
-             "--firmware", "levelBoard", "firmware.hex", "firmware.elf",
-             "firmware.dict", "--output", str(output)],
-            cwd=self.directory, text=True, capture_output=True)
-
+            self.assertNotIn(secret, diagnostic)
 
 @unittest.skipUnless(os.environ.get("RUN_C5_BUILD_TESTS") == "1",
                      "set RUN_C5_BUILD_TESTS=1 with the ARM toolchain "
@@ -675,7 +1015,6 @@ class RealFirmwareTests(unittest.TestCase):
         cls.heaterboard_build_report = TOOL.build_firmware(
             "heaterBoard", cls.heaterboard_output, 1,
             "arm-none-eabi-", "openssl")
-
     @classmethod
     def tearDownClass(cls):
         cls.workspace.cleanup()
@@ -862,6 +1201,68 @@ class RealFirmwareTests(unittest.TestCase):
                                     {board: products}, output)
             self.assertFalse(output.exists())
             self.assertFalse(Path(str(output) + ".manifest.json").exists())
+@unittest.skipUnless(os.environ.get("RUN_C5_BUILD_TESTS") == "1",
+                     "set RUN_C5_BUILD_TESTS=1 with the ARM toolchain "
+                     "available")
+class MainboardRealFirmwareTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if "mainBoardGD" not in TOOL.BOARD_PROFILES:
+            raise AssertionError(
+                "mainBoardGD builder profile is not implemented")
+        cls.workspace = tempfile.TemporaryDirectory()
+        cls.output = Path(cls.workspace.name) / "mainBoardGD"
+        cls.repo_config = ROOT / ".config"
+        cls.config_before = (cls.repo_config.read_bytes()
+                             if cls.repo_config.exists() else None)
+        cls.build_report = TOOL.build_firmware(
+            "mainBoardGD", cls.output, 1, "arm-none-eabi-", "openssl")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.workspace.cleanup()
+
+    def test_actual_mainboard_build_and_cross_board_rejections(self):
+        paths = self.build_report["products"]
+        self.assertEqual(paths["firmware"], "mainBoardGD.hex")
+        for key in ("elf", "bin", "firmware", "dictionary", "config"):
+            self.assertTrue((self.output / paths[key]).is_file(), key)
+        current = (self.repo_config.read_bytes()
+                   if self.repo_config.exists() else None)
+        self.assertEqual(current, self.config_before)
+        report = self.build_report["firmware"]
+        self.assertEqual(report["bounds"]["application"],
+                         [0x08000000, 0x08100000])
+        self.assertEqual(report["bounds"]["sram"],
+                         [0x24000000, 0x24080000])
+        self.assertEqual(report["stack_pointer"], 0x24080000)
+        self.assertEqual(report["constants"], MAINBOARD_REQUIRED_CONSTANTS)
+        self.assertEqual(report["normalization"],
+                         "application-1024k-ff-fill-v1")
+        dictionary_path = self.output / paths["dictionary"]
+        dictionary = json.loads(dictionary_path.read_text())
+        self.assertTrue(MAINBOARD_OPTIONAL_GENERIC_RESPONSES.issubset(
+            dictionary["responses"]))
+        self.assertNotIn("STEPPER_OPTIMIZED_EDGE", dictionary["config"])
+        self.assertNotIn("get_basic_param num=%u", dictionary["commands"])
+        self.assertNotIn("param_value value=%u reserve=%u",
+                         dictionary["responses"])
+        self.assertEqual(
+            TOOL._load_dictionary(
+                "mainBoardGD", dictionary_path.read_bytes())["constants"],
+            MAINBOARD_REQUIRED_CONSTANTS)
+        with self.assertRaises(TOOL.ToolError):
+            TOOL.validate_firmware(
+                "levelBoard", self.output / paths["firmware"],
+                self.output / paths["elf"], dictionary_path)
+        wrong_dictionary = self.output / "levelBoard.dict"
+        wrong_dictionary.write_bytes(dictionary_data())
+        with self.assertRaisesRegex(TOOL.ToolError, "embedded dictionary"):
+            TOOL.validate_firmware(
+                "mainBoardGD", self.output / paths["firmware"],
+                self.output / paths["elf"], wrong_dictionary)
+
+
 class ArchiveInspectionTests(unittest.TestCase):
     def inspect(self, value, **kwargs):
         return TOOL.inspect_archive(value, **kwargs)
@@ -1389,6 +1790,101 @@ class PackageTransformationTests(unittest.TestCase):
         self.assertEqual(values["./eBoard.hex"], eboard)
         self.assertEqual(values["./heaterBoard.hex"], heaterboard)
         self.assertEqual(values["./levelBoard.hex"], levelboard)
+    def test_updater_union_is_exact_for_isp_iap_and_mixed_packages(self):
+        require_mainboard_profile(self)
+        unused, profile = self._template()
+        payloads = {
+            "eBoard": ihex(board="eBoard"),
+            "heaterBoard": ihex(board="heaterBoard"),
+            "levelBoard": ihex(),
+            "mainBoardGD": ihex(board="mainBoardGD"),
+        }
+        cases = (
+            ({"mainBoardGD": payloads["mainBoardGD"]},
+             ["./ISPCommand", "./mainBoardGD.hex", "./mcu.img",
+              "./run.sh", "./Update"]),
+            ({"eBoard": payloads["eBoard"]},
+             ["./eBoard.hex", "./IAPCommand", "./mcu.img",
+              "./run.sh", "./Update"]),
+            ({board: payloads[board] for board in
+             ("eBoard", "mainBoardGD")},
+             ["./eBoard.hex", "./IAPCommand", "./ISPCommand",
+              "./mainBoardGD.hex", "./mcu.img", "./run.sh", "./Update"]),
+            (payloads,
+             ["./eBoard.hex", "./heaterBoard.hex", "./IAPCommand",
+              "./ISPCommand", "./levelBoard.hex", "./mainBoardGD.hex",
+              "./mcu.img", "./run.sh", "./Update"]),
+        )
+        shell = shutil.which("sh")
+        md5sum = shutil.which("md5sum")
+        for selected, retained_order in cases:
+            with self.subTest(boards=tuple(selected)):
+                plaintext, evidence = TOOL._build_reduced_plaintext(
+                    profile, selected, shell, md5sum)
+                summary = TOOL._assert_reduced_profile(
+                    TOOL._inspect_archive_model(plaintext), evidence,
+                    selected, md5sum)
+                with tarfile.open(fileobj=io.BytesIO(plaintext),
+                                  mode="r:") as outer:
+                    control = outer.extractfile(outer.getmembers()[0]).read()
+                with tarfile.open(fileobj=io.BytesIO(control),
+                                  mode="r:") as inner:
+                    members = inner.getmembers()
+                    values = {member.name: inner.extractfile(member).read()
+                              for member in members}
+                self.assertEqual(
+                    [member.name for member in members
+                     if member.name != "./md5sum.list"], retained_order)
+                self.assertEqual(set(values),
+                                 set(retained_order) | {"./md5sum.list"})
+                self.assertEqual(values["./md5sum.list"],
+                                 self._checksum_list(values, retained_order))
+                updater_labels = {item["label"] for item in summary["control"]
+                                  if item["label"] in
+                                  {"IAPCommand", "ISPCommand"}}
+                expected_updaters = {
+                    Path(name).name for name in retained_order
+                    if name in ("./IAPCommand", "./ISPCommand")}
+                self.assertEqual(updater_labels, expected_updaters)
+                firmware_labels = [
+                    item["label"] for item in summary["control"]
+                    if item["label"].endswith(" firmware")]
+                self.assertEqual(
+                    firmware_labels,
+                    [board + " firmware" for board in
+                     TOOL._canonical_boards(selected)])
+                for board, firmware in selected.items():
+                    self.assertEqual(
+                        values["./" + TOOL.BOARD_PROFILES[board]
+                               ["firmware_name"]], firmware)
+
+    def test_mainboard_validation_failure_never_publishes_package_or_manifest(
+            self):
+        require_mainboard_profile(self)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            template = root / "template.tgz"
+            template.write_bytes(b"not reached")
+            products = {
+                "firmware": root / "mainBoardGD.hex",
+                "elf": root / "klipper.elf",
+                "dictionary": root / "klipper.dict",
+            }
+            for path in products.values():
+                path.write_bytes(b"fixture")
+            output = root / "Creator5Pro-mainboardgd.tgz"
+            with mock.patch.object(
+                    TOOL, "_validate_firmware",
+                    side_effect=TOOL.ToolError(
+                        "injected mainBoardGD validation failure")) as validate:
+                with self.assertRaisesRegex(
+                        TOOL.ToolError, "mainBoardGD validation"):
+                    TOOL.package_update(
+                        template, {"mainBoardGD": products}, output)
+            validate.assert_called_once()
+            self.assertFalse(output.exists())
+            self.assertFalse(Path(str(output) + ".manifest.json").exists())
+
     def test_hash_gate_rejects_noncanonical_template(self):
         outer, unused = self._template()
         with self.assertRaisesRegex(TOOL.ToolError,
@@ -1524,6 +2020,27 @@ class SelectionContractTests(unittest.TestCase):
         ])
         self.assertEqual([group[0] for group in args.firmware],
                          ["levelBoard", "eBoard"])
+
+    def test_mainboard_is_selectable_after_existing_profiles(self):
+        require_mainboard_profile(self)
+        self.assertEqual(tuple(TOOL.BOARD_PROFILES),
+                         ("eBoard", "heaterBoard", "levelBoard",
+                          "mainBoardGD"))
+        args = TOOL.create_argument_parser().parse_args([
+            "package", "--template", "template.tgz",
+            "--firmware", "mainBoardGD", "m.hex", "m.elf", "m.dict",
+            "--output", "Creator5Pro-mainboardgd.tgz",
+        ])
+        self.assertEqual(args.firmware[0][0], "mainBoardGD")
+        valid = {"firmware": "f.hex", "elf": "f.elf",
+                 "dictionary": "f.dict"}
+        normalized = TOOL._normalize_firmware_inputs({
+            "mainBoardGD": valid, "levelBoard": valid,
+            "eBoard": valid, "heaterBoard": valid,
+        })
+        self.assertEqual(list(normalized),
+                         ["eBoard", "heaterBoard", "levelBoard",
+                          "mainBoardGD"])
 
     def test_public_apis_reject_invalid_selection_before_tools(self):
         with mock.patch.object(TOOL, "_tool_path",
