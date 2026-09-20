@@ -69,6 +69,7 @@ gpio-src-y := stm32/gpio.c stm32/gpioperiph.c
 gpio-src-$(CONFIG_MACH_STM32F1) := stm32/gpio.c
 gpio-src-$(CONFIG_MACH_STM32H7) := stm32/stm32h7_gpio.c stm32/gpioperiph.c
 gpio-src-$(CONFIG_MACH_GD32H7) := stm32/gd32h7_gpio.c stm32/gpioperiph.c
+gpio-src-$(CONFIG_C5_MAINBOARDGD) := stm32/c5_mainboardgd_gpio.c stm32/gpioperiph.c
 gpio-src-$(CONFIG_MACH_N32G430) := stm32/gpio.c stm32/n32g430_gpio.c
 src-y += $(timer-src-y) $(gpio-src-y)
 src-$(CONFIG_MACH_N32G430F8S7) += stm32/n32g430f8s7_gpio.c
@@ -108,6 +109,7 @@ src-$(CONFIG_USBCANBUS) += stm32/chipid.c generic/usb_canbus.c
 src-$(CONFIG_WANT_HARD_PWM) += stm32/hard_pwm.c
 src-$(CONFIG_HAVE_GPIO_SDIO) += stm32/sdio.c
 
+src-$(CONFIG_C5_MAINBOARDGD) += stm32/c5_mainboardgd.c
 src-$(CONFIG_C5_EBOARD) += stm32/c5_eboard.c
 
 # Binary output file rules
