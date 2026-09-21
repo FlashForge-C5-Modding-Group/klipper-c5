@@ -342,8 +342,9 @@ BOARD_PROFILES = {
             "STATS_SUMSQ_BASE": 256,
         },
         "required_enumerations": {
-            "pin": _package_pin_enumeration(
+            "pin": dict(_package_pin_enumeration(
                 {"A": 0xffff, "B": 0xffff, "C": 0xe000}, True),
+                        PG0=96),
         },
         "required_commands": {
             "identify offset=%u count=%c", "allocate_oids count=%c",

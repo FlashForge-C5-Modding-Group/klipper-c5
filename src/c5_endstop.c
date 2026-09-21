@@ -96,11 +96,21 @@ endstop_oversample_event(struct timer *t)
     return endstop_oversample_event_with_value(t, c5_endstop_read(e->pin));
 }
 
+static struct gpio_in
+c5_endstop_setup(uint32_t pin, int32_t pull_up)
+{
+#if CONFIG_C5_EBOARD
+    if (pin == GPIO('G', 0))
+        return (struct gpio_in) { .regs=GPIOG, .bit=GPIO2BIT(pin) };
+#endif
+    return gpio_in_setup(pin, pull_up);
+}
+
 void
 command_config_endstop(uint32_t *args)
 {
     struct endstop *e = oid_alloc(args[0], command_config_endstop, sizeof(*e));
-    e->pin = gpio_in_setup(args[1], args[2]);
+    e->pin = c5_endstop_setup(args[1], args[2]);
 }
 DECL_COMMAND(command_config_endstop, "config_endstop oid=%c pin=%c pull_up=%c");
 

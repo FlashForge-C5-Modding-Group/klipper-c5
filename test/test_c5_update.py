@@ -34,6 +34,7 @@ def c5_pin_enumerations():
     eboard = {"PA%d" % pin: pin for pin in range(16)}
     eboard.update({"PB%d" % pin: 16 + pin for pin in range(16)})
     eboard.update({"PC%d" % pin: 32 + pin for pin in range(13, 16)})
+    eboard["PG0"] = 96
     eboard["ADC_TEMPERATURE"] = 0xfe
 
     heaterboard = {"PA%d" % pin: pin for pin in range(16)}
@@ -678,6 +679,15 @@ Idx Name          Size      VMA       LMA       File off  Algn
 
 
 class SharedN32ProfileTests(unittest.TestCase):
+    def test_virtual_pg0_is_exposed_only_by_eboard(self):
+        for board, expected in (("eBoard", 96),
+                                ("heaterBoard", None),
+                                ("levelBoard", None)):
+            with self.subTest(board=board):
+                pins = (TOOL.BOARD_PROFILES[board]
+                        ["required_enumerations"]["pin"])
+                self.assertEqual(pins.get("PG0"), expected)
+
     def test_profiles_reserve_the_physical_usart1_pins(self):
         for board in ("eBoard", "heaterBoard", "levelBoard"):
             with self.subTest(board=board):
@@ -1074,23 +1084,29 @@ SECTIONS {
 
 class N32G45xRegisterModelTests(unittest.TestCase):
     MODEL_SOURCE = ROOT / "test" / "n32g45x_register_model.c"
+    VIRTUAL_ENDSTOP_SOURCE = ROOT / "test" / "c5_virtual_endstop.c"
 
-    def compile_model(self, workspace, reference_frequency):
-        executable = workspace / ("n32-model.exe" if os.name == "nt"
-                                  else "n32-model")
-        compiler = next((shutil.which(name)
-                         for name in ("cc", "gcc", "clang")
-                         if shutil.which(name)), None)
+    def compile_model(self, workspace, reference_frequency, source=None,
+                      name="n32-model", include_dirs=()):
+        source = self.MODEL_SOURCE if source is None else source
+        executable = workspace / (name + (".exe" if os.name == "nt" else ""))
+        include_dirs = (ROOT / "test",) + tuple(include_dirs)
+        compiler = next((shutil.which(candidate)
+                         for candidate in ("cc", "gcc", "clang")
+                         if shutil.which(candidate)), None)
         if compiler:
-            command = [
-                compiler, "-std=c11", "-O2", "-I", str(ROOT / "test"),
+            command = [compiler, "-std=c11", "-O2"]
+            for include_dir in include_dirs:
+                command.extend(("-I", str(include_dir)))
+            command.extend((
                 "-DCONFIG_CLOCK_REF_FREQ=%d" % reference_frequency,
-                str(self.MODEL_SOURCE), "-o", str(executable),
-            ]
-            return subprocess.run(command, capture_output=True, text=True), executable
+                str(source), "-o", str(executable)))
+            completed = subprocess.run(
+                command, capture_output=True, text=True)
+            return completed, executable
 
         if os.name != "nt":
-            self.fail("A host C compiler is required for the N32 register model")
+            self.fail("A host C compiler is required for the N32 models")
         vswhere = (Path(os.environ["ProgramFiles(x86)"]) /
                    "Microsoft Visual Studio" / "Installer" / "vswhere.exe")
         located = subprocess.run(
@@ -1100,16 +1116,35 @@ class N32G45xRegisterModelTests(unittest.TestCase):
             check=True, capture_output=True, text=True)
         installation = Path(located.stdout.strip())
         vcvars = installation / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
-        script = workspace / "compile-model.cmd"
+        script = workspace / ("compile-" + name + ".cmd")
+        include_flags = " ".join('/I"%s"' % path for path in include_dirs)
+        object_path = workspace / (name + ".obj")
         script.write_text(
             '@call "%s" >nul\n'
-            '@cl /nologo /O2 /std:c11 /I"%s" '
+            '@cl /nologo /O2 /std:c11 %s '
             '/DCONFIG_CLOCK_REF_FREQ=%d "%s" /Fo:"%s" /Fe:"%s"\n'
-            % (vcvars, ROOT / "test", reference_frequency, self.MODEL_SOURCE,
-               workspace / "n32-model.obj", executable))
-        return subprocess.run(
+            % (vcvars, include_flags, reference_frequency, source,
+               object_path, executable))
+        completed = subprocess.run(
             [os.environ["COMSPEC"], "/d", "/c", str(script)],
-            capture_output=True, text=True), executable
+            capture_output=True, text=True)
+        return completed, executable
+
+    def test_eboard_virtual_endstop_is_not_physical_gpio(self):
+        with tempfile.TemporaryDirectory() as temp:
+            compiled, executable = self.compile_model(
+                Path(temp), 12000000, self.VIRTUAL_ENDSTOP_SOURCE,
+                "virtual-endstop",
+                (ROOT / "test" / "c5_virtual_endstop_stubs",
+                 ROOT / "src"))
+            self.assertEqual(
+                compiled.returncode, 0, compiled.stdout + compiled.stderr)
+            executed = subprocess.run(
+                [str(executable)], capture_output=True, text=True)
+            self.assertEqual(
+                executed.returncode, 0, executed.stdout + executed.stderr)
+            self.assertEqual(
+                executed.stdout.strip(), "virtual-endstop-model-ok")
 
     def test_production_gpio_and_clock_startup_register_behavior(self):
         for reference_frequency in (12000000, 8000000, 16000000, 24000000):
