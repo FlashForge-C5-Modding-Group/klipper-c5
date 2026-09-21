@@ -9,13 +9,12 @@
 #include "board/misc.h" // timer_read_time
 #include "c5_eboard.h" // c5_eboard_capture
 #include "command.h" // DECL_COMMAND
-#include "compiler.h" // barrier
 #include "sched.h" // DECL_TASK
 
 #define C5_RING_SIZE 11
 #define C5_CALIBRATION_US 500
-#define C5_STABILITY_CLOCK_DIVISOR 144000
-#define C5_STABILITY_TIME_MS 2000
+#define C5_CAPTURE_TIMEOUT_US 5000
+#define C5_STABILITY_TIME_US 2000000
 #define C5_LARGE_DELTA 150
 #define C5_PA_SAMPLE_COUNT 2000
 
@@ -23,24 +22,31 @@ struct c5_detector {
     struct timer calibration_timer;
     uint32_t ring[C5_RING_SIZE];
     uint32_t current, baseline, reference, accumulator;
-    uint32_t stable_start_ms, mad, filtered, signed_delta;
+    uint32_t stable_deadline_clock, last_capture_clock;
+    uint32_t capture_timeout_ticks, mad, filtered, signed_delta;
     uint16_t moderate_count, large_count;
     int16_t effective_threshold;
     uint8_t ring_count, ring_index, assert_count, clear_count;
     uint8_t eddy_state, immediate, capture_pending;
     uint8_t ready, normal_mode, calibration_active;
+    uint8_t stability_pending, acquisition_active, fresh_capture_count;
+};
+
+enum c5_pa_mode {
+    C5_PA_IDLE,
+    C5_PA_ACQUIRING,
+    C5_PA_READY,
 };
 
 struct c5_pa_state {
     uint32_t action, verdict;
-    volatile uint8_t pending;
+    volatile uint8_t state;
     volatile uint16_t index;
     volatile int32_t samples[C5_PA_SAMPLE_COUNT];
 };
 
 static struct c5_detector eboard = {
     .effective_threshold = -20,
-    .eddy_state = 1,
 };
 static struct c5_pa_state pa;
 static struct task_wake classifier_wake;
@@ -59,6 +65,24 @@ c5_threshold_magnitude(int16_t threshold)
 }
 
 static void
+c5_invalidate_stream(uint8_t active)
+{
+    eboard.acquisition_active = active;
+    eboard.fresh_capture_count = 0;
+    eboard.capture_pending = 0;
+    classifier_wake.wake = 0;
+    eboard.ring_count = 0;
+    eboard.ring_index = 0;
+    eboard.accumulator = 0;
+    eboard.mad = 0;
+    eboard.stability_pending = 0;
+    eboard.moderate_count = 0;
+    eboard.large_count = 0;
+    eboard.immediate = 0;
+    eboard.eddy_state = 0;
+}
+
+static void
 c5_full_reset(void)
 {
     uint32_t current = eboard.current;
@@ -69,7 +93,7 @@ c5_full_reset(void)
     eboard.ring_index = 0;
     eboard.moderate_count = 0;
     eboard.large_count = 0;
-    eboard.stable_start_ms = 0;
+    eboard.stability_pending = 0;
     eboard.filtered = 0;
     eboard.assert_count = 0;
     eboard.clear_count = 0;
@@ -83,7 +107,27 @@ c5_full_reset(void)
 void
 c5_eboard_capture(uint16_t interval)
 {
+    uint32_t now = timer_read_time();
     irqstatus_t flag = irq_save();
+    if (!eboard.acquisition_active) {
+        irq_restore(flag);
+        return;
+    }
+    if (!eboard.fresh_capture_count) {
+        eboard.last_capture_clock = now;
+        eboard.fresh_capture_count = 1;
+        irq_restore(flag);
+        return;
+    }
+    uint32_t elapsed = now - eboard.last_capture_clock;
+    eboard.last_capture_clock = now;
+    if (elapsed > 0xffffu || !interval) {
+        c5_invalidate_stream(1);
+        irq_restore(flag);
+        return;
+    }
+    if (eboard.fresh_capture_count < 2)
+        eboard.fresh_capture_count++;
     eboard.current = interval;
     eboard.capture_pending = 1;
     sched_wake_task(&classifier_wake);
@@ -93,14 +137,27 @@ c5_eboard_capture(uint16_t interval)
 uint8_t
 c5_eboard_eddy_state(void)
 {
-    return eboard.eddy_state;
+    irqstatus_t flag = irq_save();
+    uint32_t now = timer_read_time();
+    if (!eboard.acquisition_active || eboard.fresh_capture_count < 2) {
+        irq_restore(flag);
+        return 0;
+    }
+    if (now - eboard.last_capture_clock > eboard.capture_timeout_ticks) {
+        c5_invalidate_stream(1);
+        irq_restore(flag);
+        return 0;
+    }
+    uint8_t state = eboard.eddy_state;
+    irq_restore(flag);
+    return state;
 }
 
 void
 c5_eboard_arm(void)
 {
     irqstatus_t flag = irq_save();
-    eboard.eddy_state = 1;
+    eboard.eddy_state = 0;
     eboard.filtered = 0;
     eboard.assert_count = 0;
     eboard.clear_count = 0;
@@ -234,7 +291,7 @@ c5_finish_calibration(uint32_t median, uint32_t mad)
     eboard.calibration_active = 0;
     eboard.ring_count = 0;
     eboard.ring_index = 0;
-    eboard.stable_start_ms = 0;
+    eboard.stability_pending = 0;
     eboard.moderate_count = 0;
     eboard.large_count = 0;
     eboard.ready = 1;
@@ -258,25 +315,33 @@ c5_process_calibration(void)
         if (eboard.ring_count < C5_RING_SIZE)
             eboard.ring_count++;
 
-        uint32_t now_ms = timer_read_time() / C5_STABILITY_CLOCK_DIVISOR;
+        uint32_t now = timer_read_time();
         if (!eboard.calibration_active) {
             if (eboard.ring_count == C5_RING_SIZE) {
                 uint32_t median, mad;
                 c5_compute_statistics(&median, &mad);
                 eboard.accumulator = median * 4u;
                 eboard.calibration_active = 1;
-                eboard.stable_start_ms = now_ms;
+                eboard.stability_pending = 1;
+                eboard.stable_deadline_clock = (now
+                    + timer_from_us(C5_STABILITY_TIME_US));
             }
-        } else {
-            eboard.accumulator = selected + ((3u * eboard.accumulator) >> 2);
+        } else if (eboard.ring_count == C5_RING_SIZE) {
             uint32_t median;
             c5_compute_statistics(&median, &eboard.mad);
             if (eboard.mad > 2) {
-                eboard.stable_start_ms = 0;
+                eboard.stability_pending = 0;
             } else {
-                if (!eboard.stable_start_ms)
-                    eboard.stable_start_ms = now_ms;
-                if (now_ms - eboard.stable_start_ms >= C5_STABILITY_TIME_MS)
+                if (!eboard.stability_pending) {
+                    eboard.accumulator = median * 4u;
+                    eboard.stability_pending = 1;
+                    eboard.stable_deadline_clock = (now
+                        + timer_from_us(C5_STABILITY_TIME_US));
+                } else {
+                    eboard.accumulator = (selected
+                        + ((3u * eboard.accumulator) >> 2));
+                }
+                if (!timer_is_before(now, eboard.stable_deadline_clock))
                     c5_finish_calibration(median, eboard.mad);
             }
         }
@@ -291,6 +356,12 @@ c5_process_calibration(void)
 static uint_fast8_t
 c5_calibration_event(struct timer *timer)
 {
+    irqstatus_t flag = irq_save();
+    uint32_t now = timer_read_time();
+    if (eboard.acquisition_active && eboard.fresh_capture_count
+        && now - eboard.last_capture_clock > eboard.capture_timeout_ticks)
+        c5_invalidate_stream(1);
+    irq_restore(flag);
     c5_process_calibration();
     timer->waketime += timer_from_us(C5_CALIBRATION_US);
     return SF_RESCHEDULE;
@@ -342,22 +413,41 @@ c5_classify_sample(void)
     irq_restore(flag);
 }
 
+static uint8_t
+c5_tmc_crc8(volatile uint8_t *data, uint_fast8_t length)
+{
+    uint8_t crc = 0;
+    for (uint_fast8_t i = 0; i < length; i++) {
+        uint8_t current = data[i];
+        for (uint_fast8_t bit = 0; bit < 8; bit++) {
+            if ((crc >> 7) ^ (current & 1))
+                crc = (crc << 1) ^ 0x07;
+            else
+                crc <<= 1;
+            current >>= 1;
+        }
+    }
+    return crc;
+}
+
 void
 c5_eboard_pa_receive(volatile uint8_t *frame, uint16_t remaining)
 {
     static const uint8_t prefix[9] = { 0x05, 0x00, 0x41, 0xcf, 0x05,
                                        0xff, 0x41, 0x00, 0x00 };
-    if (remaining == 15 || !pa.pending)
+    if (pa.state != C5_PA_ACQUIRING)
         return;
     uint_fast8_t i;
-    for (i = 0; i < sizeof(prefix); i++)
-        if (frame[i] != prefix[i])
-            break;
-    if (i == sizeof(prefix)) {
-        uint16_t index = pa.index;
-        pa.samples[index] = ((uint16_t)frame[9] << 8) | frame[10];
-        index++;
-        pa.index = index > 1989 ? 1990 : index;
+    if (remaining == 3) {
+        for (i = 0; i < sizeof(prefix); i++)
+            if (frame[i] != prefix[i])
+                break;
+        if (i == sizeof(prefix) && c5_tmc_crc8(&frame[4], 7) == frame[11]) {
+            uint16_t index = pa.index;
+            pa.samples[index] = ((uint16_t)frame[9] << 8) | frame[10];
+            index++;
+            pa.index = index > 1989 ? 1990 : index;
+        }
     }
     for (i = 0; i < 15; i++)
         frame[i] = 0;
@@ -366,24 +456,47 @@ c5_eboard_pa_receive(volatile uint8_t *frame, uint16_t remaining)
 void
 c5_eboard_task(void)
 {
-    if (pa.pending == 1 && (uint8_t)pa.action != 11) {
-        if (c5_eboard_pa_matches(pa.samples, C5_PA_SAMPLE_COUNT))
-            pa.verdict = 9;
-        pa.pending = 0;
-    }
+    irqstatus_t flag = irq_save();
+    uint8_t ready = pa.state == C5_PA_READY;
+    if (ready)
+        pa.state = C5_PA_IDLE;
+    irq_restore(flag);
+    if (ready && c5_eboard_pa_matches(pa.samples, C5_PA_SAMPLE_COUNT))
+        pa.verdict = 9;
     if (sched_check_wake(&classifier_wake))
         c5_classify_sample();
 }
 DECL_TASK(c5_eboard_task);
 
-void
-c5_eboard_init(void)
+static void
+c5_schedule_calibration(void)
 {
-    eboard.calibration_timer.func = c5_calibration_event;
     eboard.calibration_timer.waketime = (timer_read_time()
                                          + timer_from_us(C5_CALIBRATION_US));
     sched_add_timer(&eboard.calibration_timer);
 }
+
+void
+c5_eboard_init(void)
+{
+    eboard.capture_timeout_ticks = timer_from_us(C5_CAPTURE_TIMEOUT_US);
+    eboard.calibration_timer.func = c5_calibration_event;
+    c5_invalidate_stream(1);
+    c5_schedule_calibration();
+}
+
+void
+c5_eboard_shutdown(void)
+{
+    c5_eboard_set_pa_mode(0);
+    pa.state = C5_PA_IDLE;
+    pa.action = 0;
+    pa.verdict = 0;
+    pa.index = 0;
+    c5_invalidate_stream(1);
+    c5_schedule_calibration();
+}
+DECL_SHUTDOWN(c5_eboard_shutdown);
 
 void
 command_get_mcu_version(uint32_t *args)
@@ -397,7 +510,11 @@ void
 command_set_trigger_threshold(uint32_t *args)
 {
     int32_t threshold = (int32_t)args[0];
-    eboard.effective_threshold = (int16_t)(uint16_t)threshold;
+    if (threshold < -200 || threshold > 200) {
+        shutdown("Invalid trigger threshold");
+        return;
+    }
+    eboard.effective_threshold = threshold;
     sendf("trigger_threshold threshold=%i", threshold);
 }
 DECL_COMMAND(command_set_trigger_threshold,
@@ -423,6 +540,7 @@ command_remove_peel(uint32_t *args)
     (void)args;
     irqstatus_t flag = irq_save();
     int32_t value = (int32_t)eboard.signed_delta;
+    eboard.baseline = eboard.current;
     irq_restore(flag);
     sendf("peel_data value=%i", value);
 }
@@ -432,20 +550,25 @@ void
 command_pa_action(uint32_t *args)
 {
     uint32_t action = args[0];
+    irqstatus_t flag = irq_save();
     pa.action = action;
     if (action == 11) {
-        pa.pending = 1;
+        c5_invalidate_stream(0);
         pa.verdict = 0;
         pa.index = 0;
         for (uint_fast16_t i = 0; i < sizeof(pa.samples); i++)
             ((volatile uint8_t *)pa.samples)[i] = 0;
-        barrier();
+        pa.state = C5_PA_ACQUIRING;
         c5_eboard_set_pa_mode(1);
     } else {
         c5_eboard_set_pa_mode(0);
-        if (pa.pending)
+        if (pa.state == C5_PA_ACQUIRING)
+            pa.state = C5_PA_READY;
+        c5_invalidate_stream(1);
+        if (pa.state == C5_PA_READY)
             sched_wake_tasks();
     }
+    irq_restore(flag);
 }
 DECL_COMMAND(command_pa_action, "pa_action action=%u pc=%u");
 
