@@ -8,96 +8,10 @@
 #include "internal.h" // struct cline
 #include "sched.h" // sched_main
 
-#define REG32(addr) (*(volatile uint32_t *)(addr))
-
-#define RCU_CTL_OFFSET          0x00U
-#define RCU_PLL0_OFFSET         0x04U
-#define RCU_CFG0_OFFSET         0x08U
-#define RCU_INT_OFFSET          0x0cU
-#define RCU_AHB1RST_OFFSET      0x10U
-#define RCU_AHB2RST_OFFSET      0x14U
-#define RCU_PLLADDCTL_OFFSET    0x80U
-#define RCU_PLL1_OFFSET         0x84U
-#define RCU_PLL2_OFFSET         0x88U
-#define RCU_CFG1_OFFSET         0x8cU
-#define RCU_CFG2_OFFSET         0x90U
-#define RCU_CFG3_OFFSET         0x94U
-#define RCU_PLLALL_OFFSET       0x98U
-#define RCU_PLL0FRA_OFFSET      0x9cU
-#define RCU_PLL1FRA_OFFSET      0xa0U
-#define RCU_PLL2FRA_OFFSET      0xa4U
-
-#define RCU_CTL             REG32(RCU_BASE + RCU_CTL_OFFSET)
-#define RCU_PLL0            REG32(RCU_BASE + RCU_PLL0_OFFSET)
-#define RCU_CFG0            REG32(RCU_BASE + RCU_CFG0_OFFSET)
-#define RCU_INT             REG32(RCU_BASE + RCU_INT_OFFSET)
-#define RCU_PLLADDCTL       REG32(RCU_BASE + RCU_PLLADDCTL_OFFSET)
-#define RCU_PLL1            REG32(RCU_BASE + RCU_PLL1_OFFSET)
-#define RCU_PLL2            REG32(RCU_BASE + RCU_PLL2_OFFSET)
-#define RCU_CFG1            REG32(RCU_BASE + RCU_CFG1_OFFSET)
-#define RCU_CFG2            REG32(RCU_BASE + RCU_CFG2_OFFSET)
-#define RCU_CFG3            REG32(RCU_BASE + RCU_CFG3_OFFSET)
-#define RCU_PLLALL          REG32(RCU_BASE + RCU_PLLALL_OFFSET)
-#define RCU_PLL0FRA         REG32(RCU_BASE + RCU_PLL0FRA_OFFSET)
-#define RCU_PLL1FRA         REG32(RCU_BASE + RCU_PLL1FRA_OFFSET)
-#define RCU_PLL2FRA         REG32(RCU_BASE + RCU_PLL2FRA_OFFSET)
-#define SYSCFG_SRAMCFG1     REG32(SYSCFG_BASE + 0x68)
-
-_Static_assert(RCU_BASE + RCU_CTL_OFFSET == 0x58024400UL
-               && RCU_BASE + RCU_PLL0_OFFSET == 0x58024404UL
-               && RCU_BASE + RCU_CFG0_OFFSET == 0x58024408UL
-               && RCU_BASE + RCU_INT_OFFSET == 0x5802440cUL,
-               "RCU primary clock-register addresses mismatch");
-_Static_assert(RCU_BASE + RCU_AHB1RST_OFFSET == 0x58024410UL
-               && RCU_BASE + RCU_AHB2RST_OFFSET == 0x58024414UL,
-               "RCU AHB reset-register addresses mismatch");
-_Static_assert(RCU_BASE + RCU_PLLADDCTL_OFFSET == 0x58024480UL,
-               "RCU PLLADDCTL address mismatch");
-_Static_assert(RCU_BASE + RCU_PLL1_OFFSET == 0x58024484UL,
-               "RCU PLL1 address mismatch");
-_Static_assert(RCU_BASE + RCU_PLL2_OFFSET == 0x58024488UL,
-               "RCU PLL2 address mismatch");
-_Static_assert(RCU_BASE + RCU_CFG1_OFFSET == 0x5802448cUL,
-               "RCU CFG1 address mismatch");
-_Static_assert(RCU_BASE + RCU_CFG2_OFFSET == 0x58024490UL,
-               "RCU CFG2 address mismatch");
-_Static_assert(RCU_BASE + RCU_CFG3_OFFSET == 0x58024494UL,
-               "RCU CFG3 address mismatch");
-_Static_assert(RCU_BASE + RCU_PLLALL_OFFSET == 0x58024498UL,
-               "RCU PLLALL address mismatch");
-_Static_assert(RCU_BASE + RCU_PLL0FRA_OFFSET == 0x5802449cUL,
-               "RCU PLL0FRA address mismatch");
-_Static_assert(RCU_BASE + RCU_PLL1FRA_OFFSET == 0x580244a0UL,
-               "RCU PLL1FRA address mismatch");
-_Static_assert(RCU_BASE + RCU_PLL2FRA_OFFSET == 0x580244a4UL,
-               "RCU PLL2FRA address mismatch");
-_Static_assert(RCU_PLL1_OFFSET != RCU_AHB1RST_OFFSET
-               && RCU_PLL2_OFFSET != RCU_AHB2RST_OFFSET,
-               "RCU PLL registers must not alias AHB reset registers");
-
-#define RCU_CTL_HXTALEN     (1U << 16)
-#define RCU_CTL_HXTALSTB    (1U << 17)
-#define RCU_CTL_PLL0EN      (1U << 24)
-#define RCU_CTL_PLL0STB     (1U << 25)
-#define RCU_CTL_PLL1EN      (1U << 26)
-#define RCU_CTL_PLL1STB     (1U << 27)
-#define RCU_CTL_PLL2EN      (1U << 28)
-#define RCU_CTL_PLL2STB     (1U << 29)
-#define RCU_CTL_IRC64MEN    (1U << 30)
-#define RCU_CTL_IRC64MSTB   (1U << 31)
-
-static inline volatile uint32_t *
-rcu_reg(uint32_t offset)
-{
-    return (volatile uint32_t *)(RCU_BASE + offset);
-}
-
 static struct cline
-clock_line(uint32_t en_offset, uint32_t rst_offset, uint32_t bit)
+clock_line(volatile uint32_t *en, volatile uint32_t *rst, uint32_t bit)
 {
-    return (struct cline){
-        .en = rcu_reg(en_offset), .rst = rcu_reg(rst_offset), .bit = bit
-    };
+    return (struct cline){ .en = en, .rst = rst, .bit = bit };
 }
 
 // Map only peripherals whose GD32H737 clock lines are independently known.
@@ -105,21 +19,36 @@ struct cline
 lookup_clock_line(uint32_t periph_base)
 {
     switch (periph_base) {
-    case GPIOA_BASE: return clock_line(0x3c, 0x1c, 1U << 0);
-    case GPIOB_BASE: return clock_line(0x3c, 0x1c, 1U << 1);
-    case GPIOC_BASE: return clock_line(0x3c, 0x1c, 1U << 2);
-    case GPIOD_BASE: return clock_line(0x3c, 0x1c, 1U << 3);
-    case GPIOE_BASE: return clock_line(0x3c, 0x1c, 1U << 4);
-    case TIMER1_BASE: return clock_line(0x40, 0x20, 1U << 0);
-    case TIMER2_BASE: return clock_line(0x40, 0x20, 1U << 1);
-    case TIMER3_BASE: return clock_line(0x40, 0x20, 1U << 2);
-    case TIMER4_BASE: return clock_line(0x40, 0x20, 1U << 3);
-    case TIMER22_BASE: return clock_line(0x40, 0x20, 1U << 6);
-    case TIMER7_BASE: return clock_line(0x44, 0x24, 1U << 1);
-    case USART0_BASE: return clock_line(0x44, 0x24, 1U << 4);
-    case ADC0_BASE: return clock_line(0x44, 0x24, 1U << 8);
-    case ADC1_BASE: return clock_line(0x44, 0x24, 1U << 9);
-    case ADC2_BASE: return clock_line(0x44, 0x24, 1U << 10);
+    case GPIOA_BASE:
+        return clock_line(&RCU_AHB4EN, &RCU_AHB4RST, RCU_AHB4EN_PAEN);
+    case GPIOB_BASE:
+        return clock_line(&RCU_AHB4EN, &RCU_AHB4RST, RCU_AHB4EN_PBEN);
+    case GPIOC_BASE:
+        return clock_line(&RCU_AHB4EN, &RCU_AHB4RST, RCU_AHB4EN_PCEN);
+    case GPIOD_BASE:
+        return clock_line(&RCU_AHB4EN, &RCU_AHB4RST, RCU_AHB4EN_PDEN);
+    case GPIOE_BASE:
+        return clock_line(&RCU_AHB4EN, &RCU_AHB4RST, RCU_AHB4EN_PEEN);
+    case TIMER1:
+        return clock_line(&RCU_APB1EN, &RCU_APB1RST, RCU_APB1EN_TIMER1EN);
+    case TIMER2:
+        return clock_line(&RCU_APB1EN, &RCU_APB1RST, RCU_APB1EN_TIMER2EN);
+    case TIMER3:
+        return clock_line(&RCU_APB1EN, &RCU_APB1RST, RCU_APB1EN_TIMER3EN);
+    case TIMER4:
+        return clock_line(&RCU_APB1EN, &RCU_APB1RST, RCU_APB1EN_TIMER4EN);
+    case TIMER22:
+        return clock_line(&RCU_APB1EN, &RCU_APB1RST, RCU_APB1EN_TIMER22EN);
+    case TIMER7:
+        return clock_line(&RCU_APB2EN, &RCU_APB2RST, RCU_APB2EN_TIMER7EN);
+    case USART0_BASE:
+        return clock_line(&RCU_APB2EN, &RCU_APB2RST, RCU_APB2EN_USART0EN);
+    case ADC0:
+        return clock_line(&RCU_APB2EN, &RCU_APB2RST, RCU_APB2EN_ADC0EN);
+    case ADC1:
+        return clock_line(&RCU_APB2EN, &RCU_APB2RST, RCU_APB2EN_ADC1EN);
+    case ADC2:
+        return clock_line(&RCU_APB2EN, &RCU_APB2RST, RCU_APB2EN_ADC2EN);
     default:
         shutdown("Unknown peripheral clock");
         return (struct cline){};
@@ -132,9 +61,9 @@ get_pclock_frequency(uint32_t periph_base)
     switch (periph_base) {
     case GPIOA_BASE: case GPIOB_BASE: case GPIOC_BASE:
     case GPIOD_BASE: case GPIOE_BASE:
-    case TIMER1_BASE: case TIMER2_BASE: case TIMER3_BASE:
-    case TIMER4_BASE: case TIMER7_BASE: case TIMER22_BASE:
-    case USART0_BASE: case ADC0_BASE: case ADC1_BASE: case ADC2_BASE:
+    case TIMER1: case TIMER2: case TIMER3:
+    case TIMER4: case TIMER7: case TIMER22:
+    case USART0_BASE: case ADC0: case ADC1: case ADC2:
         return 300000000;
     default:
         shutdown("Unknown peripheral clock");
@@ -145,11 +74,11 @@ get_pclock_frequency(uint32_t periph_base)
 void
 gpio_clock_enable(GPIO_TypeDef *regs)
 {
-    uint32_t port = ((uint32_t)regs - GPIOA_BASE) / 0x400;
-    if (port >= 5 || (uint32_t)regs != GPIOA_BASE + port * 0x400)
+    struct cline cl = lookup_clock_line((uint32_t)regs);
+    if (cl.en != &RCU_AHB4EN)
         shutdown("Not a valid GPIO port");
-    *rcu_reg(0x3c) |= 1U << port;
-    *rcu_reg(0x3c);
+    *cl.en |= cl.bit;
+    *cl.en;
 }
 
 static void
@@ -159,31 +88,36 @@ clock_setup(void)
     RCU_CTL |= RCU_CTL_IRC64MEN;
     while (!(RCU_CTL & RCU_CTL_IRC64MSTB))
         ;
-    RCU_CFG0 &= ~3U;
-    while (RCU_CFG0 & 0x0c)
+    RCU_CFG0 &= ~RCU_CFG0_SCS;
+    while (RCU_CFG0 & RCU_CFG0_SCSS)
         ;
 
-    *rcu_reg(0x4c) |= 1U << 0;
-    SYSCFG_SRAMCFG1 &= ~1U;
+    RCU_APB4EN |= RCU_APB4EN_SYSCFGEN;
+    SYSCFG_SRAMCFG1 &= ~SYSCFG_SRAMCFG1_TCM_WAITSTATE;
 
     RCU_CTL &= ~(RCU_CTL_PLL0EN | RCU_CTL_PLL1EN | RCU_CTL_PLL2EN);
     while (RCU_CTL & (RCU_CTL_PLL0STB | RCU_CTL_PLL1STB | RCU_CTL_PLL2STB))
         ;
-    RCU_PLL0 = 0x01002020;
-    RCU_PLL1 = 0x01012020;
-    RCU_PLL2 = 0x01012020;
+    RCU_PLL0 = RCU_PLL0_RESET_VALUE;
+    RCU_PLL1 = RCU_PLL1_RESET_VALUE;
+    RCU_PLL2 = RCU_PLL2_RESET_VALUE;
     RCU_PLLADDCTL = 0;
-    RCU_INT = 0x14ff0000;
+    RCU_INT = RCU_INT_RESET_VALUE;
 
     RCU_CTL |= RCU_CTL_HXTALEN;
     while (!(RCU_CTL & RCU_CTL_HXTALSTB))
         ;
 
     // 25MHz / 5 * 120 / 1 = 600MHz. AHB/AXI run at 300MHz.
-    RCU_CFG0 = 0x24001080;
-    RCU_PLLALL = 0x00020002;
-    RCU_PLL0 = 0x01001dc5;
-    RCU_PLLADDCTL = 0x03800001;
+    RCU_CFG0 = RCU_AHB_CKSYS_DIV2 | RCU_APB1_CKAHB_DIV2
+               | RCU_APB2_CKAHB_DIV1 | RCU_APB3_CKAHB_DIV2
+               | RCU_APB4_CKAHB_DIV2;
+    RCU_PLLALL = RCU_PLLSRC_HXTAL | RCU_PLL0RNG_4M_8M;
+    RCU_PLL0 = 5U | ((120U - 1U) << RCU_PLLNOFFSET)
+               | ((1U - 1U) << RCU_PLLPOFFSET)
+               | ((2U - 1U) << RCU_PLLROFFSET);
+    RCU_PLLADDCTL = ((2U - 1U) & RCU_PLLADDCTL_PLL0Q)
+                    | RCU_PLL0P | RCU_PLL0Q | RCU_PLL0R;
     RCU_PLL0FRA = 0;
     RCU_PLL1FRA = 0;
     RCU_PLL2FRA = 0;
@@ -191,9 +125,9 @@ clock_setup(void)
     RCU_CTL |= RCU_CTL_PLL0EN;
     while (!(RCU_CTL & RCU_CTL_PLL0STB))
         ;
-    SYSCFG_SRAMCFG1 |= 1U;
-    RCU_CFG0 = (RCU_CFG0 & ~3U) | 3U;
-    while ((RCU_CFG0 & 0x0c) != 0x0c)
+    SYSCFG_SRAMCFG1 |= SYSCFG_SRAMCFG1_TCM_WAITSTATE;
+    RCU_CFG0 = (RCU_CFG0 & ~RCU_CFG0_SCS) | RCU_CKSYSSRC_PLL0P;
+    while ((RCU_CFG0 & RCU_CFG0_SCSS) != RCU_SCSS_PLL0P)
         ;
 }
 
@@ -212,7 +146,7 @@ armcm_main(void)
 
     clock_setup();
     SCB_EnableICache();
-    SCB->VTOR = 0x08000000;
+    SCB->VTOR = CONFIG_FLASH_APPLICATION_ADDRESS;
     __DSB();
     __ISB();
     sched_main();

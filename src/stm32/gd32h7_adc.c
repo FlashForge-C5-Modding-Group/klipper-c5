@@ -11,23 +11,6 @@
 #include "internal.h" // GPIO
 #include "sched.h" // shutdown
 
-#define REG32(addr) (*(volatile uint32_t *)(addr))
-#define ADC_STAT           REG32(ADC2_BASE + 0x00)
-#define ADC_CTL0           REG32(ADC2_BASE + 0x04)
-#define ADC_CTL1           REG32(ADC2_BASE + 0x08)
-#define ADC_RSQ8           REG32(ADC2_BASE + 0x44)
-#define ADC_RDATA          REG32(ADC2_BASE + 0x64)
-#define ADC_SYNCCTL        REG32(ADC2_BASE + 0x304)
-
-#define ADC_STAT_EOC       (1U << 1)
-#define ADC_CTL1_ADON      (1U << 0)
-#define ADC_CTL1_RSTCLB    (1U << 3)
-#define ADC_CTL1_CLB       (1U << 2)
-#define ADC_CTL1_DAL       (1U << 11)
-#define ADC_CTL1_SWSTART   (1U << 30)
-#define ADC_RESOLUTION_Msk (3U << 24)
-#define ADC_ADCSCK_Msk     (0x0fU << 16)
-
 DECL_CONSTANT("ADC_MAX", 4095);
 
 enum adc_state {
@@ -56,18 +39,20 @@ pin_to_channel(uint32_t pin)
 static void
 adc_init(void)
 {
-    if (is_enabled_pclock(ADC2_BASE))
+    if (is_enabled_pclock(ADC2))
         return;
-    enable_pclock(ADC2_BASE);
-    ADC_SYNCCTL = (ADC_SYNCCTL & ~ADC_ADCSCK_Msk) | (9U << 16);
-    ADC_CTL0 &= ~ADC_RESOLUTION_Msk;
-    ADC_CTL1 = (ADC_CTL1 & ~ADC_CTL1_DAL) | ADC_CTL1_ADON;
+    enable_pclock(ADC2);
+    ADC_SYNCCTL(ADC2) =
+        (ADC_SYNCCTL(ADC2) & ~(ADC_SYNCCTL_ADCSCK | ADC_SYNCCTL_ADCCK))
+        | ADC_CLK_SYNC_HCLK_DIV4;
+    ADC_CTL0(ADC2) &= ~ADC_CTL0_DRES;
+    ADC_CTL1(ADC2) = (ADC_CTL1(ADC2) & ~ADC_CTL1_DAL) | ADC_CTL1_ADCON;
     udelay(1);
-    ADC_CTL1 |= ADC_CTL1_RSTCLB;
-    while (ADC_CTL1 & ADC_CTL1_RSTCLB)
+    ADC_CTL1(ADC2) |= ADC_CTL1_RSTCLB;
+    while (ADC_CTL1(ADC2) & ADC_CTL1_RSTCLB)
         ;
-    ADC_CTL1 |= ADC_CTL1_CLB;
-    while (ADC_CTL1 & ADC_CTL1_CLB)
+    ADC_CTL1(ADC2) |= ADC_CTL1_CLB;
+    while (ADC_CTL1(ADC2) & ADC_CTL1_CLB)
         ;
 }
 
@@ -86,26 +71,26 @@ gpio_adc_setup(uint32_t pin)
     }
     uint32_t token = (++owner_sequence << 5) | channel;
     irq_restore(flag);
-    return (struct gpio_adc){ .adc = (void *)ADC2_BASE, .chan = token };
+    return (struct gpio_adc){ .adc = (void *)ADC2, .chan = token };
 }
 
 static void
 adc_drain_completion(void)
 {
-    (void)ADC_RDATA;
+    (void)ADC_RDATA(ADC2);
 }
 
 uint32_t
 gpio_adc_sample(struct gpio_adc g)
 {
     irqstatus_t flag = irq_save();
-    if (g.adc != (void *)ADC2_BASE) {
+    if (g.adc != (void *)ADC2) {
         irq_restore(flag);
         shutdown("Not a valid ADC pin");
     }
 
     if (adc_state == ADC_DISCARD_PENDING) {
-        if (!(ADC_STAT & ADC_STAT_EOC)) {
+        if (!(ADC_STAT(ADC2) & ADC_STAT_EOC)) {
             irq_restore(flag);
             return timer_from_us(20);
         }
@@ -115,17 +100,18 @@ gpio_adc_sample(struct gpio_adc g)
     }
 
     if (adc_state == ADC_ACTIVE) {
-        uint8_t ready = active_token == g.chan && (ADC_STAT & ADC_STAT_EOC);
+        uint8_t ready = active_token == g.chan
+                        && (ADC_STAT(ADC2) & ADC_STAT_EOC);
         irq_restore(flag);
         return ready ? 0 : timer_from_us(20);
     }
 
-    if (ADC_STAT & ADC_STAT_EOC)
+    if (ADC_STAT(ADC2) & ADC_STAT_EOC)
         adc_drain_completion();
     active_token = g.chan;
     adc_state = ADC_ACTIVE;
-    ADC_RSQ8 = (638U << 5) | (g.chan & 31U);
-    ADC_CTL1 |= ADC_CTL1_SWSTART;
+    ADC_RSQ8(ADC2) = SQX_SMP(638U) | (g.chan & ADC_RSQX_RSQN);
+    ADC_CTL1(ADC2) |= ADC_CTL1_SWRCST;
     irq_restore(flag);
     return timer_from_us(20);
 }
@@ -134,12 +120,12 @@ uint16_t
 gpio_adc_read(struct gpio_adc g)
 {
     irqstatus_t flag = irq_save();
-    if (g.adc != (void *)ADC2_BASE || adc_state != ADC_ACTIVE
-        || active_token != g.chan || !(ADC_STAT & ADC_STAT_EOC)) {
+    if (g.adc != (void *)ADC2 || adc_state != ADC_ACTIVE
+        || active_token != g.chan || !(ADC_STAT(ADC2) & ADC_STAT_EOC)) {
         irq_restore(flag);
         return 0;
     }
-    uint16_t value = ADC_RDATA;
+    uint16_t value = ADC_RDATA(ADC2);
     adc_state = ADC_IDLE;
     active_token = 0;
     irq_restore(flag);
@@ -150,9 +136,9 @@ void
 gpio_adc_cancel_sample(struct gpio_adc g)
 {
     irqstatus_t flag = irq_save();
-    if (g.adc == (void *)ADC2_BASE && adc_state == ADC_ACTIVE
+    if (g.adc == (void *)ADC2 && adc_state == ADC_ACTIVE
         && active_token == g.chan) {
-        if (ADC_STAT & ADC_STAT_EOC) {
+        if (ADC_STAT(ADC2) & ADC_STAT_EOC) {
             adc_drain_completion();
             adc_state = ADC_IDLE;
             active_token = 0;
