@@ -8,6 +8,10 @@
 #include "c5_levelboard.h" // c5_levelboard_capture
 #include "internal.h" // enable_pclock
 #include "sched.h" // DECL_INIT
+#ifndef N32G430_DMA_CHANNEL_WRITE
+#define N32G430_DMA_CHANNEL_WRITE(reg, value) \
+    do { DMA1_Channel1->reg = (value); } while (0)
+#endif
 
 static volatile uint16_t dma_snapshot;
 static uint16_t previous_snapshot;
@@ -51,15 +55,17 @@ c5_levelboard_acquisition_init(void)
     TIM1->CR1 = TIM_CR1_CEN;
 
     enable_pclock(DMA1_BASE);
-    DMA1_Channel1->CPAR = (uint32_t)(uintptr_t)&TIM1->CNT;
-    DMA1_Channel1->CMAR = (uint32_t)(uintptr_t)&dma_snapshot;
-    DMA1_Channel1->CNDTR = 1;
-    DMA1_Channel1->CHSEL = 0x32 & DMA_CHSEL_REQUEST_Msk;
-    DMA1_Channel1->CCR = (DMA_CCR_CIRC | DMA_CCR_PSIZE_16
-                          | DMA_CCR_MSIZE_16 | DMA_CCR_PL_HIGH);
-    DMA1->IFCR = DMA_IFCR_CTCIF1;
+    N32G430_DMA_CHANNEL_WRITE(CCR, DMA1_Channel1->CCR & ~DMA_CCR_EN);
+    N32G430_DMA_CHANNEL_WRITE(CCR, 0);
+    DMA1->IFCR = DMA_IFCR_CHANNEL1_ALL;
+    N32G430_DMA_CHANNEL_WRITE(CPAR, (uint32_t)(uintptr_t)&TIM1->CNT);
+    N32G430_DMA_CHANNEL_WRITE(CMAR, (uint32_t)(uintptr_t)&dma_snapshot);
+    N32G430_DMA_CHANNEL_WRITE(CNDTR, 1);
+    N32G430_DMA_CHANNEL_WRITE(CHSEL, 0x32 & DMA_CHSEL_REQUEST_Msk);
+    N32G430_DMA_CHANNEL_WRITE(CCR, DMA_CCR_CIRC | DMA_CCR_PSIZE_16
+                             | DMA_CCR_MSIZE_16 | DMA_CCR_PL_HIGH);
     armcm_enable_irq(DMA1_Channel1_IRQHandler, DMA1_Channel1_IRQn, 0);
-    DMA1_Channel1->CCR |= DMA_CCR_TCIE;
-    DMA1_Channel1->CCR |= DMA_CCR_EN;
+    N32G430_DMA_CHANNEL_WRITE(CCR, DMA1_Channel1->CCR | DMA_CCR_TCIE);
+    N32G430_DMA_CHANNEL_WRITE(CCR, DMA1_Channel1->CCR | DMA_CCR_EN);
 }
 DECL_INIT(c5_levelboard_acquisition_init);

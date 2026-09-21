@@ -4,10 +4,28 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include <stddef.h> // NULL
+#ifdef N32G430_REGISTER_MODEL
+#include "n32g430_register_model.h"
+#else
 #include "autoconf.h" // CONFIG_CLOCK_FREQ
 #include "board/armcm_boot.h" // VectorTable
 #include "internal.h" // struct cline
 #include "sched.h" // sched_main
+#endif
+
+// Clock setup runs from the fixed 8MHz HSI.  Two million polls give at
+// least 250ms even if a complete poll could execute in a single cycle.
+#define N32G430_HSI_CLOCK_FREQ 8000000u
+#define N32G430_CLOCK_TIMEOUT_MS 250u
+#define N32G430_CLOCK_TIMEOUT \
+    ((N32G430_HSI_CLOCK_FREQ / 1000u) * N32G430_CLOCK_TIMEOUT_MS)
+#ifndef N32G430_WAIT_POLL
+#define N32G430_WAIT_POLL(reg, mask, expected) do { } while (0)
+#endif
+#ifndef N32G430_RESET_REQUESTED
+#define N32G430_RESET_REQUESTED() do { } while (0)
+#endif
 
 // Return the enable and reset controls for the peripherals supported here.
 struct cline
@@ -15,7 +33,7 @@ lookup_clock_line(uint32_t periph_base)
 {
     switch (periph_base) {
     case DMA1_BASE:
-        return (struct cline){ .en=&RCC->AHBENR, .rst=&RCC->AHBRSTR,
+        return (struct cline){ .en=&RCC->AHBENR, .rst=NULL,
                               .bit=RCC_AHBENR_DMA1EN };
     case GPIOA_BASE:
         return (struct cline){ .en=&RCC->AHBENR, .rst=&RCC->AHBRSTR,
@@ -48,8 +66,6 @@ uint32_t
 get_pclock_frequency(uint32_t periph_base)
 {
     switch (periph_base) {
-    case IWDG_BASE:
-        return CONFIG_CLOCK_FREQ / 4;
     case USART1_BASE:
         return CONFIG_CLOCK_FREQ / 2;
     case TIM1_BASE:
@@ -84,22 +100,46 @@ gpio_clock_enable(GPIO_TypeDef *regs)
     RCC->AHBENR;
 }
 
+void noinline __noreturn
+n32g430_clock_fail(void)
+{
+    __disable_irq();
+    __DSB();
+    SCB->AIRCR = ((0x5fau << SCB_AIRCR_VECTKEY_Pos)
+                  | (SCB->AIRCR & SCB_AIRCR_PRIGROUP_Msk)
+                  | SCB_AIRCR_SYSRESETREQ_Msk);
+    __DSB();
+    N32G430_RESET_REQUESTED();
+    for (;;)
+        __NOP();
+}
+
+void noinline
+n32g430_wait_mask_or_reset(volatile uint32_t *reg, uint32_t mask,
+                           uint32_t expected)
+{
+    for (uint32_t timeout = N32G430_CLOCK_TIMEOUT; timeout; timeout--) {
+        N32G430_WAIT_POLL(reg, mask, expected);
+        if ((*reg & mask) == expected)
+            return;
+    }
+    n32g430_clock_fail();
+}
+
 static void
 clock_setup(void)
 {
     // Revert to the HSI regardless of the clock state the boot stage
     // leaves behind; the PLL can not be disabled while it drives SYSCLK.
     RCC->CR |= RCC_CR_HSION;
-    while (!(RCC->CR & RCC_CR_HSIRDY))
-        ;
+    n32g430_wait_mask_or_reset(&RCC->CR, RCC_CR_HSIRDY, RCC_CR_HSIRDY);
     RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW_Msk) | RCC_CFGR_SW_HSI;
-    while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI)
-        ;
+    n32g430_wait_mask_or_reset(&RCC->CFGR, RCC_CFGR_SWS_Msk,
+                               RCC_CFGR_SWS_HSI);
 
     // Clock-tree fields may only change while the PLL is disabled.
     RCC->CR &= ~RCC_CR_PLLON;
-    while (RCC->CR & RCC_CR_PLLRDY)
-        ;
+    n32g430_wait_mask_or_reset(&RCC->CR, RCC_CR_PLLRDY, 0);
 
     // Establish the public 128MHz flash timing before raising SYSCLK.
     uint32_t acr = FLASH->ACR;
@@ -108,8 +148,7 @@ clock_setup(void)
 
     // Use the crystal/resonator HSE path and wait until it is stable.
     RCC->CR = (RCC->CR & ~RCC_CR_HSEBYP) | RCC_CR_HSEON;
-    while (!(RCC->CR & RCC_CR_HSERDY))
-        ;
+    n32g430_wait_mask_or_reset(&RCC->CR, RCC_CR_HSERDY, RCC_CR_HSERDY);
 
     // HSE / 2 * 32 gives 128MHz HCLK; APB1 and APB2 are 32/64MHz.
     uint32_t cfgr = RCC->CFGR;
@@ -124,12 +163,11 @@ clock_setup(void)
     RCC->CFGR2 &= ~RCC_CFGR2_TIM1_8_SEL;
 
     RCC->CR |= RCC_CR_PLLON;
-    while (!(RCC->CR & RCC_CR_PLLRDY))
-        ;
+    n32g430_wait_mask_or_reset(&RCC->CR, RCC_CR_PLLRDY, RCC_CR_PLLRDY);
 
     RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW_Msk) | RCC_CFGR_SW_PLL;
-    while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_PLL)
-        ;
+    n32g430_wait_mask_or_reset(&RCC->CFGR, RCC_CFGR_SWS_Msk,
+                               RCC_CFGR_SWS_PLL);
 }
 
 // Main entry point - called from armcm_boot.c:ResetHandler().
