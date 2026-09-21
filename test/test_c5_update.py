@@ -860,7 +860,8 @@ class MainboardProfileTests(unittest.TestCase):
         for name in sorted(MAINBOARD_REQUIRED_CONSTANTS):
             constants = dict(MAINBOARD_REQUIRED_CONSTANTS)
             value = constants[name]
-            constants[name] = value + 1 if isinstance(value, int) else value + "x"
+            constants[name] = (
+                value + 1 if isinstance(value, int) else value + "x")
             with self.subTest(constant=name), self.assertRaisesRegex(
                     TOOL.ToolError, "dictionary constant"):
                 TOOL._load_dictionary(
@@ -1153,11 +1154,13 @@ class N32G45xRegisterModelTests(unittest.TestCase):
                     compiled, executable = self.compile_model(
                         Path(temp), reference_frequency)
                     self.assertEqual(
-                        compiled.returncode, 0, compiled.stdout + compiled.stderr)
+                        compiled.returncode, 0,
+                        compiled.stdout + compiled.stderr)
                     executed = subprocess.run(
                         [str(executable)], capture_output=True, text=True)
                     self.assertEqual(
-                        executed.returncode, 0, executed.stdout + executed.stderr)
+                        executed.returncode, 0,
+                        executed.stdout + executed.stderr)
                     self.assertEqual(
                         executed.stdout.strip(),
                         "ref=%d clock=144000000 model-ok"
@@ -1298,7 +1301,8 @@ class RealFirmwareTests(unittest.TestCase):
         paths = self.heaterboard_build_report["products"]
         self.assertEqual(paths["firmware"], "heaterBoard.hex")
         for key in ("elf", "bin", "firmware", "dictionary", "config"):
-            self.assertTrue((self.heaterboard_output / paths[key]).is_file(), key)
+            self.assertTrue(
+                (self.heaterboard_output / paths[key]).is_file(), key)
         report = self.heaterboard_build_report["firmware"]
         self.assertEqual(report["bounds"]["application"],
                          [0x08010000, 0x08080000])
