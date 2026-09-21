@@ -811,6 +811,10 @@ c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
     float va, vb;
     inverse_transform(m->requested_d, m->requested_q,
                       sine, cosine, &va, &vb);
+    const float maximum_finite = 0x1.fffffep+127f;
+    if (!(va >= -maximum_finite && va <= maximum_finite
+          && vb >= -maximum_finite && vb <= maximum_finite))
+        return 2;
     va = clip_upper_lower(va, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
     vb = clip_upper_lower(vb, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
     m->previous_voltage_a = va;

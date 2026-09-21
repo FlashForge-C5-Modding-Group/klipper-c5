@@ -21,6 +21,9 @@
 
 static int failures;
 
+static void check_pwm_shape(const char *name,
+                            const struct c5_mclib_output *out);
+
 #define CHECK(condition, message) do {                                  \
         if (!(condition)) {                                             \
             fprintf(stderr, "%s\n", (message));                        \
@@ -74,6 +77,7 @@ expect_output(const char *name, const struct c5_mclib_output *out,
                 name, i, expected[i], out->compare[i]);
         failures++;
     }
+    check_pwm_shape(name, out);
 }
 
 static uint8_t
@@ -106,6 +110,10 @@ output_is_sentinel(const struct c5_mclib_output *out)
 static void
 check_pwm_shape(const char *name, const struct c5_mclib_output *out)
 {
+    if (out->signs & ~3u) {
+        fprintf(stderr, "%s invalid sign bits: %u\n", name, out->signs);
+        failures++;
+    }
     for (uint8_t phase = 0; phase < 2; phase++) {
         const uint32_t *v = &out->compare[phase * 4];
         uint8_t negative = (out->signs >> phase) & 1u;
@@ -121,7 +129,7 @@ check_pwm_shape(const char *name, const struct c5_mclib_output *out)
             failures++;
         }
         for (uint8_t i = 0; i < 4; i++) {
-            if (v[i] <= 15000u)
+            if (v[i] <= 14999u)
                 continue;
             fprintf(stderr, "%s phase %u compare %u exceeds period\n",
                     name, phase, v[i]);
@@ -188,14 +196,12 @@ test_reference_waveforms(void)
     CHECK(c5_mclib_update(&m, 0, 0.0f, 0.0f, &out) == 1,
           "zero-current update admission");
     expect_output("zero-current waveform", &out, 0, zero_current);
-    check_pwm_shape("zero-current waveform", &out);
 
     setup_z(&m, 1000, 1000);
     c5_mclib_enable(&m, 0);
     CHECK(c5_mclib_update(&m, 0, 0.0f, 0.0f, &out) == 1,
           "one-amp update admission");
     expect_output("one-amp waveform", &out, 1, one_amp);
-    check_pwm_shape("one-amp waveform", &out);
 
     setup_z(&m, 1000, 1000);
     c5_mclib_direction(&m, 1);
@@ -700,6 +706,24 @@ test_zero_period_steps(void)
                   &out, 1, zero_period);
 }
 
+static void
+test_nonfinite_control_faults(void)
+{
+    struct c5_mclib_motor m;
+    struct c5_mclib_output out;
+
+    setup_z(&m, 1000, 1000);
+    c5_mclib_enable(&m, 0);
+    m.q_pi.integral = NAN;
+    CHECK(c5_mclib_update(&m, 0, 0.0f, 0.0f, &out) == 2,
+          "NaN control state must report an invalid-output fault");
+
+    setup_z(&m, 1000, 1000);
+    c5_mclib_enable(&m, 0);
+    CHECK(c5_mclib_update(&m, 0, INFINITY, INFINITY, &out) == 2,
+          "infinite currents must report an invalid-output fault");
+}
+
 int
 main(void)
 {
@@ -713,5 +737,6 @@ main(void)
     test_retained_fast_history();
     test_pi_saturation_reversal_recovery();
     test_zero_period_steps();
+    test_nonfinite_control_faults();
     return failures ? 1 : 0;
 }

@@ -10,18 +10,70 @@
 
 #define REG32(addr) (*(volatile uint32_t *)(addr))
 
-#define RCU_CTL             REG32(RCU_BASE + 0x00)
-#define RCU_PLL0            REG32(RCU_BASE + 0x04)
-#define RCU_CFG0            REG32(RCU_BASE + 0x08)
-#define RCU_INT             REG32(RCU_BASE + 0x0c)
-#define RCU_PLL1            REG32(RCU_BASE + 0x10)
-#define RCU_PLL2            REG32(RCU_BASE + 0x14)
-#define RCU_PLLADDCTL       REG32(RCU_BASE + 0x80)
-#define RCU_PLL0FRA         REG32(RCU_BASE + 0x84)
-#define RCU_PLL1FRA         REG32(RCU_BASE + 0x88)
-#define RCU_PLL2FRA         REG32(RCU_BASE + 0x8c)
-#define RCU_PLLALL          REG32(RCU_BASE + 0x98)
+#define RCU_CTL_OFFSET          0x00U
+#define RCU_PLL0_OFFSET         0x04U
+#define RCU_CFG0_OFFSET         0x08U
+#define RCU_INT_OFFSET          0x0cU
+#define RCU_AHB1RST_OFFSET      0x10U
+#define RCU_AHB2RST_OFFSET      0x14U
+#define RCU_PLLADDCTL_OFFSET    0x80U
+#define RCU_PLL1_OFFSET         0x84U
+#define RCU_PLL2_OFFSET         0x88U
+#define RCU_CFG1_OFFSET         0x8cU
+#define RCU_CFG2_OFFSET         0x90U
+#define RCU_CFG3_OFFSET         0x94U
+#define RCU_PLLALL_OFFSET       0x98U
+#define RCU_PLL0FRA_OFFSET      0x9cU
+#define RCU_PLL1FRA_OFFSET      0xa0U
+#define RCU_PLL2FRA_OFFSET      0xa4U
+
+#define RCU_CTL             REG32(RCU_BASE + RCU_CTL_OFFSET)
+#define RCU_PLL0            REG32(RCU_BASE + RCU_PLL0_OFFSET)
+#define RCU_CFG0            REG32(RCU_BASE + RCU_CFG0_OFFSET)
+#define RCU_INT             REG32(RCU_BASE + RCU_INT_OFFSET)
+#define RCU_PLLADDCTL       REG32(RCU_BASE + RCU_PLLADDCTL_OFFSET)
+#define RCU_PLL1            REG32(RCU_BASE + RCU_PLL1_OFFSET)
+#define RCU_PLL2            REG32(RCU_BASE + RCU_PLL2_OFFSET)
+#define RCU_CFG1            REG32(RCU_BASE + RCU_CFG1_OFFSET)
+#define RCU_CFG2            REG32(RCU_BASE + RCU_CFG2_OFFSET)
+#define RCU_CFG3            REG32(RCU_BASE + RCU_CFG3_OFFSET)
+#define RCU_PLLALL          REG32(RCU_BASE + RCU_PLLALL_OFFSET)
+#define RCU_PLL0FRA         REG32(RCU_BASE + RCU_PLL0FRA_OFFSET)
+#define RCU_PLL1FRA         REG32(RCU_BASE + RCU_PLL1FRA_OFFSET)
+#define RCU_PLL2FRA         REG32(RCU_BASE + RCU_PLL2FRA_OFFSET)
 #define SYSCFG_SRAMCFG1     REG32(SYSCFG_BASE + 0x68)
+
+_Static_assert(RCU_BASE + RCU_CTL_OFFSET == 0x58024400UL
+               && RCU_BASE + RCU_PLL0_OFFSET == 0x58024404UL
+               && RCU_BASE + RCU_CFG0_OFFSET == 0x58024408UL
+               && RCU_BASE + RCU_INT_OFFSET == 0x5802440cUL,
+               "RCU primary clock-register addresses mismatch");
+_Static_assert(RCU_BASE + RCU_AHB1RST_OFFSET == 0x58024410UL
+               && RCU_BASE + RCU_AHB2RST_OFFSET == 0x58024414UL,
+               "RCU AHB reset-register addresses mismatch");
+_Static_assert(RCU_BASE + RCU_PLLADDCTL_OFFSET == 0x58024480UL,
+               "RCU PLLADDCTL address mismatch");
+_Static_assert(RCU_BASE + RCU_PLL1_OFFSET == 0x58024484UL,
+               "RCU PLL1 address mismatch");
+_Static_assert(RCU_BASE + RCU_PLL2_OFFSET == 0x58024488UL,
+               "RCU PLL2 address mismatch");
+_Static_assert(RCU_BASE + RCU_CFG1_OFFSET == 0x5802448cUL,
+               "RCU CFG1 address mismatch");
+_Static_assert(RCU_BASE + RCU_CFG2_OFFSET == 0x58024490UL,
+               "RCU CFG2 address mismatch");
+_Static_assert(RCU_BASE + RCU_CFG3_OFFSET == 0x58024494UL,
+               "RCU CFG3 address mismatch");
+_Static_assert(RCU_BASE + RCU_PLLALL_OFFSET == 0x58024498UL,
+               "RCU PLLALL address mismatch");
+_Static_assert(RCU_BASE + RCU_PLL0FRA_OFFSET == 0x5802449cUL,
+               "RCU PLL0FRA address mismatch");
+_Static_assert(RCU_BASE + RCU_PLL1FRA_OFFSET == 0x580244a0UL,
+               "RCU PLL1FRA address mismatch");
+_Static_assert(RCU_BASE + RCU_PLL2FRA_OFFSET == 0x580244a4UL,
+               "RCU PLL2FRA address mismatch");
+_Static_assert(RCU_PLL1_OFFSET != RCU_AHB1RST_OFFSET
+               && RCU_PLL2_OFFSET != RCU_AHB2RST_OFFSET,
+               "RCU PLL registers must not alias AHB reset registers");
 
 #define RCU_CTL_HXTALEN     (1U << 16)
 #define RCU_CTL_HXTALSTB    (1U << 17)
@@ -121,9 +173,6 @@ clock_setup(void)
     RCU_PLL1 = 0x01012020;
     RCU_PLL2 = 0x01012020;
     RCU_PLLADDCTL = 0;
-    RCU_PLL0FRA = 0;
-    RCU_PLL1FRA = 0;
-    RCU_PLL2FRA = 0;
     RCU_INT = 0x14ff0000;
 
     RCU_CTL |= RCU_CTL_HXTALEN;
@@ -136,6 +185,8 @@ clock_setup(void)
     RCU_PLL0 = 0x01001dc5;
     RCU_PLLADDCTL = 0x03800001;
     RCU_PLL0FRA = 0;
+    RCU_PLL1FRA = 0;
+    RCU_PLL2FRA = 0;
 
     RCU_CTL |= RCU_CTL_PLL0EN;
     while (!(RCU_CTL & RCU_CTL_PLL0STB))
