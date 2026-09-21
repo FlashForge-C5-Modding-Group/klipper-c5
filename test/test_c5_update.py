@@ -1811,7 +1811,7 @@ class PackageTransformationTests(unittest.TestCase):
             "./levelBoard.hex": b"old-level-board",
             "./mainBoardGD.hex": b"unrelated-main-board",
             "./mcu.img": b"display-image",
-            "./run.sh": b"#!/bin/sh\necho stock-control\n",
+            "./run.sh": b"#!/bin/sh\necho stock-control\nexit 0\n",
             "./Update": b"",
         }
         checksum_order = [
@@ -1912,6 +1912,28 @@ class PackageTransformationTests(unittest.TestCase):
             b"rm /usr/prog/wifi/8821cu.ko*\nsync\necho keep\n")
         self.assertEqual(TOOL._suppress_space_reclaim(outer, True),
                          b"echo keep\n")
+
+    def test_update_marker_removed_before_unique_success_exit(self):
+        script = (b"#!/bin/sh\n"
+                  b"if [ -f gd.log ];then\n"
+                  b" if ! grep -q finished gd.log; then\n"
+                  b"  touch $WORK_DIR/Update\n"
+                  b"  sleep 10000\n"
+                  b" fi\nfi\n"
+                  b"sync\nsleep 3\n\n"
+                  b"exit 0\n")
+        transformed = TOOL._remove_update_marker(script)
+        expected = script.replace(
+            b"exit 0\n", b"rm -f $WORK_DIR/Update\nsync\n\nexit 0\n")
+        self.assertEqual(transformed, expected)
+        self.assertIn(b"touch $WORK_DIR/Update", transformed)
+        TOOL._check_shell_syntax(transformed, shutil.which("sh"))
+        for bad in (script + b"exit 0\n",
+                    script.replace(b"exit 0\n", b"exit 1\n")):
+            with self.assertRaisesRegex(
+                    TOOL.ToolError, "unique success exit"):
+                TOOL._remove_update_marker(bad)
+
     def test_reduced_plaintext_is_reproducible_and_exactly_allowlisted(self):
         unused, profile = self._template()
         replacement = ihex()

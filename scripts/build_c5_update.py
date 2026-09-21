@@ -2234,6 +2234,19 @@ def _filter_result_checks(data, selected_boards):
     kept = b"".join(by_board[board] + b"\n"
                        for board in _canonical_boards(selected_boards))
     return data[:begin] + kept + data[finish:]
+
+
+def _remove_update_marker(data):
+    exit_line = b"exit 0\n"
+    if data.count(exit_line) != 1:
+        raise ToolError("control script has no unique success exit for "
+                        "update marker removal")
+    index = data.index(exit_line)
+    removal = (b"rm -f $WORK_DIR/Update\n"
+                b"sync\n\n")
+    return data[:index] + removal + data[index:]
+
+
 def _check_shell_syntax(data, shell="sh", label="outer installer"):
     program = _program_path(shell, "sh")
     try:
@@ -2299,6 +2312,7 @@ def _build_reduced_plaintext(profile, firmware_data, shell="sh",
     control_script = _suppress_space_reclaim(
         control["./run.sh"]["_data"], False)
     control_script = _filter_result_checks(control_script, selected_boards)
+    control_script = _remove_update_marker(control_script)
     _check_shell_syntax(control_script, shell, "control script")
     control_data = {
         "./mcu.img": control["./mcu.img"]["_data"],
@@ -2614,6 +2628,8 @@ def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
         {"effect": "NIM log deletion", "status": "suppressed"},
         {"effect": "persistent startup image replacement",
          "status": "suppressed"},
+        {"effect": "pending-update marker removal on success",
+         "status": "added"},
     ]
     reclaim_templates = {profile["plaintext"]
                          for profile in CANONICAL_TEMPLATE_PROFILES
