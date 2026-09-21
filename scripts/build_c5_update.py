@@ -2237,13 +2237,15 @@ def _filter_result_checks(data, selected_boards):
 
 
 def _remove_update_marker(data):
-    exit_line = b"exit 0\n"
-    if data.count(exit_line) != 1:
-        raise ToolError("control script has no unique success exit for "
-                        "update marker removal")
-    index = data.index(exit_line)
-    removal = (b"rm -f $WORK_DIR/Update\n"
-                b"sync\n\n")
+    # Stock resolves WORK_DIR as "." and the version pruning below changes
+    # the working directory, so the marker must be removed before that cd
+    # for $WORK_DIR/Update to name the installed marker file.
+    anchor = b"cd /usr/prog/PROGRAM/control/\n"
+    if data.count(anchor) != 1:
+        raise ToolError("control script has no unique version-prune change "
+                        "of directory for update marker removal")
+    index = data.index(anchor)
+    removal = b"rm -f $WORK_DIR/Update\nsync\n\n"
     return data[:index] + removal + data[index:]
 
 
