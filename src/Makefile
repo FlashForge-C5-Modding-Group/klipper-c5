@@ -2,6 +2,7 @@
 
 src-y += sched.c command.c basecmd.c debugcmds.c
 src-$(CONFIG_C5_MAINBOARDGD) += c5_mainboardgd.c c5_mclib.c
+src-$(CONFIG_C5_MAINBOARDGD_DIAGNOSTICS) += c5_mainboardgd_diag.c
 src-$(CONFIG_C5_LEVELBOARD) += c5_levelboard.c
 src-$(CONFIG_C5_EBOARD) += c5_eboard.c c5_eboard_pa.c
 src-$(CONFIG_C5_HEATERBOARD) += c5_heaterboard.c

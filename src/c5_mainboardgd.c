@@ -5,9 +5,11 @@
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
 #include <stdint.h>
+#include "autoconf.h" // CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
 #include "basecmd.h" // oid_alloc
 #include "board/irq.h" // irq_save
 #include "c5_mainboardgd.h" // c5_mainboardgd_init_motors
+#include "c5_mainboardgd_diag.h" // c5_mainboardgd_diag_snapshot
 #include "command.h" // DECL_COMMAND
 #include "sched.h" // sched_is_shutdown
 
@@ -243,3 +245,44 @@ command_mainboardgd_get_emcu_pa_value(uint32_t *args)
     sendf("pa_value value=%u", 0u);
 }
 DECL_COMMAND(command_mainboardgd_get_emcu_pa_value, "get_emcu_pa_value");
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+void
+command_mainboardgd_query_diag(uint32_t *args)
+{
+    (void)args;
+    struct c5_mainboardgd_diag diag;
+    struct c5_mainboardgd_hw_diag hw;
+    uint8_t mode[C5_MAINBOARDGD_MOTOR_COUNT];
+    uint8_t stall[C5_MAINBOARDGD_MOTOR_COUNT];
+
+    irqstatus_t flag = irq_save();
+    c5_mainboardgd_diag_snapshot(&diag);
+    c5_mainboardgd_hw_diag_snapshot(&hw);
+    uint_fast8_t axis;
+    for (axis = 0; axis < C5_MAINBOARDGD_MOTOR_COUNT; axis++) {
+        mode[axis] = motors[axis].mode;
+        stall[axis] = motors[axis].stall;
+    }
+    if (sched_is_shutdown())
+        hw.flags |= C5_MAINBOARDGD_DIAG_CURRENT_STOP;
+    irq_restore(flag);
+
+    sendf("mainboardgd_diag reset_status=%u fault_pc=%u fault_lr=%u"
+          " cfsr=%u hfsr=%u boot_count=%u flags=%u",
+          hw.reset_status, hw.fault_pc, hw.fault_lr, hw.cfsr, hw.hfsr,
+          hw.boot_count, hw.flags);
+    sendf("mainboardgd_diag_hw adc0=%u adc1=%u dma=%u",
+          hw.adc_stat0, hw.adc_stat1, hw.dma_intf);
+    for (axis = 0; axis < C5_MAINBOARDGD_MOTOR_COUNT; axis++) {
+        const struct c5_mainboardgd_motor_diag *motor = &diag.motor[axis];
+        sendf("mainboardgd_diag_motor axis=%c isr_count=%u error_count=%u"
+              " idle_count=%u last_event=%c previous_event=%c mode=%c"
+              " stall=%c max_isr_ticks=%u",
+              axis, motor->isr_count, motor->error_count,
+              motor->idle_count, motor->last_event, hw.previous_event[axis],
+              mode[axis], stall[axis], motor->max_isr_ticks);
+    }
+}
+DECL_COMMAND_FLAGS(command_mainboardgd_query_diag, HF_IN_SHUTDOWN,
+                   "mainboardgd_query_diag");
+#endif

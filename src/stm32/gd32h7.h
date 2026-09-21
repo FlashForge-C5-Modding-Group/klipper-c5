@@ -149,6 +149,14 @@ typedef struct {
 #define RCU_PLLADDCTL_PLL0PEN BIT(25)
 #define RCU_RSTSCK_IRC32KEN   BIT(0)
 #define RCU_RSTSCK_IRC32KSTB  BIT(1)
+#define RCU_RSTSCK_RSTFC      BIT(24)
+#define RCU_RSTSCK_BORRSTF    BIT(25)
+#define RCU_RSTSCK_EPRSTF     BIT(26)
+#define RCU_RSTSCK_PORRSTF    BIT(27)
+#define RCU_RSTSCK_SWRSTF     BIT(28)
+#define RCU_RSTSCK_FWDGTRSTF  BIT(29)
+#define RCU_RSTSCK_WWDGTRSTF  BIT(30)
+#define RCU_RSTSCK_LPRSTF     BIT(31)
 
 #define CFG0_SCS(regval) \
     (BITS(0, 1) & ((uint32_t)(regval) << 0U))
@@ -347,6 +355,7 @@ typedef struct {
 
 #define ADC_STAT_EOC        BIT(1)
 #define ADC_STAT_EOIC       BIT(2)
+#define ADC_STAT_ROVF       BIT(5)
 #define ADC_CTL0_EOICIE     BIT(7)
 #define ADC_CTL0_SM         BIT(8)
 #define ADC_CTL0_DRES       BITS(24, 25)
@@ -406,6 +415,9 @@ typedef struct {
 #define DMAMUX_RM_CHXCFG(channel) \
     REG32(DMAMUX + 0x04U * (uint32_t)(channel))
 
+#define DMA_INTF_FEEIF          BIT(0)
+#define DMA_INTF_SDEIF          BIT(2)
+#define DMA_INTF_TAEIF          BIT(3)
 #define DMA_INTF_FTFIF          BIT(5)
 #define DMA_INTC_FEEIFC         BIT(0)
 #define DMA_INTC_SDEIFC         BIT(2)

@@ -8,6 +8,7 @@
 #include "board/irq.h" // irq_save
 #include "command.h" // shutdown
 #include "c5_mainboardgd.h" // c5_mainboardgd_control
+#include "c5_mainboardgd_diag.h" // c5_mainboardgd_diag_isr
 #include "generic/armcm_boot.h" // armcm_enable_irq
 #include "generic/armcm_timer.h" // udelay
 #include "internal.h" // enable_pclock
@@ -50,6 +51,119 @@ static const uint32_t pwm_bases[] = {
 static struct c5_mclib_acq acquisitions[3];
 static volatile uint32_t dma_samples_y[2] __attribute__((aligned(4)));
 static volatile uint32_t dma_samples_z[2] __attribute__((aligned(4)));
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+#define C5_DIAG_DTCM_ADDRESS ((uint32_t)0x20000000U)
+#define C5_DIAG_MAGIC ((uint32_t)0x43443544U)
+#define C5_DIAG_VERSION ((uint32_t)1U)
+#define C5_DIAG_RESET_MASK ((uint32_t)0xfe000000U)
+
+struct c5_mainboardgd_persistent_diag {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t boot_count;
+    uint32_t flags;
+    uint32_t fault_pc;
+    uint32_t fault_lr;
+    uint32_t cfsr;
+    uint32_t hfsr;
+    uint32_t last_event[C5_MAINBOARDGD_MOTOR_COUNT];
+};
+
+static volatile struct c5_mainboardgd_persistent_diag *const persistent_diag =
+    (void *)C5_DIAG_DTCM_ADDRESS;
+static struct c5_mainboardgd_hw_diag hardware_diag;
+static volatile uint8_t persistent_diag_ready;
+
+static void
+c5_mainboardgd_diag_boot(void)
+{
+    uint32_t reset_status = RCU_RSTSCK & C5_DIAG_RESET_MASK;
+    hardware_diag.reset_status = reset_status;
+    uint8_t valid = !(reset_status & RCU_RSTSCK_PORRSTF)
+                    && persistent_diag->magic == C5_DIAG_MAGIC
+                    && persistent_diag->version == C5_DIAG_VERSION;
+    if (valid) {
+        hardware_diag.fault_pc = persistent_diag->fault_pc;
+        hardware_diag.fault_lr = persistent_diag->fault_lr;
+        hardware_diag.cfsr = persistent_diag->cfsr;
+        hardware_diag.hfsr = persistent_diag->hfsr;
+        hardware_diag.flags = persistent_diag->flags
+                              | C5_MAINBOARDGD_DIAG_PERSIST_VALID;
+        uint_fast8_t axis;
+        for (axis = 0; axis < C5_MAINBOARDGD_MOTOR_COUNT; axis++)
+            hardware_diag.previous_event[axis] =
+                persistent_diag->last_event[axis];
+    }
+
+    persistent_diag->magic = C5_DIAG_MAGIC;
+    persistent_diag->version = C5_DIAG_VERSION;
+    persistent_diag->boot_count = valid ? persistent_diag->boot_count + 1U : 1U;
+    hardware_diag.boot_count = persistent_diag->boot_count;
+    persistent_diag->flags = 0;
+    persistent_diag->fault_pc = 0;
+    persistent_diag->fault_lr = 0;
+    persistent_diag->cfsr = 0;
+    persistent_diag->hfsr = 0;
+    uint_fast8_t axis;
+    for (axis = 0; axis < C5_MAINBOARDGD_MOTOR_COUNT; axis++)
+        persistent_diag->last_event[axis] = 0;
+    c5_mainboardgd_diag_clear();
+    persistent_diag_ready = 1;
+    RCU_RSTSCK |= RCU_RSTSCK_RSTFC;
+}
+
+void
+c5_mainboardgd_hw_diag_snapshot(struct c5_mainboardgd_hw_diag *snapshot)
+{
+    *snapshot = hardware_diag;
+    snapshot->adc_stat0 = ADC_STAT(ADC0);
+    snapshot->adc_stat1 = ADC_STAT(ADC1);
+    snapshot->dma_intf = DMA_INTF0(DMA0);
+}
+
+void
+c5_mainboardgd_hw_diag_event(uint8_t axis, uint8_t event)
+{
+    if (!persistent_diag->last_event[axis])
+        persistent_diag->last_event[axis] = event;
+}
+
+void
+c5_mainboardgd_hw_diag_shutdown(void)
+{
+    persistent_diag->flags |= C5_MAINBOARDGD_DIAG_SHUTDOWN;
+}
+
+static void __attribute__((used, noreturn))
+c5_mainboardgd_hardfault(uint32_t *frame)
+{
+    __disable_irq();
+    persistent_diag->magic = C5_DIAG_MAGIC;
+    persistent_diag->version = C5_DIAG_VERSION;
+    uint32_t flags = C5_MAINBOARDGD_DIAG_HARDFAULT;
+    if (persistent_diag_ready)
+        flags |= persistent_diag->flags;
+    persistent_diag->flags = flags;
+    persistent_diag->fault_pc = frame[6];
+    persistent_diag->fault_lr = frame[5];
+    persistent_diag->cfsr = SCB->CFSR;
+    persistent_diag->hfsr = SCB->HFSR;
+    __DSB();
+    NVIC_SystemReset();
+}
+
+void __attribute__((naked))
+HardFault_Handler(void)
+{
+    asm volatile(
+        "tst lr, #4\n"
+        "ite eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "b c5_mainboardgd_hardfault");
+}
+DECL_ARMCM_IRQ(HardFault_Handler, -13);
+#endif
 
 static const struct c5_adc_sequence adc_sequences[] = {
     { ADC0, 8, 4, 5, 9 },
@@ -139,15 +253,30 @@ static void
 process_sample(uint8_t axis, int16_t raw0, int16_t raw1)
 {
     float ia, ib;
-    if (!c5_mclib_acquire(&acquisitions[axis], raw0, raw1, &ia, &ib))
+    if (!c5_mclib_acquire(&acquisitions[axis], raw0, raw1, &ia, &ib)) {
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+        c5_mainboardgd_diag_idle(axis);
+#endif
         return;
+    }
 
     struct c5_mclib_output out;
     uint32_t now = c5_mainboardgd_motor_time();
     uint8_t status = c5_mainboardgd_control(axis, now, ia, ib, &out);
-    if (!status)
+    if (!status) {
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+        c5_mainboardgd_diag_idle(axis);
+#endif
         return;
+    }
     if (status != 1 || !control_output_valid(&out)) {
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+        uint8_t event = status != 1 ? C5_DIAG_EVENT_MCLIB_OUTPUT
+                        : out.signs & ~3U ? C5_DIAG_EVENT_SIGNS
+                                         : C5_DIAG_EVENT_COMPARE;
+        c5_mainboardgd_diag_event(axis, event);
+        c5_mainboardgd_hw_diag_event(axis, event);
+#endif
         disable_all_pwm_outputs();
         shutdown("Invalid mainBoardGD PWM output");
         return;
@@ -155,29 +284,47 @@ process_sample(uint8_t axis, int16_t raw0, int16_t raw1)
     write_control_output(axis, &out);
 }
 
+static void
+process_dma(const struct c5_dma_stream *stream)
+{
+    uint32_t status = DMA_INTF0(DMA0);
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+    uint32_t started = c5_mainboardgd_motor_time();
+    uint32_t error_mask = DMA_FLAG_ADD(DMA_INTF_FEEIF | DMA_INTF_SDEIF
+                                       | DMA_INTF_TAEIF, stream->channel);
+    uint8_t dma_error = !!(status & error_mask);
+    uint8_t adc_error = !!(ADC_STAT(stream->adc_base) & ADC_STAT_ROVF);
+    c5_mainboardgd_diag_isr(stream->axis, dma_error || adc_error);
+    if (dma_error || adc_error) {
+        uint8_t event = adc_error ? C5_DIAG_EVENT_ADC_OVERRUN
+                                  : C5_DIAG_EVENT_DMA;
+        c5_mainboardgd_diag_event(stream->axis, event);
+        c5_mainboardgd_hw_diag_event(stream->axis, event);
+    }
+#endif
+    if (!(status & stream->ftf_flag))
+        return;
+    DMA_INTC0(DMA0) = stream->clear_mask;
+    int16_t raw0 = (int16_t)(uint16_t)stream->samples[0];
+    int16_t raw1 = (int16_t)(uint16_t)stream->samples[1];
+    process_sample(stream->axis, raw0, raw1);
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+    c5_mainboardgd_diag_timing(stream->axis, started,
+                               c5_mainboardgd_motor_time());
+#endif
+}
+
 void
 DMA0_Channel0_IRQHandler(void)
 {
-    uint32_t status = DMA_INTF0(DMA0);
-    if (!(status & dma_stream_y.ftf_flag))
-        return;
-    DMA_INTC0(DMA0) = dma_stream_y.clear_mask;
-    int16_t raw0 = (int16_t)(uint16_t)dma_stream_y.samples[0];
-    int16_t raw1 = (int16_t)(uint16_t)dma_stream_y.samples[1];
-    process_sample(dma_stream_y.axis, raw0, raw1);
+    process_dma(&dma_stream_y);
 }
 DECL_ARMCM_IRQ(DMA0_Channel0_IRQHandler, DMA0_Channel0_IRQn);
 
 void
 DMA0_Channel1_IRQHandler(void)
 {
-    uint32_t status = DMA_INTF0(DMA0);
-    if (!(status & dma_stream_z.ftf_flag))
-        return;
-    DMA_INTC0(DMA0) = dma_stream_z.clear_mask;
-    int16_t raw0 = (int16_t)(uint16_t)dma_stream_z.samples[0];
-    int16_t raw1 = (int16_t)(uint16_t)dma_stream_z.samples[1];
-    process_sample(dma_stream_z.axis, raw0, raw1);
+    process_dma(&dma_stream_z);
 }
 DECL_ARMCM_IRQ(DMA0_Channel1_IRQHandler, DMA0_Channel1_IRQn);
 
@@ -186,10 +333,18 @@ ADC_IRQHandler(void)
 {
     uint32_t stat0 = ADC_STAT(ADC0);
     if (stat0 & ADC_STAT_EOIC) {
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+        uint32_t started = c5_mainboardgd_motor_time();
+        c5_mainboardgd_diag_isr(0, 0);
+#endif
         int16_t raw0 = (int16_t)(uint16_t)ADC_IDATA0(ADC0);
         int16_t raw1 = (int16_t)(uint16_t)ADC_IDATA1(ADC0);
         ADC_STAT(ADC0) = ~ADC_STAT_EOIC;
         process_sample(0, raw0, raw1);
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+        c5_mainboardgd_diag_timing(0, started,
+                                   c5_mainboardgd_motor_time());
+#endif
     }
     if (ADC_STAT(ADC1) & ADC_STAT_EOIC)
         ADC_STAT(ADC1) = ~ADC_STAT_EOIC;
@@ -467,6 +622,9 @@ setup_motor_time(void)
 void
 c5_mainboardgd_hardware_init(void)
 {
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+    c5_mainboardgd_diag_boot();
+#endif
     c5_mainboardgd_init_motors();
     uint_fast8_t axis;
     for (axis = 0; axis < 3; axis++)
@@ -512,6 +670,9 @@ void
 c5_mainboardgd_shutdown(void)
 {
     irqstatus_t flag = irq_save();
+#if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
+    c5_mainboardgd_hw_diag_shutdown();
+#endif
     disable_all_pwm_outputs();
     c5_mainboardgd_enable(0, 0);
     c5_mainboardgd_enable(1, 0);
