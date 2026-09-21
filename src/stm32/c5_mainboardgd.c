@@ -52,7 +52,7 @@ static struct c5_mclib_acq acquisitions[3];
 static volatile uint32_t dma_samples_y[2] __attribute__((aligned(4)));
 static volatile uint32_t dma_samples_z[2] __attribute__((aligned(4)));
 #if CONFIG_C5_MAINBOARDGD_DIAGNOSTICS
-#define C5_DIAG_DTCM_ADDRESS ((uint32_t)0x20000000U)
+#define C5_DIAG_ITCM_ADDRESS ((uint32_t)0x00000000U)
 #define C5_DIAG_MAGIC ((uint32_t)0x43443544U)
 #define C5_DIAG_VERSION ((uint32_t)1U)
 #define C5_DIAG_RESET_MASK ((uint32_t)0xfe000000U)
@@ -70,7 +70,7 @@ struct c5_mainboardgd_persistent_diag {
 };
 
 static volatile struct c5_mainboardgd_persistent_diag *const persistent_diag =
-    (void *)C5_DIAG_DTCM_ADDRESS;
+    (void *)C5_DIAG_ITCM_ADDRESS;
 static struct c5_mainboardgd_hw_diag hardware_diag;
 static volatile uint8_t persistent_diag_ready;
 
