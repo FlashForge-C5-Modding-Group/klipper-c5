@@ -707,6 +707,28 @@ test_zero_period_steps(void)
 }
 
 static void
+test_stock_boot_microstep_defaults(void)
+{
+    struct c5_mclib_motor m;
+
+    c5_mclib_init(&m, 0);
+    c5_mclib_direction(&m, 1);
+    c5_mclib_step(&m, 0);
+    expect_u32("XY boot phase increment", m.phase, 8192u + 512u);
+    c5_mclib_enable(&m, 0);
+    c5_mclib_step(&m, 0);
+    expect_u32("XY boot stop timeout", m.last_period, 8333333u << 3);
+
+    c5_mclib_init(&m, 2);
+    c5_mclib_direction(&m, 1);
+    c5_mclib_step(&m, 0);
+    expect_u32("Z boot phase increment", m.phase, 8192u + 1024u);
+    c5_mclib_enable(&m, 0);
+    c5_mclib_step(&m, 0);
+    expect_u32("Z boot stop timeout", m.last_period, 8333333u << 4);
+}
+
+static void
 test_nonfinite_control_faults(void)
 {
     struct c5_mclib_motor m;
@@ -737,6 +759,7 @@ main(void)
     test_retained_fast_history();
     test_pi_saturation_reversal_recovery();
     test_zero_period_steps();
+    test_stock_boot_microstep_defaults();
     test_nonfinite_control_faults();
     return failures ? 1 : 0;
 }

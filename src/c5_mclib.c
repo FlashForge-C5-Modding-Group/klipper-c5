@@ -414,8 +414,6 @@ c5_mclib_init(struct c5_mclib_motor *m, uint8_t axis)
     memset(m, 0, sizeof(*m));
     m->axis = axis;
     m->phase = 8192u;
-    m->phase_increment = 16384u;
-    m->stop_timeout = 0x7f281500u;
     m->hold_delay = 100000000u;
     m->ramp_ticks = 200000000u;
     m->crossover_threshold = 2343u;
@@ -453,6 +451,8 @@ c5_mclib_init(struct c5_mclib_motor *m, uint8_t axis)
         m->exponent = 4u;
         m->stall_threshold = 3.1f;
     }
+    m->phase_increment = (uint16_t)arm_lsl(1u, 14u - m->exponent);
+    m->stop_timeout = arm_lsl(8333333u, 8u - m->exponent);
     pi_init(&m->outer_pi, 0.005f, 0x1.a36e2ep-15f, 1.0f, 1.0f);
     pi_reset(&m->d_pi);
     pi_reset(&m->q_pi);
