@@ -1870,6 +1870,48 @@ class PackageTransformationTests(unittest.TestCase):
                         "exactly one.*update_other|update_other.*exactly one"):
                     TOOL._suppress_update_other(bad)
 
+    def test_current_template_reducer_keeps_selected_failure_only(self):
+        control = (
+            b"# free 28M\nrm /usr/prog/qt-4.8.6 -rf\n"
+            b"# free 22M\nrm /usr/prog/opencv-4.10 -rf\n"
+            b"# free 3M\nrm /usr/prog/wifi/8821cu.ko*\nsync\n"
+            b"# check update result\n"
+            b"if [ -f eboard.log ];then\n"
+            b" if grep -q fail eboard.log; then\n"
+            b"  cat $WORK_DIR/eBoard_fail.img > /dev/fb0\n"
+            b" fi\nfi\n\n"
+            b"if [ -f heater.log ];then\n"
+            b" if grep -q fail heater.log; then\n"
+            b"  cat $WORK_DIR/heaterBoard_fail.img > /dev/fb0\n"
+            b" fi\nfi\n\n"
+            b"if [ -f level.log ];then\n"
+            b" if grep -q fail level.log; then\n"
+            b"  cat $WORK_DIR/levelBoard_fail.img > /dev/fb0\n"
+            b" fi\nfi\n\n"
+            b"if [ -f gd.log ];then\n"
+            b" if ! grep -q finished gd.log; then\n"
+            b"  cat $WORK_DIR/mcu_fail.img > /dev/fb0\n"
+            b" fi\nfi\n\n"
+            b"# remove small version\necho keep\n")
+        transformed = TOOL._suppress_space_reclaim(control, False)
+        transformed = TOOL._filter_result_checks(
+            transformed, ["mainBoardGD"])
+        self.assertNotIn(b"qt-4.8.6", transformed)
+        self.assertNotIn(b"eBoard_fail.img", transformed)
+        self.assertIn(b"if ! grep -q finished gd.log", transformed)
+        self.assertIn(b"mcu_fail.img", transformed)
+        TOOL._check_shell_syntax(transformed, shutil.which("sh"))
+
+        outer = (
+            b"rm /usr/prog/PROGRAM/control/*.tar.xz*\n"
+            b"rm /usr/prog/PROGRAM/library/*.tar.xz*\n"
+            b"rm /usr/prog/PROGRAM/kernel/*.tar.xz*\n"
+            b"rm /usr/prog/PROGRAM/software/*.tar.xz*\n"
+            b"rm /usr/prog/qt-4.8.6 -rf\n"
+            b"rm /usr/prog/opencv-4.10 -rf\n"
+            b"rm /usr/prog/wifi/8821cu.ko*\nsync\necho keep\n")
+        self.assertEqual(TOOL._suppress_space_reclaim(outer, True),
+                         b"echo keep\n")
     def test_reduced_plaintext_is_reproducible_and_exactly_allowlisted(self):
         unused, profile = self._template()
         replacement = ihex()
@@ -2068,6 +2110,48 @@ class PackageTransformationTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(Path(str(output) + ".manifest.json").exists())
 
+    def test_each_approved_template_profile_requires_consistent_hashes(self):
+        approved = (
+            ("d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616",
+             "2b05283f39cd68019e2d67b3068dff1e7a9a23507780635bab4bdfead2e48d9c",
+             "615dc69a86e0f01a6e32688d4bd8615098e236d51cd7c5afdcd99d3113d3f8a8",
+             "a042533ff5be0392455fe06a8f5270b8e"
+             "27da04661e8eef830146ad540ba47e6"),
+            ("5aeb22a7c0f7f16c286ed74433582ee7fc1557e050dbf5243a3fb48a93960cd6",
+             "8f587d850b3876f65a482cf2d1d708348a5dbf2cda45c6211c9b0ed451910f3f",
+             "c05dd781da74d1bf78bd8209730e27aad7de4e49abcf0e0265617395df6fbaa6",
+             "6fd03bd00a9ef297188d491b4352deef0"
+             "721a24b8f1f21373db7363f969e3f0d"),
+        )
+
+        def located(control, installer, script):
+            return {
+                "control_outer": {"sha256": control},
+                "outer": {"./runFirmwareExe.sh": {"sha256": installer}},
+                "control": {
+                    "./run.sh": {"sha256": script},
+                    "./IAPCommand": {
+                        "sha256": TOOL.CANONICAL_IAP_SHA256},
+                },
+            }
+
+        for plaintext, control, installer, script in approved:
+            with self.subTest(plaintext=plaintext), mock.patch.object(
+                    TOOL, "_locate_template_members",
+                    return_value=located(control, installer, script)):
+                profile = TOOL._canonical_template_profile(
+                    {"sha256": plaintext})
+                self.assertEqual(profile["control_outer"]["sha256"],
+                                 control)
+
+        plaintext, _, _, _ = approved[1]
+        _, control, installer, script = approved[0]
+        with mock.patch.object(
+                TOOL, "_locate_template_members",
+                return_value=located(control, installer, script)):
+            with self.assertRaisesRegex(TOOL.ToolError,
+                                        "canonical control archive"):
+                TOOL._canonical_template_profile({"sha256": plaintext})
     def test_hash_gate_rejects_noncanonical_template(self):
         outer, unused = self._template()
         with self.assertRaisesRegex(TOOL.ToolError,
@@ -2134,7 +2218,8 @@ class PackageTransformationTests(unittest.TestCase):
         }
         repository = {"commit": "a" * 40, "dirty": False}
         manifest = TOOL._create_manifest(
-            {"levelBoard": report}, TOOL.CANONICAL_PLAINTEXT_SHA256,
+            {"levelBoard": report},
+            TOOL.CANONICAL_TEMPLATE_PROFILES[0]["plaintext"],
             b"plain", b"cipher", {"outer": [], "control": []},
             shutil.which("sh"), shutil.which("md5sum"), repository)
         serialized = json.dumps(manifest)
@@ -2150,6 +2235,19 @@ class PackageTransformationTests(unittest.TestCase):
         self.assertEqual(manifest["repository"], repository)
         self.assertRegex(manifest["repository"]["commit"], r"^[0-9a-f]{40}$")
 
+        current_manifest = TOOL._create_manifest(
+            {"levelBoard": report},
+            TOOL.CANONICAL_TEMPLATE_PROFILES[1]["plaintext"],
+            b"plain", b"cipher", {"outer": [], "control": []},
+            shutil.which("sh"), shutil.which("md5sum"), repository)
+        changes = {(item["effect"], item["status"])
+                   for item in current_manifest["installer_changes"]}
+        self.assertIn(("host disk-reclaim deletions", "suppressed"),
+                      changes)
+        self.assertIn(("unselected board failure-result checks",
+                       "suppressed"), changes)
+        self.assertIn(("selected board failure-result check and image",
+                       "retained"), changes)
     def test_package_cli_validation_failure_publishes_nothing(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

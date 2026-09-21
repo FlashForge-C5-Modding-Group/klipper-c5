@@ -30,25 +30,45 @@ MAX_ARCHIVE_DEPTH = 8
 _ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz",
                      ".tar.bz2", ".tbz", ".tbz2", ".gz", ".xz", ".bz2")
 
-CANONICAL_PLAINTEXT_SHA256 = (
-    "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616")
-CANONICAL_CONTROL_SHA256 = (
-    "2b05283f39cd68019e2d67b3068dff1e7a9a23507780635bab4bdfead2e48d9c")
-CANONICAL_INSTALLER_SHA256 = (
-    "615dc69a86e0f01a6e32688d4bd8615098e236d51cd7c5afdcd99d3113d3f8a8")
-CANONICAL_CONTROL_SCRIPT_SHA256 = (
-    "a042533ff5be0392455fe06a8f5270b8e27da04661e8eef830146ad540ba47e6")
+CANONICAL_TEMPLATE_PROFILES = (
+    {
+        "plaintext":
+            "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616",
+        "control":
+            "2b05283f39cd68019e2d67b3068dff1e7a9a23507780635bab4bdfead2e48d9c",
+        "installer":
+            "615dc69a86e0f01a6e32688d4bd8615098e236d51cd7c5afdcd99d3113d3f8a8",
+        "control_script":
+            "a042533ff5be0392455fe06a8f5270b8e27da04661e8eef830146ad540ba47e6",
+    },
+    {
+        "plaintext":
+            "5aeb22a7c0f7f16c286ed74433582ee7fc1557e050dbf5243a3fb48a93960cd6",
+        "control":
+            "8f587d850b3876f65a482cf2d1d708348a5dbf2cda45c6211c9b0ed451910f3f",
+        "installer":
+            "c05dd781da74d1bf78bd8209730e27aad7de4e49abcf0e0265617395df6fbaa6",
+        "control_script":
+            "6fd03bd00a9ef297188d491b4352deef0721a24b8f1f21373db7363f969e3f0d",
+        "space_reclaim": True,
+    },
+)
 CANONICAL_IAP_SHA256 = (
     "c258bf965a92dad33b15bff616ef3ac72e958618b9cbb059f0a9cd4602c51f68")
 PACKAGE_NAME_RE = re.compile(
     r"^Creator5Pro-[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
 COMPONENT_NAME_RE = re.compile(
     r"^(?:\./)?(control|kernel|library|software)-.+\.tar\.xz$")
-CONTROL_MEMBER_NAMES = (
-    "./eBoard.hex", "./heaterBoard.hex", "./IAPCommand", "./ISPCommand",
-    "./levelBoard.hex", "./mainBoardGD.hex", "./mcu.img",
-    "./md5sum.list", "./run.sh", "./Update")
-
+CONTROL_MEMBER_PROFILES = (
+    ("./eBoard.hex", "./heaterBoard.hex", "./IAPCommand",
+     "./ISPCommand", "./levelBoard.hex", "./mainBoardGD.hex",
+     "./mcu.img", "./md5sum.list", "./run.sh", "./Update"),
+    ("./eBoard_fail.img", "./eBoard.hex", "./heaterBoard_fail.img",
+     "./heaterBoard.hex", "./IAPCommand", "./ISPCommand",
+     "./levelBoard_fail.img", "./levelBoard.hex", "./mainBoardGD.hex",
+     "./mcu_fail.img", "./mcu.img", "./md5sum.list", "./run.sh",
+     "./Update", "./VDS_V1.0.1_0.hex"),
+)
 
 class ToolError(Exception):
     def __init__(self, message, exit_code=2):
@@ -2040,8 +2060,8 @@ def _locate_template_members(model, md5sum="md5sum"):
     control_outer = components["control"]
     control_model = control_outer["nested"]
     control = _regular_member_map(control_model, "control template")
-    if (tuple(member["path"] for member in control_model["members"]) !=
-            CONTROL_MEMBER_NAMES or
+    if (tuple(member["path"] for member in control_model["members"]) not in
+            CONTROL_MEMBER_PROFILES or
             any(not member["leading_dot_slash"]
                 for member in control_model["members"])):
         raise ToolError("unsupported canonical control member profile")
@@ -2060,24 +2080,25 @@ def _locate_template_members(model, md5sum="md5sum"):
         "control_members": control_model["members"],
         "checksum_entries": checksum_entries,
     }
-
-
 def _canonical_template_profile(model, md5sum="md5sum"):
-    if model.get("sha256") != CANONICAL_PLAINTEXT_SHA256:
+    expected = next(
+        (item for item in CANONICAL_TEMPLATE_PROFILES
+         if item["plaintext"] == model.get("sha256")), None)
+    if expected is None:
         raise ToolError("unsupported canonical template plaintext hash")
     profile = _locate_template_members(model, md5sum)
-    if profile["control_outer"]["sha256"] != CANONICAL_CONTROL_SHA256:
+    if profile["control_outer"]["sha256"] != expected["control"]:
         raise ToolError("unsupported canonical control archive hash")
     gates = (
         (profile["outer"]["./runFirmwareExe.sh"],
-         CANONICAL_INSTALLER_SHA256, "outer installer"),
+         expected["installer"], "outer installer"),
         (profile["control"]["./run.sh"],
-         CANONICAL_CONTROL_SCRIPT_SHA256, "control script"),
+         expected["control_script"], "control script"),
         (profile["control"]["./IAPCommand"], CANONICAL_IAP_SHA256,
          "IAPCommand"),
     )
-    for member, expected, label in gates:
-        if member["sha256"] != expected:
+    for member, expected_hash, label in gates:
+        if member["sha256"] != expected_hash:
             raise ToolError("unsupported canonical %s hash" % label)
     return profile
 
@@ -2124,7 +2145,96 @@ def _suppress_update_other(data):
                     if index not in removed)
 
 
-def _check_shell_syntax(data, shell="sh"):
+def _remove_optional_shell_block(data, start, end, required, label):
+    if start not in data:
+        return data
+    if data.count(start) != 1:
+        raise ToolError("%s start marker is ambiguous" % label)
+    begin = data.index(start)
+    finish = data.find(end, begin)
+    if finish < 0:
+        raise ToolError("%s end marker is missing" % label)
+    finish += len(end)
+    block = data[begin:finish]
+    if any(block.count(token) != 1 for token in required):
+        raise ToolError("%s has an unsupported shape" % label)
+    return data[:begin] + data[finish:]
+
+
+def _suppress_space_reclaim(data, outer):
+    if outer:
+        start = b"rm /usr/prog/PROGRAM/control/*.tar.xz*\n"
+        required = (
+            b"rm /usr/prog/PROGRAM/library/*.tar.xz*",
+            b"rm /usr/prog/PROGRAM/kernel/*.tar.xz*",
+            b"rm /usr/prog/PROGRAM/software/*.tar.xz*",
+            b"rm /usr/prog/qt-4.8.6 -rf",
+            b"rm /usr/prog/opencv-4.10 -rf",
+            b"rm /usr/prog/wifi/8821cu.ko*",
+        )
+    else:
+        start = b"# free 28M\n"
+        required = (
+            b"rm /usr/prog/qt-4.8.6 -rf",
+            b"rm /usr/prog/opencv-4.10 -rf",
+            b"rm /usr/prog/wifi/8821cu.ko*",
+        )
+    return _remove_optional_shell_block(
+        data, start, b"sync\n", required, "space-reclaim block")
+
+
+FAILURE_IMAGE_NAMES = {
+    "eBoard": "eBoard_fail.img",
+    "heaterBoard": "heaterBoard_fail.img",
+    "levelBoard": "levelBoard_fail.img",
+    "mainBoardGD": "mcu_fail.img",
+}
+
+
+def _filter_result_checks(data, selected_boards):
+    marker = b"# check update result\n"
+    end_marker = b"# remove small version\n"
+    if marker not in data:
+        return data
+    if data.count(marker) != 1 or data.count(end_marker) != 1:
+        raise ToolError("control result-check section is ambiguous")
+    begin = data.index(marker) + len(marker)
+    finish = data.index(end_marker, begin)
+    lines = data[begin:finish].splitlines(keepends=True)
+    blocks = []
+    index = 0
+    while index < len(lines):
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if index == len(lines):
+            break
+        block_start = index
+        depth = 0
+        while index < len(lines):
+            stripped = lines[index].lstrip()
+            if stripped.startswith(b"if "):
+                depth += 1
+            elif stripped.rstrip() == b"fi":
+                depth -= 1
+            index += 1
+            if depth == 0:
+                break
+        if depth or block_start == index:
+            raise ToolError("control result-check block is malformed")
+        blocks.append(b"".join(lines[block_start:index]))
+    by_board = {}
+    for block in blocks:
+        matches = [board for board, name in FAILURE_IMAGE_NAMES.items()
+                   if name.encode("ascii") in block]
+        if len(matches) != 1 or matches[0] in by_board:
+            raise ToolError("control result-check profile is unsupported")
+        by_board[matches[0]] = block
+    if set(by_board) != set(FAILURE_IMAGE_NAMES):
+        raise ToolError("control result-check profile is incomplete")
+    kept = b"".join(by_board[board] + b"\n"
+                       for board in _canonical_boards(selected_boards))
+    return data[:begin] + kept + data[finish:]
+def _check_shell_syntax(data, shell="sh", label="outer installer"):
     program = _program_path(shell, "sh")
     try:
         result = subprocess.run([program, "-n"], input=data,
@@ -2135,8 +2245,8 @@ def _check_shell_syntax(data, shell="sh"):
     if result.returncode:
         diagnostic = sanitize_diagnostic(
             result.stderr.decode("utf-8", "replace").strip())
-        raise ToolError("generated outer installer failed sh -n%s" %
-                        ((": " + diagnostic) if diagnostic else ""))
+        raise ToolError("generated %s failed sh -n%s" %
+                        (label, (": " + diagnostic) if diagnostic else ""))
 
 
 def _member_metadata(member):
@@ -2176,18 +2286,26 @@ def _build_reduced_plaintext(profile, firmware_data, shell="sh",
                       for board in selected_boards}
     updater_paths = {"./" + BOARD_PROFILES[board]["updater_name"]
                      for board in selected_boards}
-    retained = (updater_paths | {"./mcu.img", "./md5sum.list",
-                                 "./run.sh", "./Update"} | firmware_paths)
+    failure_paths = {"./" + FAILURE_IMAGE_NAMES[board]
+                     for board in selected_boards
+                     if "./" + FAILURE_IMAGE_NAMES[board] in control}
+    retained = (updater_paths | failure_paths |
+                {"./mcu.img", "./md5sum.list", "./run.sh", "./Update"} |
+                firmware_paths)
     checksum_paths = [path for path, unused in profile["checksum_entries"]
                       if path in retained and path != "./md5sum.list"]
     if set(checksum_paths) != retained - {"./md5sum.list"}:
         raise ToolError("retained control checksum order is incomplete")
+    control_script = _suppress_space_reclaim(
+        control["./run.sh"]["_data"], False)
+    control_script = _filter_result_checks(control_script, selected_boards)
+    _check_shell_syntax(control_script, shell, "control script")
     control_data = {
         "./mcu.img": control["./mcu.img"]["_data"],
-        "./run.sh": control["./run.sh"]["_data"],
+        "./run.sh": control_script,
         "./Update": control["./Update"]["_data"],
     }
-    for path in updater_paths:
+    for path in updater_paths | failure_paths:
         control_data[path] = control[path]["_data"]
     for board in selected_boards:
         control_data["./" + BOARD_PROFILES[board]["firmware_name"]] = (
@@ -2205,6 +2323,8 @@ def _build_reduced_plaintext(profile, firmware_data, shell="sh",
         raise ToolError("generated control archive is not GNU tar")
     transformed_installer = _suppress_update_other(
         profile["outer"]["./runFirmwareExe.sh"]["_data"])
+    transformed_installer = _suppress_space_reclaim(
+        transformed_installer, True)
     _check_shell_syntax(transformed_installer, shell)
     control_path = profile["control_outer"]["path"]
     outer_data = {
@@ -2292,7 +2412,10 @@ def _assert_reduced_profile(model, evidence, selected_boards, md5sum="md5sum"):
     expected_updater_paths = {
         "./" + BOARD_PROFILES[board]["updater_name"]
         for board in selected_boards}
-    expected_control = (expected_updater_paths |
+    expected_failure_paths = {
+        "./" + FAILURE_IMAGE_NAMES[board] for board in selected_boards
+        if "./" + FAILURE_IMAGE_NAMES[board] in evidence["control_data"]}
+    expected_control = (expected_updater_paths | expected_failure_paths |
                         {"./mcu.img", "./md5sum.list", "./run.sh", "./Update"} |
                         set(expected_hex_paths))
     if (set(control) != expected_control or
@@ -2328,6 +2451,9 @@ def _assert_reduced_profile(model, evidence, selected_boards, md5sum="md5sum"):
     for board in selected_boards:
         control_labels["./" + BOARD_PROFILES[board]["firmware_name"]] = (
             board + " firmware")
+        failure_path = "./" + FAILURE_IMAGE_NAMES[board]
+        if failure_path in control:
+            control_labels[failure_path] = board + " failure image"
     return {
         "outer": [_manifest_member(outer_labels[path], outer[path])
                   for path in evidence["outer_order"]],
@@ -2484,6 +2610,23 @@ def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
     tools["md5sum"] = _version(md5sum)
     timestamp = datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0).isoformat().replace("+00:00", "Z")
+    installer_changes = [
+        {"effect": "NIM log deletion", "status": "suppressed"},
+        {"effect": "persistent startup image replacement",
+         "status": "suppressed"},
+    ]
+    reclaim_templates = {profile["plaintext"]
+                         for profile in CANONICAL_TEMPLATE_PROFILES
+                         if profile.get("space_reclaim")}
+    if template_plaintext_hash in reclaim_templates:
+        installer_changes.extend([
+            {"effect": "host disk-reclaim deletions",
+             "status": "suppressed"},
+            {"effect": "unselected board failure-result checks",
+             "status": "suppressed"},
+            {"effect": "selected board failure-result check and image",
+             "status": "retained"},
+        ])
     return {
         "schema_version": 2,
         "repository": repository,
@@ -2496,17 +2639,13 @@ def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
             "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
             "members": members,
         },
-        "installer_changes": [
-            {"effect": "NIM log deletion", "status": "suppressed"},
-            {"effect": "persistent startup image replacement",
-             "status": "suppressed"},
-        ],
+        "installer_changes": installer_changes,
         "validation": {
             "passed": [
                 "firmware representations",
                 "canonical template hash gates",
                 "input control checksums",
-                "installer byte transformation and sh -n",
+                "package script transformations and sh -n",
                 "reduced archive profile",
                 "output control checksums",
                 "fresh ciphertext decryption and reinspection",
