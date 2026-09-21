@@ -30,7 +30,28 @@ SPEC.loader.exec_module(TOOL)
 LEVEL_PROFILE = TOOL.BOARD_PROFILES["levelBoard"]
 APP_START = LEVEL_PROFILE["app_start"]
 APP_END = LEVEL_PROFILE["app_end"]
+def c5_pin_enumerations():
+    eboard = {"PA%d" % pin: pin for pin in range(16)}
+    eboard.update({"PB%d" % pin: 16 + pin for pin in range(16)})
+    eboard.update({"PC%d" % pin: 32 + pin for pin in range(13, 16)})
+    eboard["ADC_TEMPERATURE"] = 0xfe
 
+    heaterboard = {"PA%d" % pin: pin for pin in range(16)}
+    heaterboard.update({"PB%d" % pin: 16 + pin for pin in range(16)})
+    heaterboard.update({"PC%d" % pin: 32 + pin for pin in range(16)})
+    heaterboard["PD2"] = 50
+    heaterboard["ADC_TEMPERATURE"] = 0xfe
+
+    levelboard = {"PA%d" % pin: pin for pin in range(8)}
+    levelboard.update({"PA9": 9, "PA10": 10, "PB1": 17, "PD0": 48})
+    return {
+        "eBoard": eboard,
+        "heaterBoard": heaterboard,
+        "levelBoard": levelboard,
+    }
+
+
+C5_REQUIRED_PIN_ENUMERATIONS = c5_pin_enumerations()
 MAINBOARD_REQUIRED_CONSTANTS = {
     "MCU": "gd32h737vgt6", "ADC_MAX": 4095,
     "CLOCK_FREQ": 600000000, "RECEIVE_WINDOW": 384,
@@ -656,6 +677,63 @@ Idx Name          Size      VMA       LMA       File off  Algn
         self.assertEqual(captured.getvalue(), "")
 
 
+class SharedN32ProfileTests(unittest.TestCase):
+    def test_profiles_reserve_the_physical_usart1_pins(self):
+        for board in ("eBoard", "heaterBoard", "levelBoard"):
+            with self.subTest(board=board):
+                self.assertEqual(
+                    TOOL.BOARD_PROFILES[board]["required_constants"]
+                    ["RESERVE_PINS_serial"], "PA10,PA9")
+
+    def test_profile_serial_reservation_blocks_host_pin_claims(self):
+        pins_path = ROOT / "klippy" / "pins.py"
+        spec = importlib.util.spec_from_file_location("c5_test_pins", pins_path)
+        pins_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pins_module)
+        for board in ("eBoard", "heaterBoard", "levelBoard"):
+            resolver = pins_module.PinResolver()
+            reservation = (TOOL.BOARD_PROFILES[board]["required_constants"]
+                           ["RESERVE_PINS_serial"])
+            for pin in reservation.split(","):
+                resolver.reserve_pin(pin, "serial")
+            for pin in ("PA9", "PA10"):
+                with self.subTest(board=board, pin=pin), \
+                        self.assertRaisesRegex(
+                            pins_module.error, "reserved for serial"):
+                    resolver.update_command("set_digital_out pin=" + pin)
+            self.assertEqual(
+                resolver.update_command("set_digital_out pin=PA0"),
+                "set_digital_out pin=PA0")
+
+    def test_profiles_require_exact_package_pin_surfaces(self):
+        for board, pins in C5_REQUIRED_PIN_ENUMERATIONS.items():
+            with self.subTest(board=board):
+                self.assertEqual(
+                    TOOL.BOARD_PROFILES[board]["required_enumerations"],
+                    {"pin": pins})
+
+    def test_dictionary_rejects_missing_or_unbonded_package_pins(self):
+        extra_pin = {
+            "eBoard": ("PC0", 32),
+            "heaterBoard": ("PD3", 51),
+            "levelBoard": ("PA8", 8),
+        }
+        for board, expected in C5_REQUIRED_PIN_ENUMERATIONS.items():
+            missing = dict(expected)
+            missing.pop(next(iter(expected)))
+            extra = dict(expected)
+            name, value = extra_pin[board]
+            extra[name] = value
+            for kind, pins in (("missing", missing), ("extra", extra)):
+                with self.subTest(board=board, kind=kind), \
+                        self.assertRaisesRegex(
+                            TOOL.ToolError,
+                            "dictionary enumeration pin does not match"):
+                    TOOL._load_dictionary(
+                        board, dictionary_data(
+                            board=board, enumerations={"pin": pins}))
+
+
 class MainboardProfileTests(unittest.TestCase):
     def setUp(self):
         require_mainboard_profile(self)
@@ -994,6 +1072,71 @@ SECTIONS {
             self.assertFalse(Path(str(output) + ".manifest.json").exists())
             self.assertNotIn(secret, diagnostic)
 
+class N32G45xRegisterModelTests(unittest.TestCase):
+    MODEL_SOURCE = ROOT / "test" / "n32g45x_register_model.c"
+
+    def compile_model(self, workspace, reference_frequency):
+        executable = workspace / ("n32-model.exe" if os.name == "nt"
+                                  else "n32-model")
+        compiler = next((shutil.which(name)
+                         for name in ("cc", "gcc", "clang")
+                         if shutil.which(name)), None)
+        if compiler:
+            command = [
+                compiler, "-std=c11", "-O2", "-I", str(ROOT / "test"),
+                "-DCONFIG_CLOCK_REF_FREQ=%d" % reference_frequency,
+                str(self.MODEL_SOURCE), "-o", str(executable),
+            ]
+            return subprocess.run(command, capture_output=True, text=True), executable
+
+        if os.name != "nt":
+            self.fail("A host C compiler is required for the N32 register model")
+        vswhere = (Path(os.environ["ProgramFiles(x86)"]) /
+                   "Microsoft Visual Studio" / "Installer" / "vswhere.exe")
+        located = subprocess.run(
+            [str(vswhere), "-latest", "-products", "*", "-requires",
+             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+             "-property", "installationPath"],
+            check=True, capture_output=True, text=True)
+        installation = Path(located.stdout.strip())
+        vcvars = installation / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+        script = workspace / "compile-model.cmd"
+        script.write_text(
+            '@call "%s" >nul\n'
+            '@cl /nologo /O2 /std:c11 /I"%s" '
+            '/DCONFIG_CLOCK_REF_FREQ=%d "%s" /Fo:"%s" /Fe:"%s"\n'
+            % (vcvars, ROOT / "test", reference_frequency, self.MODEL_SOURCE,
+               workspace / "n32-model.obj", executable))
+        return subprocess.run(
+            [os.environ["COMSPEC"], "/d", "/c", str(script)],
+            capture_output=True, text=True), executable
+
+    def test_production_gpio_and_clock_startup_register_behavior(self):
+        for reference_frequency in (12000000, 8000000, 16000000, 24000000):
+            with self.subTest(reference_frequency=reference_frequency):
+                with tempfile.TemporaryDirectory() as temp:
+                    compiled, executable = self.compile_model(
+                        Path(temp), reference_frequency)
+                    self.assertEqual(
+                        compiled.returncode, 0, compiled.stdout + compiled.stderr)
+                    executed = subprocess.run(
+                        [str(executable)], capture_output=True, text=True)
+                    self.assertEqual(
+                        executed.returncode, 0, executed.stdout + executed.stderr)
+                    self.assertEqual(
+                        executed.stdout.strip(),
+                        "ref=%d clock=144000000 model-ok"
+                        % reference_frequency)
+
+    def test_unsupported_n32_pll_plans_are_rejected_at_compile_time(self):
+        for reference_frequency in (1000000, 20000000, 25000000):
+            with self.subTest(reference_frequency=reference_frequency):
+                with tempfile.TemporaryDirectory() as temp:
+                    compiled, unused = self.compile_model(
+                        Path(temp), reference_frequency)
+                    self.assertNotEqual(compiled.returncode, 0)
+
+
 @unittest.skipUnless(os.environ.get("RUN_C5_BUILD_TESTS") == "1",
                      "set RUN_C5_BUILD_TESTS=1 with the ARM toolchain "
                      "available")
@@ -1157,6 +1300,7 @@ class RealFirmwareTests(unittest.TestCase):
                 "heaterBoard", self.heaterboard_output / paths["firmware"],
                 self.eboard_output / eboard["elf"],
                 self.eboard_output / eboard["dictionary"])
+
 
     def test_package_rejects_cross_board_and_cross_role_products(self):
         level = self.build_report["products"]

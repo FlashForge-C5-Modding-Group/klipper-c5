@@ -57,5 +57,8 @@ struct cline { volatile uint32_t *en, *rst; uint32_t bit; };
 struct cline lookup_clock_line(uint32_t periph_base);
 uint32_t get_pclock_frequency(uint32_t periph_base);
 void gpio_clock_enable(GPIO_TypeDef *regs);
+#if CONFIG_MACH_N32G45x
+void stm32f1_alternative_remap(uint32_t mapr_mask, uint32_t mapr_value);
+#endif
 
 #endif // internal.h

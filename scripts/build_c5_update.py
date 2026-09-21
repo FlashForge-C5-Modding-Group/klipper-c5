@@ -298,6 +298,17 @@ def _mainboard_pin_enumeration():
     return pins
 
 
+def _package_pin_enumeration(port_masks, adc_temperature=False):
+    pins = {}
+    for port, mask in port_masks.items():
+        base = (ord(port) - ord("A")) * 16
+        pins.update({"P%s%d" % (port, pin): base + pin
+                     for pin in range(16) if mask & (1 << pin)})
+    if adc_temperature:
+        pins["ADC_TEMPERATURE"] = 0xfe
+    return pins
+
+
 BOARD_PROFILES = {
     "eBoard": {
         "firmware_name": "eBoard.hex",
@@ -327,8 +338,12 @@ BOARD_PROFILES = {
         "required_constants": {
             "MCU": "n32g455ccl7", "ADC_MAX": 4095, "CLOCK_FREQ": 144000000,
             "PWM_MAX": 32768, "RECEIVE_WINDOW": 384,
-            "RESERVE_PINS_serial": "PH10,PH9", "SERIAL_BAUD": 460800,
+            "RESERVE_PINS_serial": "PA10,PA9", "SERIAL_BAUD": 460800,
             "STATS_SUMSQ_BASE": 256,
+        },
+        "required_enumerations": {
+            "pin": _package_pin_enumeration(
+                {"A": 0xffff, "B": 0xffff, "C": 0xe000}, True),
         },
         "required_commands": {
             "identify offset=%u count=%c", "allocate_oids count=%c",
@@ -427,8 +442,13 @@ BOARD_PROFILES = {
         "required_constants": {
             "MCU": "n32g455rel7", "ADC_MAX": 4095, "PWM_MAX": 32768,
             "CLOCK_FREQ": 144000000, "RECEIVE_WINDOW": 384,
-            "RESERVE_PINS_serial": "PH10,PH9", "SERIAL_BAUD": 230400,
+            "RESERVE_PINS_serial": "PA10,PA9", "SERIAL_BAUD": 230400,
             "STATS_SUMSQ_BASE": 256,
+        },
+        "required_enumerations": {
+            "pin": _package_pin_enumeration(
+                {"A": 0xffff, "B": 0xffff, "C": 0xffff, "D": 0x0004},
+                True),
         },
         "required_commands": {
             "identify offset=%u count=%c", "allocate_oids count=%c",
@@ -497,8 +517,12 @@ BOARD_PROFILES = {
         "required_constants": {
             "MCU": "n32g430f8s7", "ADC_MAX": 4095,
             "CLOCK_FREQ": 128000000,
-            "RECEIVE_WINDOW": 384, "RESERVE_PINS_serial": "PH10,PH9",
+            "RECEIVE_WINDOW": 384, "RESERVE_PINS_serial": "PA10,PA9",
             "SERIAL_BAUD": 230400, "STATS_SUMSQ_BASE": 256,
+        },
+        "required_enumerations": {
+            "pin": _package_pin_enumeration(
+                {"A": 0x06ff, "B": 0x0002, "D": 0x0001}),
         },
         "required_commands": {
             "identify offset=%u count=%c", "set_trigger_threshold threshold=%i",
