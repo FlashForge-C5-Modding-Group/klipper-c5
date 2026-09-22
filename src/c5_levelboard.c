@@ -13,8 +13,7 @@
 
 #define C5_RING_SIZE 11
 #define C5_CALIBRATION_US 500
-#define C5_STABILITY_CLOCK_DIVISOR 128000
-#define C5_STABILITY_TIME_MS 2000
+#define C5_STABILITY_TIME_US 2000000
 #define C5_STABILITY_MAD 2
 #define C5_LARGE_DELTA 150
 
@@ -22,7 +21,7 @@ struct c5_detector {
     struct timer calibration_timer;
     uint32_t ring[C5_RING_SIZE];
     uint32_t offset, baseline, reference, accumulator;
-    uint32_t stable_start_ms, median, mad;
+    uint32_t stability_deadline, median, mad;
     int32_t commanded_threshold, filtered, signed_delta;
     uint16_t current;
     int16_t effective_threshold;
@@ -30,7 +29,7 @@ struct c5_detector {
     uint8_t eddy_state, moderate_count, large_count;
     uint8_t assert_count, clear_count;
     uint8_t immediate, capture_pending;
-    uint8_t calibration_active, initialization_latch;
+    uint8_t calibration_active, initialization_latch, stability_started;
 };
 
 static struct c5_detector levelboard;
@@ -70,7 +69,8 @@ c5_full_reset(void)
     levelboard.large_count = 0;
     levelboard.assert_count = 0;
     levelboard.clear_count = 0;
-    levelboard.stable_start_ms = 0;
+    levelboard.stability_deadline = 0;
+    levelboard.stability_started = 0;
     levelboard.median = 0;
     levelboard.mad = 0;
     levelboard.immediate = 0;
@@ -257,11 +257,6 @@ c5_finish_calibration(uint32_t median, uint32_t mad)
     levelboard.calibration_active = 0;
 }
 
-static uint32_t
-c5_elapsed_ms(uint32_t clock, uint32_t start_ms)
-{
-    return clock / C5_STABILITY_CLOCK_DIVISOR - start_ms;
-}
 
 static void
 c5_process_calibration(void)
@@ -297,18 +292,19 @@ c5_process_calibration(void)
 
     c5_compute_statistics(&levelboard.median, &levelboard.mad);
     if (levelboard.mad > C5_STABILITY_MAD) {
-        levelboard.stable_start_ms = 0;
+        levelboard.stability_started = 0;
         return;
     }
 
-    uint32_t clock = timer_read_time();
-    uint32_t now_ms = clock / C5_STABILITY_CLOCK_DIVISOR;
-    if (!levelboard.stable_start_ms) {
-        levelboard.stable_start_ms = now_ms;
+    uint32_t now = timer_read_time();
+    if (!levelboard.stability_started) {
+        levelboard.stability_deadline = (now
+                                         + timer_from_us(
+                                             C5_STABILITY_TIME_US));
+        levelboard.stability_started = 1;
         return;
     }
-    if (c5_elapsed_ms(clock, levelboard.stable_start_ms)
-        >= C5_STABILITY_TIME_MS)
+    if (!timer_is_before(now, levelboard.stability_deadline))
         c5_finish_calibration(levelboard.median, levelboard.mad);
 }
 

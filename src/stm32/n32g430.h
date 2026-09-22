@@ -183,6 +183,7 @@ typedef struct {
 
 #define DMA_ISR_TCIF1          (1U << 1)
 #define DMA_IFCR_CTCIF1        (1U << 1)
+#define DMA_IFCR_CHANNEL1_ALL  0x0FU
 #define DMA_CCR_EN             (1U << 0)
 #define DMA_CCR_TCIE           (1U << 1)
 #define DMA_CCR_CIRC           (1U << 5)

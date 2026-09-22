@@ -30,25 +30,45 @@ MAX_ARCHIVE_DEPTH = 8
 _ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz",
                      ".tar.bz2", ".tbz", ".tbz2", ".gz", ".xz", ".bz2")
 
-CANONICAL_PLAINTEXT_SHA256 = (
-    "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616")
-CANONICAL_CONTROL_SHA256 = (
-    "2b05283f39cd68019e2d67b3068dff1e7a9a23507780635bab4bdfead2e48d9c")
-CANONICAL_INSTALLER_SHA256 = (
-    "615dc69a86e0f01a6e32688d4bd8615098e236d51cd7c5afdcd99d3113d3f8a8")
-CANONICAL_CONTROL_SCRIPT_SHA256 = (
-    "a042533ff5be0392455fe06a8f5270b8e27da04661e8eef830146ad540ba47e6")
+CANONICAL_TEMPLATE_PROFILES = (
+    {
+        "plaintext":
+            "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616",
+        "control":
+            "2b05283f39cd68019e2d67b3068dff1e7a9a23507780635bab4bdfead2e48d9c",
+        "installer":
+            "615dc69a86e0f01a6e32688d4bd8615098e236d51cd7c5afdcd99d3113d3f8a8",
+        "control_script":
+            "a042533ff5be0392455fe06a8f5270b8e27da04661e8eef830146ad540ba47e6",
+    },
+    {
+        "plaintext":
+            "5aeb22a7c0f7f16c286ed74433582ee7fc1557e050dbf5243a3fb48a93960cd6",
+        "control":
+            "8f587d850b3876f65a482cf2d1d708348a5dbf2cda45c6211c9b0ed451910f3f",
+        "installer":
+            "c05dd781da74d1bf78bd8209730e27aad7de4e49abcf0e0265617395df6fbaa6",
+        "control_script":
+            "6fd03bd00a9ef297188d491b4352deef0721a24b8f1f21373db7363f969e3f0d",
+        "space_reclaim": True,
+    },
+)
 CANONICAL_IAP_SHA256 = (
     "c258bf965a92dad33b15bff616ef3ac72e958618b9cbb059f0a9cd4602c51f68")
 PACKAGE_NAME_RE = re.compile(
     r"^Creator5Pro-[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
 COMPONENT_NAME_RE = re.compile(
     r"^(?:\./)?(control|kernel|library|software)-.+\.tar\.xz$")
-CONTROL_MEMBER_NAMES = (
-    "./eBoard.hex", "./heaterBoard.hex", "./IAPCommand", "./ISPCommand",
-    "./levelBoard.hex", "./mainBoardGD.hex", "./mcu.img",
-    "./md5sum.list", "./run.sh", "./Update")
-
+CONTROL_MEMBER_PROFILES = (
+    ("./eBoard.hex", "./heaterBoard.hex", "./IAPCommand",
+     "./ISPCommand", "./levelBoard.hex", "./mainBoardGD.hex",
+     "./mcu.img", "./md5sum.list", "./run.sh", "./Update"),
+    ("./eBoard_fail.img", "./eBoard.hex", "./heaterBoard_fail.img",
+     "./heaterBoard.hex", "./IAPCommand", "./ISPCommand",
+     "./levelBoard_fail.img", "./levelBoard.hex", "./mainBoardGD.hex",
+     "./mcu_fail.img", "./mcu.img", "./md5sum.list", "./run.sh",
+     "./Update", "./VDS_V1.0.1_0.hex"),
+)
 
 class ToolError(Exception):
     def __init__(self, message, exit_code=2):
@@ -287,12 +307,35 @@ def parse_ihex(board, data):
     }
 
 
+def _mainboard_pin_enumeration():
+    pins = {"PA%d" % pin: pin for pin in range(11)}
+    pins.update({"PA%d" % pin: pin for pin in range(13, 16)})
+    for port, base in (("B", 16), ("C", 32), ("D", 48), ("E", 64)):
+        pins.update({"P%s%d" % (port, pin): base + pin
+                     for pin in range(16)})
+    pins.update({"PH2": 114, "PH3": 115})
+    pins.update({"PJ%d" % pin: 144 + pin for pin in range(16)})
+    return pins
+
+
+def _package_pin_enumeration(port_masks, adc_temperature=False):
+    pins = {}
+    for port, mask in port_masks.items():
+        base = (ord(port) - ord("A")) * 16
+        pins.update({"P%s%d" % (port, pin): base + pin
+                     for pin in range(16) if mask & (1 << pin)})
+    if adc_temperature:
+        pins["ADC_TEMPERATURE"] = 0xfe
+    return pins
+
+
 BOARD_PROFILES = {
     "eBoard": {
         "firmware_name": "eBoard.hex",
         "app_start": 0x08010000, "app_end": 0x08040000,
         "ram_start": 0x20000000, "ram_end": 0x20020000,
         "normalization": "application-192k-ff-fill-v1",
+        "updater_name": "IAPCommand",
         "seed_config": (
             "CONFIG_MACH_STM32=y\n" "CONFIG_MACH_N32G455=y\n"
             "CONFIG_C5_EBOARD=y\n" "CONFIG_STM32_CLOCK_REF_12M=y\n"
@@ -315,8 +358,13 @@ BOARD_PROFILES = {
         "required_constants": {
             "MCU": "n32g455ccl7", "ADC_MAX": 4095, "CLOCK_FREQ": 144000000,
             "PWM_MAX": 32768, "RECEIVE_WINDOW": 384,
-            "RESERVE_PINS_serial": "PH10,PH9", "SERIAL_BAUD": 460800,
+            "RESERVE_PINS_serial": "PA10,PA9", "SERIAL_BAUD": 460800,
             "STATS_SUMSQ_BASE": 256,
+        },
+        "required_enumerations": {
+            "pin": dict(_package_pin_enumeration(
+                {"A": 0xffff, "B": 0xffff, "C": 0xe000}, True),
+                        PG0=96),
         },
         "required_commands": {
             "identify offset=%u count=%c", "allocate_oids count=%c",
@@ -389,6 +437,7 @@ BOARD_PROFILES = {
         "app_start": 0x08010000, "app_end": 0x08080000,
         "ram_start": 0x20000000, "ram_end": 0x20020000,
         "normalization": "application-448k-ff-fill-v1",
+        "updater_name": "IAPCommand",
         "seed_config": (
             "CONFIG_MACH_STM32=y\n" "CONFIG_MACH_N32G455=y\n"
             "CONFIG_C5_HEATERBOARD=y\n"
@@ -414,8 +463,13 @@ BOARD_PROFILES = {
         "required_constants": {
             "MCU": "n32g455rel7", "ADC_MAX": 4095, "PWM_MAX": 32768,
             "CLOCK_FREQ": 144000000, "RECEIVE_WINDOW": 384,
-            "RESERVE_PINS_serial": "PH10,PH9", "SERIAL_BAUD": 230400,
+            "RESERVE_PINS_serial": "PA10,PA9", "SERIAL_BAUD": 230400,
             "STATS_SUMSQ_BASE": 256,
+        },
+        "required_enumerations": {
+            "pin": _package_pin_enumeration(
+                {"A": 0xffff, "B": 0xffff, "C": 0xffff, "D": 0x0004},
+                True),
         },
         "required_commands": {
             "identify offset=%u count=%c", "allocate_oids count=%c",
@@ -463,6 +517,7 @@ BOARD_PROFILES = {
         "app_start": 0x08004000, "app_end": 0x08010000,
         "ram_start": 0x20000000, "ram_end": 0x20004000,
         "normalization": "application-48k-ff-fill-v1",
+        "updater_name": "IAPCommand",
         "seed_config": (
             "CONFIG_MACH_STM32=y\n" "CONFIG_MACH_N32G430F8S7=y\n"
             "CONFIG_STM32_CLOCK_REF_8M=y\n" "CONFIG_SERIAL=y\n"
@@ -483,8 +538,12 @@ BOARD_PROFILES = {
         "required_constants": {
             "MCU": "n32g430f8s7", "ADC_MAX": 4095,
             "CLOCK_FREQ": 128000000,
-            "RECEIVE_WINDOW": 384, "RESERVE_PINS_serial": "PH10,PH9",
+            "RECEIVE_WINDOW": 384, "RESERVE_PINS_serial": "PA10,PA9",
             "SERIAL_BAUD": 230400, "STATS_SUMSQ_BASE": 256,
+        },
+        "required_enumerations": {
+            "pin": _package_pin_enumeration(
+                {"A": 0x06ff, "B": 0x0002, "D": 0x0001}),
         },
         "required_commands": {
             "identify offset=%u count=%c", "set_trigger_threshold threshold=%i",
@@ -519,6 +578,137 @@ BOARD_PROFILES = {
                                  "query_analog_in"},
         "forbidden_responses": {"endstop_recover_state"},
         "forbidden_format_names": {"Levelboard"},
+    },
+    "mainBoardGD": {
+        "firmware_name": "mainBoardGD.hex",
+        "app_start": 0x08000000, "app_end": 0x08100000,
+        "ram_start": 0x24000000, "ram_end": 0x24080000,
+        "normalization": "application-1024k-ff-fill-v1",
+        "updater_name": "ISPCommand",
+        "seed_config": (
+            "CONFIG_MACH_STM32=y\n"
+            "CONFIG_MACH_GD32H737VGT6=y\n"
+            "CONFIG_C5_MAINBOARDGD=y\n"
+            "CONFIG_STM32_CLOCK_REF_25M=y\n"
+            "CONFIG_GD32_SERIAL_USART0=y\n"
+            "CONFIG_WANT_ADC=y\n"
+            "CONFIG_WANT_BUTTONS=y\n"),
+        "required_config": {
+            "MACH_STM32": "y", "MACH_GD32H7": "y",
+            "MACH_GD32H737VGT6": "y", "C5_MAINBOARDGD": "y",
+            "MCU": "gd32h737vgt6", "STM32_CLOCK_REF_25M": "y",
+            "GD32_SERIAL_USART0": "y", "WANT_ADC": "y",
+            "WANT_BUTTONS": "y", "INLINE_STEPPER_HACK": "y",
+            "HAVE_STEPPER_OPTIMIZED_BOTH_EDGE": "n",
+            "WANT_STEPPER_OPTIMIZED_BOTH_EDGE": "n",
+            "ARMCM_FLASH_SIZE_IS_TOTAL": "y",
+            "ARMCM_EXPLICIT_RESET_ENTRY": "y",
+            "FLASH_APPLICATION_ADDRESS": "0x08000000",
+            "FLASH_BOOT_ADDRESS": "0x08000000", "FLASH_SIZE": "0x100000",
+            "RAM_START": "0x24000000", "RAM_SIZE": "0x80000",
+            "STACK_SIZE": "4096", "CLOCK_FREQ": "600000000",
+            "CLOCK_REF_FREQ": "25000000", "SERIAL_BAUD": "230400",
+            "SERIAL_RX_BUFFER_SIZE": "384",
+        },
+        "forbidden_config": {
+            "C5_EBOARD", "C5_HEATERBOARD", "C5_LEVELBOARD",
+            "MACH_STM32H7", "MACH_N32G455", "MACH_N32G430F8S7",
+        },
+        "required_constants": {
+            "MCU": "gd32h737vgt6", "ADC_MAX": 4095,
+            "CLOCK_FREQ": 600000000, "RECEIVE_WINDOW": 384,
+            "RESERVE_PINS_serial": "PA10,PA9", "SERIAL_BAUD": 230400,
+            "STATS_SUMSQ_BASE": 256,
+        },
+        "required_enumerations": {
+            "stepper": {
+                "stepper_x": 0, "stepper_y": 1,
+                "stepper_z": 2, "extruder": 3,
+            },
+            "pin": _mainboard_pin_enumeration(),
+        },
+        "required_commands": {
+            "identify offset=%u count=%c", "allocate_oids count=%c",
+            "get_config", "finalize_config crc=%u", "get_clock",
+            "get_uptime", "emergency_stop", "clear_shutdown", "reset",
+            "debug_nop", "debug_ping data=%*s",
+            "debug_read order=%c addr=%u",
+            "debug_write order=%c addr=%u val=%u",
+            ("config_stepper oid=%c step_pin=%c dir_pin=%c invert_step=%c "
+             "step_pulse_ticks=%u"),
+            "queue_step oid=%c interval=%u count=%hu add=%hi",
+            "set_next_step_dir oid=%c dir=%c",
+            "reset_step_clock oid=%c clock=%u",
+            "stepper_get_position oid=%c",
+            "stepper_stop_on_trigger oid=%c trsync_oid=%c",
+            "config_endstop oid=%c pin=%c pull_up=%c",
+            ("endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c "
+             "rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c"),
+            "endstop_query_state oid=%c", "config_trsync oid=%c",
+            ("trsync_start oid=%c report_clock=%u report_ticks=%u "
+             "expire_reason=%c"),
+            "trsync_set_timeout oid=%c clock=%u",
+            "trsync_trigger oid=%c reason=%c",
+            ("config_digital_out oid=%c pin=%u value=%c default_value=%c "
+             "max_duration=%u"),
+            "set_digital_out_pwm_cycle oid=%c cycle_ticks=%u",
+            "queue_digital_out oid=%c clock=%u on_ticks=%u",
+            "update_digital_out oid=%c value=%c",
+            "set_digital_out pin=%u value=%c",
+            "config_analog_in oid=%c pin=%u",
+            ("query_analog_in oid=%c clock=%u sample_ticks=%u "
+             "sample_count=%c rest_ticks=%u min_value=%hu max_value=%hu "
+             "range_check_count=%c"),
+            "config_buttons oid=%c button_count=%c",
+            "buttons_add oid=%c pos=%c pin=%u pull_up=%c",
+            ("buttons_query oid=%c clock=%u rest_ticks=%u "
+             "retransmit_count=%c invert=%c"),
+            "buttons_ack oid=%c count=%c",
+            "config_mclib oid=%c stepper=%u rs=%u ls=%u km=%u",
+            "mclib_config_microstep oid=%c interpolate=%c mstep=%u",
+            "mclib_config_stalldetect oid=%c stallthrs=%u",
+            "mclib_set_current oid=%c run_current=%u hold_current=%u",
+            "mclib_set_pid_params oid=%c kp=%u ki=%u",
+            ("mclib_set_resonance_damp oid=%c tdx=%c amp=%u phase1=%u "
+             "phase2=%u"),
+            "mclib_identify_motor oid=%c umax=%u umin=%u",
+            "get_mcu_version", "remove_peel action=%u",
+            "pa_action action=%u pc=%u", "get_emcu_pa_value",
+        },
+        "required_responses": {
+            "identify_response offset=%u data=%.*s",
+            "config is_config=%c crc=%u is_shutdown=%c move_count=%hu",
+            "clock clock=%u", "uptime high=%u clock=%u",
+            "stats count=%u sum=%u sumsq=%u", "starting",
+            "is_shutdown static_string_id=%hu",
+            "shutdown clock=%u static_string_id=%hu", "pong data=%*s",
+            "debug_result val=%u", "stepper_position oid=%c pos=%i",
+            "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c",
+            "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
+            "analog_in_state oid=%c next_clock=%u value=%hu",
+            "buttons_state oid=%c ack_count=%c state=%*s",
+            "mcu_version year=%u date=%u version=%u", "pa_value value=%u",
+        },
+        "forbidden_commands": {
+            "config_reset", "endstop_recover_state", "get_basic_param",
+            "set_trigger_threshold", "config_pwm_out", "queue_pwm_out",
+            "config_spi", "spi_set_bus", "spi_transfer", "spi_send",
+            "config_spi_shutdown", "config_lis2dw", "query_lis2dw",
+            "query_lis2dw_status",
+        },
+        "forbidden_responses": {
+            "endstop_recover_state", "param_value", "peel_data",
+            "trigger_threshold", "spi_transfer_response",
+        },
+        "forbidden_format_names": {
+            "Eboard", "Eheaterboard", "GDMainboard", "Levelboard",
+        },
+        "forbidden_formats": {
+            ("query_analog_in oid=%c clock=%u sample_ticks=%u "
+             "sample_count=%c rest_ticks=%u bytes_per_report=%c "
+             "min_value=%hu max_value=%hu range_check_count=%c"),
+        },
+        "forbidden_constants": {"STEPPER_OPTIMIZED_EDGE"},
     },
 }
 
@@ -731,6 +921,17 @@ def _load_dictionary(board, data):
             raise ToolError(
     "dictionary constant %s does not match required value" %
      name)
+    for name in profile.get("forbidden_constants", ()):
+        if name in constants:
+            raise ToolError("forbidden dictionary constant is present: %s" %
+                            name)
+    enumerations = parser.get_enumerations()
+    for enum_name, expected in profile.get(
+            "required_enumerations", {}).items():
+        if enumerations.get(enum_name) != expected:
+            raise ToolError(
+                "dictionary enumeration %s does not match required values" %
+                enum_name)
     resolved_config = _load_resolved_config_text(board, parser.get_kconfig())
     raw_tables = {"command": raw.get("commands", {}),
                   "response": raw.get("responses", {}),
@@ -798,6 +999,9 @@ def _load_dictionary(board, data):
     forbidden_names = profile["forbidden_format_names"]
     if any(item.split(" ", 1)[0] in forbidden_names for item in all_formats):
         raise ToolError("forbidden dictionary format name is present")
+    forbidden_formats = profile.get("forbidden_formats", set())
+    if forbidden_formats & all_formats:
+        raise ToolError("forbidden dictionary format is present")
     if raw.get("commands", {}).get("identify offset=%u count=%c") != 1:
         raise ToolError("bootstrap identify message ID is not 1")
     if raw.get("responses", {}).get(
@@ -1856,8 +2060,8 @@ def _locate_template_members(model, md5sum="md5sum"):
     control_outer = components["control"]
     control_model = control_outer["nested"]
     control = _regular_member_map(control_model, "control template")
-    if (tuple(member["path"] for member in control_model["members"]) !=
-            CONTROL_MEMBER_NAMES or
+    if (tuple(member["path"] for member in control_model["members"]) not in
+            CONTROL_MEMBER_PROFILES or
             any(not member["leading_dot_slash"]
                 for member in control_model["members"])):
         raise ToolError("unsupported canonical control member profile")
@@ -1876,24 +2080,25 @@ def _locate_template_members(model, md5sum="md5sum"):
         "control_members": control_model["members"],
         "checksum_entries": checksum_entries,
     }
-
-
 def _canonical_template_profile(model, md5sum="md5sum"):
-    if model.get("sha256") != CANONICAL_PLAINTEXT_SHA256:
+    expected = next(
+        (item for item in CANONICAL_TEMPLATE_PROFILES
+         if item["plaintext"] == model.get("sha256")), None)
+    if expected is None:
         raise ToolError("unsupported canonical template plaintext hash")
     profile = _locate_template_members(model, md5sum)
-    if profile["control_outer"]["sha256"] != CANONICAL_CONTROL_SHA256:
+    if profile["control_outer"]["sha256"] != expected["control"]:
         raise ToolError("unsupported canonical control archive hash")
     gates = (
         (profile["outer"]["./runFirmwareExe.sh"],
-         CANONICAL_INSTALLER_SHA256, "outer installer"),
+         expected["installer"], "outer installer"),
         (profile["control"]["./run.sh"],
-         CANONICAL_CONTROL_SCRIPT_SHA256, "control script"),
+         expected["control_script"], "control script"),
         (profile["control"]["./IAPCommand"], CANONICAL_IAP_SHA256,
          "IAPCommand"),
     )
-    for member, expected, label in gates:
-        if member["sha256"] != expected:
+    for member, expected_hash, label in gates:
+        if member["sha256"] != expected_hash:
             raise ToolError("unsupported canonical %s hash" % label)
     return profile
 
@@ -1940,7 +2145,111 @@ def _suppress_update_other(data):
                     if index not in removed)
 
 
-def _check_shell_syntax(data, shell="sh"):
+def _remove_optional_shell_block(data, start, end, required, label):
+    if start not in data:
+        return data
+    if data.count(start) != 1:
+        raise ToolError("%s start marker is ambiguous" % label)
+    begin = data.index(start)
+    finish = data.find(end, begin)
+    if finish < 0:
+        raise ToolError("%s end marker is missing" % label)
+    finish += len(end)
+    block = data[begin:finish]
+    if any(block.count(token) != 1 for token in required):
+        raise ToolError("%s has an unsupported shape" % label)
+    return data[:begin] + data[finish:]
+
+
+def _suppress_space_reclaim(data, outer):
+    if outer:
+        start = b"rm /usr/prog/PROGRAM/control/*.tar.xz*\n"
+        required = (
+            b"rm /usr/prog/PROGRAM/library/*.tar.xz*",
+            b"rm /usr/prog/PROGRAM/kernel/*.tar.xz*",
+            b"rm /usr/prog/PROGRAM/software/*.tar.xz*",
+            b"rm /usr/prog/qt-4.8.6 -rf",
+            b"rm /usr/prog/opencv-4.10 -rf",
+            b"rm /usr/prog/wifi/8821cu.ko*",
+        )
+    else:
+        start = b"# free 28M\n"
+        required = (
+            b"rm /usr/prog/qt-4.8.6 -rf",
+            b"rm /usr/prog/opencv-4.10 -rf",
+            b"rm /usr/prog/wifi/8821cu.ko*",
+        )
+    return _remove_optional_shell_block(
+        data, start, b"sync\n", required, "space-reclaim block")
+
+
+FAILURE_IMAGE_NAMES = {
+    "eBoard": "eBoard_fail.img",
+    "heaterBoard": "heaterBoard_fail.img",
+    "levelBoard": "levelBoard_fail.img",
+    "mainBoardGD": "mcu_fail.img",
+}
+
+
+def _filter_result_checks(data, selected_boards):
+    marker = b"# check update result\n"
+    end_marker = b"# remove small version\n"
+    if marker not in data:
+        return data
+    if data.count(marker) != 1 or data.count(end_marker) != 1:
+        raise ToolError("control result-check section is ambiguous")
+    begin = data.index(marker) + len(marker)
+    finish = data.index(end_marker, begin)
+    lines = data[begin:finish].splitlines(keepends=True)
+    blocks = []
+    index = 0
+    while index < len(lines):
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if index == len(lines):
+            break
+        block_start = index
+        depth = 0
+        while index < len(lines):
+            stripped = lines[index].lstrip()
+            if stripped.startswith(b"if "):
+                depth += 1
+            elif stripped.rstrip() == b"fi":
+                depth -= 1
+            index += 1
+            if depth == 0:
+                break
+        if depth or block_start == index:
+            raise ToolError("control result-check block is malformed")
+        blocks.append(b"".join(lines[block_start:index]))
+    by_board = {}
+    for block in blocks:
+        matches = [board for board, name in FAILURE_IMAGE_NAMES.items()
+                   if name.encode("ascii") in block]
+        if len(matches) != 1 or matches[0] in by_board:
+            raise ToolError("control result-check profile is unsupported")
+        by_board[matches[0]] = block
+    if set(by_board) != set(FAILURE_IMAGE_NAMES):
+        raise ToolError("control result-check profile is incomplete")
+    kept = b"".join(by_board[board] + b"\n"
+                       for board in _canonical_boards(selected_boards))
+    return data[:begin] + kept + data[finish:]
+
+
+def _remove_update_marker(data):
+    # Stock resolves WORK_DIR as "." and the version pruning below changes
+    # the working directory, so the marker must be removed before that cd
+    # for $WORK_DIR/Update to name the installed marker file.
+    anchor = b"cd /usr/prog/PROGRAM/control/\n"
+    if data.count(anchor) != 1:
+        raise ToolError("control script has no unique version-prune change "
+                        "of directory for update marker removal")
+    index = data.index(anchor)
+    removal = b"rm -f $WORK_DIR/Update\nsync\n\n"
+    return data[:index] + removal + data[index:]
+
+
+def _check_shell_syntax(data, shell="sh", label="outer installer"):
     program = _program_path(shell, "sh")
     try:
         result = subprocess.run([program, "-n"], input=data,
@@ -1951,8 +2260,8 @@ def _check_shell_syntax(data, shell="sh"):
     if result.returncode:
         diagnostic = sanitize_diagnostic(
             result.stderr.decode("utf-8", "replace").strip())
-        raise ToolError("generated outer installer failed sh -n%s" %
-                        ((": " + diagnostic) if diagnostic else ""))
+        raise ToolError("generated %s failed sh -n%s" %
+                        (label, (": " + diagnostic) if diagnostic else ""))
 
 
 def _member_metadata(member):
@@ -1990,18 +2299,30 @@ def _build_reduced_plaintext(profile, firmware_data, shell="sh",
     control = profile["control"]
     firmware_paths = {"./" + BOARD_PROFILES[board]["firmware_name"]
                       for board in selected_boards}
-    retained = {"./IAPCommand", "./mcu.img", "./md5sum.list",
-                "./run.sh", "./Update"} | firmware_paths
+    updater_paths = {"./" + BOARD_PROFILES[board]["updater_name"]
+                     for board in selected_boards}
+    failure_paths = {"./" + FAILURE_IMAGE_NAMES[board]
+                     for board in selected_boards
+                     if "./" + FAILURE_IMAGE_NAMES[board] in control}
+    retained = (updater_paths | failure_paths |
+                {"./mcu.img", "./md5sum.list", "./run.sh", "./Update"} |
+                firmware_paths)
     checksum_paths = [path for path, unused in profile["checksum_entries"]
                       if path in retained and path != "./md5sum.list"]
     if set(checksum_paths) != retained - {"./md5sum.list"}:
         raise ToolError("retained control checksum order is incomplete")
+    control_script = _suppress_space_reclaim(
+        control["./run.sh"]["_data"], False)
+    control_script = _filter_result_checks(control_script, selected_boards)
+    control_script = _remove_update_marker(control_script)
+    _check_shell_syntax(control_script, shell, "control script")
     control_data = {
-        "./IAPCommand": control["./IAPCommand"]["_data"],
         "./mcu.img": control["./mcu.img"]["_data"],
-        "./run.sh": control["./run.sh"]["_data"],
+        "./run.sh": control_script,
         "./Update": control["./Update"]["_data"],
     }
+    for path in updater_paths | failure_paths:
+        control_data[path] = control[path]["_data"]
     for board in selected_boards:
         control_data["./" + BOARD_PROFILES[board]["firmware_name"]] = (
             firmware_data[board])
@@ -2018,6 +2339,8 @@ def _build_reduced_plaintext(profile, firmware_data, shell="sh",
         raise ToolError("generated control archive is not GNU tar")
     transformed_installer = _suppress_update_other(
         profile["outer"]["./runFirmwareExe.sh"]["_data"])
+    transformed_installer = _suppress_space_reclaim(
+        transformed_installer, True)
     _check_shell_syntax(transformed_installer, shell)
     control_path = profile["control_outer"]["path"]
     outer_data = {
@@ -2102,8 +2425,15 @@ def _assert_reduced_profile(model, evidence, selected_boards, md5sum="md5sum"):
     control = {member["path"]: member for member in control_members}
     expected_hex_paths = ["./" + BOARD_PROFILES[board]["firmware_name"]
                           for board in selected_boards]
-    expected_control = {"./IAPCommand", "./mcu.img", "./md5sum.list",
-                        "./run.sh", "./Update"} | set(expected_hex_paths)
+    expected_updater_paths = {
+        "./" + BOARD_PROFILES[board]["updater_name"]
+        for board in selected_boards}
+    expected_failure_paths = {
+        "./" + FAILURE_IMAGE_NAMES[board] for board in selected_boards
+        if "./" + FAILURE_IMAGE_NAMES[board] in evidence["control_data"]}
+    expected_control = (expected_updater_paths | expected_failure_paths |
+                        {"./mcu.img", "./md5sum.list", "./run.sh", "./Update"} |
+                        set(expected_hex_paths))
     if (set(control) != expected_control or
             set(evidence["control_data"]) != expected_control):
         raise ToolError("generated control archive allowlist mismatch")
@@ -2128,6 +2458,7 @@ def _assert_reduced_profile(model, evidence, selected_boards, md5sum="md5sum"):
     }
     control_labels = {
         "./IAPCommand": "IAPCommand",
+        "./ISPCommand": "ISPCommand",
         "./mcu.img": "control display image",
         "./md5sum.list": "checksum list",
         "./run.sh": "control script",
@@ -2136,6 +2467,9 @@ def _assert_reduced_profile(model, evidence, selected_boards, md5sum="md5sum"):
     for board in selected_boards:
         control_labels["./" + BOARD_PROFILES[board]["firmware_name"]] = (
             board + " firmware")
+        failure_path = "./" + FAILURE_IMAGE_NAMES[board]
+        if failure_path in control:
+            control_labels[failure_path] = board + " failure image"
     return {
         "outer": [_manifest_member(outer_labels[path], outer[path])
                   for path in evidence["outer_order"]],
@@ -2292,6 +2626,25 @@ def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
     tools["md5sum"] = _version(md5sum)
     timestamp = datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0).isoformat().replace("+00:00", "Z")
+    installer_changes = [
+        {"effect": "NIM log deletion", "status": "suppressed"},
+        {"effect": "persistent startup image replacement",
+         "status": "suppressed"},
+        {"effect": "pending-update marker removal on success",
+         "status": "added"},
+    ]
+    reclaim_templates = {profile["plaintext"]
+                         for profile in CANONICAL_TEMPLATE_PROFILES
+                         if profile.get("space_reclaim")}
+    if template_plaintext_hash in reclaim_templates:
+        installer_changes.extend([
+            {"effect": "host disk-reclaim deletions",
+             "status": "suppressed"},
+            {"effect": "unselected board failure-result checks",
+             "status": "suppressed"},
+            {"effect": "selected board failure-result check and image",
+             "status": "retained"},
+        ])
     return {
         "schema_version": 2,
         "repository": repository,
@@ -2304,17 +2657,13 @@ def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
             "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
             "members": members,
         },
-        "installer_changes": [
-            {"effect": "NIM log deletion", "status": "suppressed"},
-            {"effect": "persistent startup image replacement",
-             "status": "suppressed"},
-        ],
+        "installer_changes": installer_changes,
         "validation": {
             "passed": [
                 "firmware representations",
                 "canonical template hash gates",
                 "input control checksums",
-                "installer byte transformation and sh -n",
+                "package script transformations and sh -n",
                 "reduced archive profile",
                 "output control checksums",
                 "fresh ciphertext decryption and reinspection",
