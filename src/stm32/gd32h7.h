@@ -23,6 +23,13 @@ typedef enum {
 
 #include "core_cm7.h"
 
+// Pool excluded from the data cache by the MPU, for DMA-written buffers.
+// The MPU SIZE field encodes 2^(SIZE+1) bytes, so 8 selects 512 bytes.
+#define NONCACHED_POOL_BYTES     512U
+#define NONCACHED_POOL_WORDS     (NONCACHED_POOL_BYTES / 4U)
+#define NONCACHED_POOL_MPU_SIZE  8U
+extern volatile uint32_t noncached_pool[NONCACHED_POOL_WORDS];
+
 #define REG32(addr) (*(volatile uint32_t *)(uint32_t)(addr))
 #define BIT(x) ((uint32_t)((uint32_t)0x01U << (x)))
 #define BITS(start, end) \

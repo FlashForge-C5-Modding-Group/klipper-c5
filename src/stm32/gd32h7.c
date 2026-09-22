@@ -131,6 +131,47 @@ clock_setup(void)
         ;
 }
 
+// Memory excluded from the data cache, for buffers a DMA controller writes.
+// The Cortex-M7 has no cache coherency unit, so shareable Normal memory is
+// not allocated into the D-cache; that is how the region below is made safe
+// for DMA, and it is what stock does for its own ADC sample buffers.
+volatile uint32_t noncached_pool[NONCACHED_POOL_WORDS]
+    __attribute__((aligned(NONCACHED_POOL_BYTES)));
+
+// Mirror stock's MPU setup: a background no-access trap over the unused
+// external-memory quadrants, and one small shareable region carving the DMA
+// buffers out of the cache.  PRIVDEFENA leaves everything else on the
+// architectural default map, i.e. AXI SRAM stays cacheable write-back.
+static void
+mpu_setup(void)
+{
+    __DMB();
+    SCB->SHCSR &= ~SCB_SHCSR_MEMFAULTENA_Msk;
+    MPU->CTRL = 0;
+    __DSB();
+    __ISB();
+    MPU->RBAR = 0;
+    MPU->RASR = 0;
+
+    // 0x60000000-0xDFFFFFFF: no access, execute never.
+    MPU->RNR = 0;
+    MPU->RBAR = 0;
+    MPU->RASR = MPU_RASR_ENABLE_Msk | (0x1FU << MPU_RASR_SIZE_Pos)
+                | (0x87U << MPU_RASR_SRD_Pos) | MPU_RASR_XN_Msk;
+
+    // DMA sample buffers: shareable, so the D-cache never allocates them.
+    MPU->RNR = 1;
+    MPU->RBAR = (uint32_t)noncached_pool;
+    MPU->RASR = MPU_RASR_ENABLE_Msk | (NONCACHED_POOL_MPU_SIZE
+                                       << MPU_RASR_SIZE_Pos)
+                | (3U << MPU_RASR_AP_Pos) | MPU_RASR_C_Msk | MPU_RASR_S_Msk;
+
+    MPU->CTRL = MPU_CTRL_ENABLE_Msk | MPU_CTRL_PRIVDEFENA_Msk;
+    SCB->SHCSR |= SCB_SHCSR_MEMFAULTENA_Msk;
+    __DSB();
+    __ISB();
+}
+
 void
 armcm_main(void)
 {
@@ -138,14 +179,12 @@ armcm_main(void)
     SCB->CPACR |= 0x0fU << 20;
     __DSB();
     __ISB();
-    FPU->FPCCR = (FPU->FPCCR | FPU_FPCCR_ASPEN_Msk)
-                 & ~FPU_FPCCR_LSPEN_Msk;
-    __DSB();
-    __ISB();
     irq_restore(flag);
 
     clock_setup();
+    mpu_setup();
     SCB_EnableICache();
+    SCB_EnableDCache();
     SCB->VTOR = CONFIG_FLASH_APPLICATION_ADDRESS;
     __DSB();
     __ISB();

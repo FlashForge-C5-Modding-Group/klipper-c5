@@ -48,8 +48,10 @@ static const uint32_t pwm_bases[] = {
     TIMER3, TIMER7, TIMER1,
 };
 static struct c5_mclib_acq acquisitions[3];
-static volatile uint32_t dma_samples_y[2] __attribute__((aligned(4)));
-static volatile uint32_t dma_samples_z[2] __attribute__((aligned(4)));
+// The ADC writes these by DMA, so they must live in the MPU region that the
+// data cache does not allocate.  See noncached_pool in gd32h7.c.
+#define dma_samples_y (&noncached_pool[0])
+#define dma_samples_z (&noncached_pool[2])
 
 static const struct c5_adc_sequence adc_sequences[] = {
     { ADC0, 8, 4, 5, 9 },
@@ -145,9 +147,8 @@ static void
 process_sample(uint8_t axis, int16_t raw0, int16_t raw1)
 {
     float ia, ib;
-    if (!c5_mclib_acquire(&acquisitions[axis], raw0, raw1, &ia, &ib)) {
+    if (!c5_mclib_acquire(&acquisitions[axis], raw0, raw1, &ia, &ib))
         return;
-    }
 
     struct c5_mclib_output out;
     uint32_t now = c5_mainboardgd_motor_time();
