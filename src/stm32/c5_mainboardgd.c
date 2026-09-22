@@ -13,7 +13,14 @@
 #include "internal.h" // enable_pclock
 #include "sched.h" // DECL_INIT
 
-#define MOTOR_IRQ_PRIORITY 1
+// Stock sets PRIGROUP 5 and gives the motor IRQs group priority 1 while
+// SysTick sits in group 0, so step events preempt the 20 kHz control loop
+// and are timestamped on time. Klipper leaves PRIGROUP at 0, so reproduce
+// that order with a value numerically above SysTick (2). A step held off
+// by a running control sample corrupts the step period the X/Y fast-mode
+// switch uses, which slips the motors on fast travel. Serial (0) still
+// preempts, so a shutdown raised here is transmitted.
+#define MOTOR_IRQ_PRIORITY 3
 #define TIMER_CAR_20KHZ 14999U
 
 struct c5_adc_sequence {
