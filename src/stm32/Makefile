@@ -113,7 +113,7 @@ src-$(CONFIG_USBCANBUS) += stm32/chipid.c generic/usb_canbus.c
 src-$(CONFIG_WANT_HARD_PWM) += stm32/hard_pwm.c
 src-$(CONFIG_HAVE_GPIO_SDIO) += stm32/sdio.c
 
-src-$(CONFIG_C5_MAINBOARDGD) += stm32/c5_mainboardgd.c
+src-$(CONFIG_C5_MAINBOARDGD) += stm32/c5_mainboardgd.c stm32/c5_mainboardgd_fault.c
 src-$(CONFIG_C5_EBOARD) += stm32/c5_eboard.c
 
 # Binary output file rules

@@ -12,12 +12,21 @@
 
 DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA10,PA9");
 
-void
-USART0_IRQHandler(void)
+#if CONFIG_C5_MAINBOARDGD
+void c5_fault_stall_check(uint32_t *frame);
+void c5_fault_note_host(void);
+#endif
+
+void __visible
+usart0_irq_body(uint32_t *frame)
 {
     uint32_t stat = USART0->STAT;
-    if (stat & USART_STAT_RBNE)
+    if (stat & USART_STAT_RBNE) {
         serial_rx_byte(USART0->RDATA);
+#if CONFIG_C5_MAINBOARDGD
+        c5_fault_note_host();
+#endif
+    }
     if ((stat & USART_STAT_TBE) && (USART0->CTL0 & USART_CTL0_TBEIE)) {
         uint8_t data;
         if (serial_get_tx_byte(&data))
@@ -27,6 +36,25 @@ USART0_IRQHandler(void)
     }
     USART0->INTC = stat & (USART_STAT_PERR | USART_STAT_FERR
                            | USART_STAT_NERR | USART_STAT_ORERR);
+#if CONFIG_C5_MAINBOARDGD
+    // Runs at priority 0, so it preempts a stuck motor interrupt.
+    c5_fault_stall_check(frame);
+#else
+    (void)frame;
+#endif
+}
+
+// Capture the preempted context's exception frame for the stall check.
+void __visible __attribute__((naked))
+USART0_IRQHandler(void)
+{
+    asm volatile(
+        "mrs r0, msp\n"
+        "tst lr, #4\n"
+        "beq 1f\n"
+        "mrs r0, psp\n"
+        "1:\n"
+        "b usart0_irq_body\n");
 }
 DECL_ARMCM_IRQ(USART0_IRQHandler, USART0_IRQn);
 

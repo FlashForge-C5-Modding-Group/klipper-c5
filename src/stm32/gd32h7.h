@@ -14,12 +14,19 @@
 #define __DCACHE_PRESENT          1U
 
 typedef enum {
+    NonMaskableInt_IRQn = -14,
+    HardFault_IRQn = -13,
+    MemoryManagement_IRQn = -12,
+    BusFault_IRQn = -11,
+    UsageFault_IRQn = -10,
     SysTick_IRQn = -1,
     DMA0_Channel0_IRQn = 11,
     DMA0_Channel1_IRQn = 12,
     ADC0_1_IRQn = 18,
     USART0_IRQn = 37,
+    TIMER6_IRQn = 55,
 } IRQn_Type;
+
 
 #include "core_cm7.h"
 
@@ -514,6 +521,33 @@ typedef struct {
 #define FWDGT_WRITEACCESS_ENABLE ((uint16_t)0x5555U)
 #define FWDGT_KEY_RELOAD         ((uint16_t)0xAAAAU)
 #define FWDGT_KEY_ENABLE         ((uint16_t)0xCCCCU)
+
+// Power management unit.  The low-voltage detector is a monitor only: brown
+// out reset is disabled in this part's factory option bytes, so a supply sag
+// short of the power-down threshold is otherwise invisible.
+#define PMU_BASE                (APB4_BUS_BASE + 0x00005800U)
+#define PMU_CTL0                REG32(PMU_BASE + 0x00000000U)
+#define PMU_CS                  REG32(PMU_BASE + 0x00000004U)
+#define PMU_CTL0_LVDEN          BIT(4)
+#define PMU_CTL0_LVDT           BITS(5, 7)
+#define PMU_LVDT_2V9            ((uint32_t)6U << 5)
+#define PMU_CS_LVDF             BIT(2)
+#define RCU_APB4EN_PMUEN        BIT(4)
+
+// TIMER6 is a basic timer.  It is not part of the stock motor trigger
+// topology and is used only to give the stall check a periodic
+// priority-0 interrupt that does not depend on host traffic.
+#define TIMER6                  (TIMER_BASE + 0x00001400U)
+#define RCU_APB1EN_TIMER6EN     BIT(5)
+#define TIMER_DMAINTEN(timerx)  REG32((timerx) + 0x0000000CU)
+#define TIMER_INTF(timerx)      REG32((timerx) + 0x00000010U)
+#define TIMER_DMAINTEN_UPIE     BIT(0)
+#define TIMER_INTF_UPIF         BIT(0)
+
+_Static_assert((uintptr_t)&PMU_CTL0 == 0x58005800U
+               && (uintptr_t)&PMU_CS == 0x58005804U
+               && TIMER6 == 0x40001400U,
+               "GD32H7 PMU or basic timer address mismatch");
 
 _Static_assert(offsetof(GPIO_TypeDef, MODER) == 0x00U
                && offsetof(GPIO_TypeDef, OTYPER) == 0x04U
