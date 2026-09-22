@@ -51,7 +51,7 @@ serial_init(void)
     USART0->BAUD = DIV_ROUND_CLOSEST(pclk, CONFIG_SERIAL_BAUD);
     USART0->INTC = USART_INTC_PEC | USART_INTC_FEC
                    | USART_INTC_NEC | USART_INTC_OREC;
-    armcm_enable_irq(USART0_IRQHandler, USART0_IRQn, 2);
+    armcm_enable_irq(USART0_IRQHandler, USART0_IRQn, 0);
     USART0->CTL0 = USART_CTL0_UEN | USART_CTL0_REN | USART_CTL0_TEN
                    | USART_CTL0_RBNEIE;
 }

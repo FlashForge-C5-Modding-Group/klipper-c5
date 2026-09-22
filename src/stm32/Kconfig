@@ -147,11 +147,6 @@ config C5_MAINBOARDGD
     depends on MACH_GD32H737VGT6
     default n
 
-config C5_MAINBOARDGD_DIAGNOSTICS
-    bool "Creator 5 mainBoardGD diagnostic instrumentation"
-    depends on C5_MAINBOARDGD
-    default n
-
 config ARMCM_FLASH_SIZE_IS_TOTAL
     bool
 
