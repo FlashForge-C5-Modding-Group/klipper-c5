@@ -11,8 +11,10 @@
 
 // Cortex-m7 may disable cpu counter on wfi, and with the flash I-cache
 // enabled the n32g45x can fetch the vector of the waking interrupt from
-// the wrong cache line, so use nop instead of wfi on those parts
-#if CONFIG_MACH_N32G45x
+// the wrong cache line, so use nop instead of wfi on those parts.  The
+// n32g430 has the same vendor flash I-cache; stock Creator 5 firmware
+// never sleeps with wfi on either family.
+#if CONFIG_MACH_N32G45x || CONFIG_MACH_N32G430
 #define IRQ_WAIT_NOP 1
 #else
 #define IRQ_WAIT_NOP (__CORTEX_M == 7)
