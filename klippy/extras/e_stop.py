@@ -28,7 +28,9 @@ class EStopEndstopWrapper:
         self.home_start = self.mcu_endstop.home_start
         self.home_wait = self.mcu_endstop.home_wait
         self.query_endstop = self.mcu_endstop.query_endstop
-        self.recover_endstop_state = self.mcu_endstop.recover_endstop_state
+        recover = getattr(self.mcu_endstop, 'recover_endstop_state', None)
+        if recover is not None:
+            self.recover_endstop_state = recover
         # multi probes state
         self.multi = 'OFF'
         self.last_move_error = None

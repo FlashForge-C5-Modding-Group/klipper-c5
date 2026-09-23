@@ -3,6 +3,7 @@
 # Copyright (C) 2018-2019  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import logging
 
 class QueryEndstops:
     def __init__(self, config):
@@ -16,6 +17,8 @@ class QueryEndstops:
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command("QUERY_ENDSTOPS", self.cmd_QUERY_ENDSTOPS,
                                desc=self.cmd_QUERY_ENDSTOPS_help)
+        gcode.register_command("RECOVER_ENDSTOPS", self.cmd_RECOVER_ENDSTOPS,
+                               desc=self.cmd_RECOVER_ENDSTOPS_help)
         gcode.register_command("M119", self.cmd_QUERY_ENDSTOPS)
     def register_endstop(self, mcu_endstop, name):
         self.endstops.append((mcu_endstop, name))
@@ -31,6 +34,7 @@ class QueryEndstops:
         web_request.send({name: ["open", "TRIGGERED"][not not t]
                           for name, t in self.last_state})
     cmd_QUERY_ENDSTOPS_help = "Report on the status of each endstop"
+    cmd_RECOVER_ENDSTOPS_help = "Request MCU-side endstop state recovery"
     def cmd_QUERY_ENDSTOPS(self, gcmd):
         # Query the endstops
         print_time = self.printer.lookup_object('toolhead').get_last_move_time()
@@ -39,7 +43,17 @@ class QueryEndstops:
         # Report results
         msg = " ".join(["%s:%s" % (name, ["open", "TRIGGERED"][not not t])
                         for name, t in self.last_state])
+        logging.warning("[FP_QUERY_ENDSTOPS],MSG[%s]", msg)
         gcmd.respond_raw(msg)
+    def cmd_RECOVER_ENDSTOPS(self, gcmd):
+        recovered = 0
+        for mcu_endstop, name in self.endstops:
+            recover = getattr(mcu_endstop, 'recover_endstop_state', None)
+            if recover is not None:
+                recover()
+                recovered += 1
+        gcmd.respond_info("RECOVER_ENDSTOPS: requested recovery on %d endstop(s)"
+                          % (recovered,))
 
 def load_config(config):
     return QueryEndstops(config)

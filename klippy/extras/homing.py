@@ -320,7 +320,12 @@ class PrinterHoming:
     def check_probe_first_home(self, gcmd):
         return (gcmd.get_command() == 'G28'
                 and gcmd.get("HOME_ATTEMPT_NUM", None) == '1')
-    def probing_move(self, mcu_probe, pos, speed, check_movement=True):
+    def probing_move(self, mcu_probe, pos, speed, check_movement=True,
+                     rase=None, safe_mode=False):
+        # FlashForge's e_stop helper calls this with the misspelled ``rase``
+        # keyword.  Keep the mainline argument while accepting that vendor API.
+        if rase is not None:
+            check_movement = rase
         endstops = [(mcu_probe, "probe")]
         hmove = HomingMove(self.printer, endstops)
         try:
@@ -329,10 +334,15 @@ class PrinterHoming:
             if self.printer.is_shutdown():
                 raise self.printer.command_error(
                     "Probing failed due to printer shutdown")
+            if safe_mode:
+                return [9999., 0., 0.]
             raise
-        if check_movement and hmove.check_no_movement() is not None:
-            raise self.printer.command_error(
-                "Probe triggered prior to movement")
+        if hmove.check_no_movement() is not None:
+            if check_movement:
+                raise self.printer.command_error(
+                    "Probe triggered prior to movement")
+            # The stock e_stop module uses this sentinel to retry a sample.
+            epos[0] = 9999.
         return epos
     def cmd_G28(self, gcmd):
         # Move to origin
