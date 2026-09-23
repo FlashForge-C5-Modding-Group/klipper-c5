@@ -122,6 +122,7 @@ extern uint32_t VectorTable[];
 #define RCC_CFGR_PLLXTPRE_HSE_DIV2 (1u << 17)
 #define RCC_CFGR_PLLMULL_Pos 18
 #define RCC_CFGR_PLLMULL_Msk (15u << RCC_CFGR_PLLMULL_Pos)
+#define RCC_CFGR_MCO_Msk (7u << 24)
 #define RCC_APB1ENR_PWREN (1u << 28)
 #define RCC_APB1ENR_BKPEN (1u << 27)
 #define FLASH_ACR_LATENCY_Msk 7u

@@ -62,13 +62,15 @@ n32g45x_model_poll(volatile uint32_t *reg, uint32_t mask,
             || (RCC->CFGR & RCC_CFGR_SW_Msk) != RCC_CFGR_SW_HSI)
             model_fail(21);
     } else if (condition == 2) {
-        if ((RCC->CR & RCC_CR_PLLON)
+        if ((RCC->CR & (RCC_CR_PLLON | RCC_CR_HSEON | RCC_CR_CSSON))
             || (RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI)
             model_fail(22);
     } else if (condition == 3) {
         if ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI
-            || (RCC->CR & (RCC_CR_PLLON | RCC_CR_PLLRDY))
-            || !(RCC->CR & RCC_CR_HSEON))
+            || (RCC->CR & (RCC_CR_PLLON | RCC_CR_PLLRDY | RCC_CR_HSEBYP))
+            || !(RCC->CR & RCC_CR_HSEON)
+            || (RCC->CFGR & RCC_CFGR_MCO_Msk)
+            || RCC->CIR != 0x009f0000u)
             model_fail(23);
     } else if (condition == 4) {
         if ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI
@@ -79,7 +81,7 @@ n32g45x_model_poll(volatile uint32_t *reg, uint32_t mask,
         uint32_t flash_mask = (FLASH_ACR_LATENCY_Msk | FLASH_ACR_PRFTBE
                                | N32G45X_FLASH_ICRST | N32G45X_FLASH_ICEN);
         uint32_t flash_expected = ((CONFIG_CLOCK_FREQ - 1) / 32000000
-                                   | N32G45X_FLASH_ICEN);
+                                   | FLASH_ACR_PRFTBE | N32G45X_FLASH_ICEN);
         if ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI
             || !(RCC->CR & RCC_CR_PLLRDY)
             || (RCC->CFGR & RCC_CFGR_SW_Msk) != RCC_CFGR_SW_PLL
@@ -96,7 +98,7 @@ n32g45x_model_poll(volatile uint32_t *reg, uint32_t mask,
         RCC->CFGR = ((RCC->CFGR & ~RCC_CFGR_SWS_Msk)
                      | RCC_CFGR_SWS_HSI);
     else if (condition == 2)
-        RCC->CR &= ~RCC_CR_PLLRDY;
+        RCC->CR &= ~(RCC_CR_PLLRDY | RCC_CR_HSERDY);
     else if (condition == 3)
         RCC->CR |= RCC_CR_HSERDY;
     else if (condition == 4)
@@ -150,8 +152,13 @@ reset_model(int stall)
     memset(&model_bkp, 0, sizeof(model_bkp));
     memset(&model_scb, 0, sizeof(model_scb));
     memset(&model_gpio_ports, 0, sizeof(model_gpio_ports));
-    RCC->CR = RCC_CR_PLLON | RCC_CR_PLLRDY;
-    RCC->CFGR = RCC_CFGR_SW_PLL | RCC_CFGR_SWS_PLL;
+    // Model a boot stage that leaves PLL from HSE, CSS, MCO, and RCC
+    // interrupts configured with the prefetch buffer disabled.
+    RCC->CR = (RCC_CR_PLLON | RCC_CR_PLLRDY | RCC_CR_HSEON | RCC_CR_HSERDY
+               | RCC_CR_CSSON);
+    RCC->CFGR = (RCC_CFGR_SW_PLL | RCC_CFGR_SWS_PLL | RCC_CFGR_MCO_Msk
+                 | RCC_CFGR_PLLSRC_Msk);
+    RCC->CIR = 0x00001f00u;
     SCB->AIRCR = 3u << 8;
     stalled_condition = stall;
     reset_requested = 0;
@@ -208,7 +215,7 @@ run_normal_path(void)
     if (plan)
         return plan;
     uint32_t expected_acr = ((CONFIG_CLOCK_FREQ - 1) / 32000000
-                             | N32G45X_FLASH_ICEN);
+                             | FLASH_ACR_PRFTBE | N32G45X_FLASH_ICEN);
     uint32_t acr_mask = (FLASH_ACR_LATENCY_Msk | FLASH_ACR_PRFTBE
                          | N32G45X_FLASH_ICRST | N32G45X_FLASH_ICEN);
     if ((FLASH->ACR & acr_mask) != expected_acr)
