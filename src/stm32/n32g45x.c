@@ -103,8 +103,17 @@ n32g45x_clock_setup(void)
     n32g45x_wait_mask_or_reset(&RCC->CFGR, RCC_CFGR_SWS_Msk,
                                RCC_CFGR_SWS_HSI);
 
-    RCC->CR &= ~RCC_CR_PLLON;
+    // Return the clock tree to its reset state like the stock SystemInit:
+    // stop PLL/HSE/CSS and clear MCO, prescalers, PLL, and RCC interrupts
+    // that a boot stage may have left configured.
+    RCC->CR &= ~(RCC_CR_PLLON | RCC_CR_CSSON | RCC_CR_HSEON);
     n32g45x_wait_mask_or_reset(&RCC->CR, RCC_CR_PLLRDY, 0);
+    RCC->CR &= ~RCC_CR_HSEBYP;
+    RCC->CFGR &= ~(RCC_CFGR_HPRE_Msk | RCC_CFGR_PPRE1_Msk
+                   | RCC_CFGR_PPRE2_Msk | RCC_CFGR_MCO_Msk
+                   | RCC_CFGR_PLLSRC_Msk | RCC_CFGR_PLLXTPRE_Msk
+                   | N32G45X_PLLMUL_MASK | N32G45X_USBPRES_MASK);
+    RCC->CIR = 0x009f0000;
 
     // Reset inherited peripheral clocks only after the HSI takeover.
     RCC->AHBENR = 0x14;
@@ -116,17 +125,16 @@ n32g45x_clock_setup(void)
     *N32G45X_PWR_CTRL3 |= 1u;
     RCC->APB1ENR &= ~RCC_APB1ENR_PWREN;
 
-    // Establish flash timing and I-cache state before increasing SYSCLK.
+    // Establish flash timing, prefetch, and I-cache state before
+    // increasing SYSCLK, matching the stock eBoard/heaterBoard startup.
     uint32_t latency = (CONFIG_CLOCK_FREQ - 1) / 32000000;
     uint32_t acr = FLASH->ACR;
-    acr &= ~(FLASH_ACR_LATENCY_Msk | FLASH_ACR_PRFTBE
-             | N32G45X_FLASH_ICRST);
-    FLASH->ACR = acr | latency | N32G45X_FLASH_ICEN;
+    acr &= ~(FLASH_ACR_LATENCY_Msk | N32G45X_FLASH_ICRST);
+    FLASH->ACR = acr | latency | FLASH_ACR_PRFTBE | N32G45X_FLASH_ICEN;
 
     uint32_t pll_bits;
     if (!CONFIG_STM32_CLOCK_REF_INTERNAL) {
         // Prefer HSE/2 when its integral PLL multiplier is representable.
-        RCC->CR &= ~(RCC_CR_HSEON | RCC_CR_HSEBYP | RCC_CR_CSSON);
         RCC->CR |= RCC_CR_HSEON;
         n32g45x_wait_mask_or_reset(&RCC->CR, RCC_CR_HSERDY,
                                    RCC_CR_HSERDY);
@@ -142,10 +150,7 @@ n32g45x_clock_setup(void)
 
     // HCLK=SYSCLK, PCLK1=HCLK/4, and PCLK2=HCLK/2 at 144MHz.
     uint32_t cfgr = RCC->CFGR;
-    cfgr &= ~(RCC_CFGR_SW_Msk | RCC_CFGR_HPRE_Msk
-              | RCC_CFGR_PPRE1_Msk | RCC_CFGR_PPRE2_Msk
-              | RCC_CFGR_PLLSRC_Msk | RCC_CFGR_PLLXTPRE_Msk
-              | N32G45X_PLLMUL_MASK | N32G45X_USBPRES_MASK);
+    cfgr &= ~RCC_CFGR_SW_Msk;
     if (CONFIG_CLOCK_FREQ > 72000000)
         cfgr |= RCC_CFGR_PPRE1_DIV4 | RCC_CFGR_PPRE2_DIV2;
     else if (CONFIG_CLOCK_FREQ > 36000000)
