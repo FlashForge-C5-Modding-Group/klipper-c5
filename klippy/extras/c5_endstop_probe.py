@@ -4,6 +4,7 @@
 #                     <155874349+wondercrash@users.noreply.github.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+from . import homing
 
 REBASELINE_TRIES = 6
 
@@ -56,14 +57,40 @@ class C5EndstopProbe:
             toolhead.dwell(1.)
         raise self.printer.command_error(
             "%s triggered prior to movement" % (self.name,))
+    def _probing_move(self, pos):
+        hmove = homing.HomingMove(self.printer, [(self.mcu_endstop, "probe")])
+        try:
+            epos = hmove.homing_move(pos, self.speed, probe_pos=True)
+        except self.printer.command_error:
+            if self.printer.is_shutdown():
+                raise self.printer.command_error(
+                    "Probing failed due to printer shutdown")
+            raise
+        if hmove.check_no_movement() is not None:
+            return None
+        return epos
     def _sample(self, axis, target):
         toolhead = self.printer.lookup_object('toolhead')
-        self._ensure_clear(toolhead)
+        gcode = self.printer.lookup_object('gcode')
         pos = toolhead.get_position()
         start = pos[axis]
         pos[axis] = target
-        phoming = self.printer.lookup_object('homing')
-        epos = phoming.probing_move(self.mcu_endstop, pos, self.speed)
+        # Stock e_stop discards a sample that triggers before the axis moves
+        # and probes again; the levelBoard sensor can report clear to a query
+        # and still trigger as soon as it is armed.
+        for i in range(REBASELINE_TRIES):
+            self._ensure_clear(toolhead)
+            epos = self._probing_move(pos)
+            if epos is not None:
+                break
+            gcode.respond_info("%s: triggered before moving, probing again"
+                               % (self.name,))
+            if self.basic_param_cmd is not None:
+                self.basic_param_cmd.send([0])
+                toolhead.dwell(1.)
+        else:
+            raise self.printer.command_error(
+                "%s triggered prior to movement" % (self.name,))
         if self.retract:
             coord = [None, None, None]
             coord[axis] = epos[axis] + (self.retract if target < start

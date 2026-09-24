@@ -4466,10 +4466,10 @@ axes:
 #   The number of times to restart sampling when the spread exceeds
 #   samples_tolerance. The default is 10.
 #rebaseline: False
-#   If true, an endstop that is already triggered before a sample is
-#   re-baselined with the Creator 5 levelBoard "get_basic_param"
-#   command (up to 6 times) instead of failing immediately. The
-#   default is False.
+#   If true, an endstop that is already triggered before a sample, or
+#   that triggers before the axis moves, is re-baselined with the
+#   Creator 5 levelBoard "get_basic_param" command (up to 6 times)
+#   instead of failing immediately. The default is False.
 ```
 
 ### [c5_tool_sensors]
