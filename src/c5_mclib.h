@@ -70,7 +70,6 @@ void c5_mclib_microstep(struct c5_mclib_motor *m,
                         uint8_t interpolate, uint16_t exponent);
 void c5_mclib_current(struct c5_mclib_motor *m,
                       uint32_t run_ma, uint32_t hold_ma);
-void c5_mclib_pid(struct c5_mclib_motor *m, uint32_t kp, uint32_t ki);
 void c5_mclib_stall_threshold(struct c5_mclib_motor *m,
                               uint32_t threshold);
 void c5_mclib_resonance(struct c5_mclib_motor *m,

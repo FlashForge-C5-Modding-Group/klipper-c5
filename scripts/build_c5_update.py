@@ -490,9 +490,6 @@ BOARD_PROFILES = {
             ("buttons_query oid=%c clock=%u rest_ticks=%u "
              "retransmit_count=%c invert=%c"),
             "buttons_ack oid=%c count=%c", "get_mcu_version",
-            "set_trigger_threshold threshold=%i", "get_basic_param num=%u",
-            "pa_action action=%u pc=%u", "get_emcu_pa_value",
-            "remove_peel action=%u",
         },
         "required_responses": {
             "identify_response offset=%u data=%.*s",
@@ -505,7 +502,10 @@ BOARD_PROFILES = {
             "buttons_state oid=%c ack_count=%c state=%*s",
             "mcu_version year=%u date=%u version=%u",
         },
-        "forbidden_commands": {"config_reset"},
+        "forbidden_commands": {
+            "config_reset", "set_trigger_threshold", "get_basic_param",
+            "pa_action", "get_emcu_pa_value", "remove_peel",
+        },
         "forbidden_responses": {
             "trigger_threshold", "param_value", "pa_value", "peel_data",
             "pa_action",
@@ -668,12 +668,9 @@ BOARD_PROFILES = {
             "mclib_config_microstep oid=%c interpolate=%c mstep=%u",
             "mclib_config_stalldetect oid=%c stallthrs=%u",
             "mclib_set_current oid=%c run_current=%u hold_current=%u",
-            "mclib_set_pid_params oid=%c kp=%u ki=%u",
             ("mclib_set_resonance_damp oid=%c tdx=%c amp=%u phase1=%u "
              "phase2=%u"),
-            "mclib_identify_motor oid=%c umax=%u umin=%u",
-            "get_mcu_version", "remove_peel action=%u",
-            "pa_action action=%u pc=%u", "get_emcu_pa_value",
+            "get_mcu_version",
         },
         "required_responses": {
             "identify_response offset=%u data=%.*s",
@@ -687,18 +684,20 @@ BOARD_PROFILES = {
             "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
             "analog_in_state oid=%c next_clock=%u value=%hu",
             "buttons_state oid=%c ack_count=%c state=%*s",
-            "mcu_version year=%u date=%u version=%u", "pa_value value=%u",
+            "mcu_version year=%u date=%u version=%u",
         },
         "forbidden_commands": {
             "config_reset", "endstop_recover_state", "get_basic_param",
             "set_trigger_threshold", "config_pwm_out", "queue_pwm_out",
             "config_spi", "spi_set_bus", "spi_transfer", "spi_send",
             "config_spi_shutdown", "config_lis2dw", "query_lis2dw",
-            "query_lis2dw_status",
+            "query_lis2dw_status", "mclib_set_pid_params",
+            "mclib_identify_motor", "remove_peel", "pa_action",
+            "get_emcu_pa_value",
         },
         "forbidden_responses": {
             "endstop_recover_state", "param_value", "peel_data",
-            "trigger_threshold", "spi_transfer_response",
+            "trigger_threshold", "spi_transfer_response", "pa_value",
         },
         "forbidden_format_names": {
             "Eboard", "Eheaterboard", "GDMainboard", "Levelboard",
