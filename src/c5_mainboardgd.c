@@ -216,14 +216,6 @@ DECL_COMMAND(command_mclib_identify_motor,
              "mclib_identify_motor oid=%c umax=%u umin=%u");
 
 void
-command_mainboardgd_get_mcu_version(uint32_t *args)
-{
-    (void)args;
-    sendf("mcu_version year=%u date=%u version=%u", 2026u, 920u, 1u);
-}
-DECL_COMMAND(command_mainboardgd_get_mcu_version, "get_mcu_version");
-
-void
 command_mainboardgd_remove_peel(uint32_t *args)
 {
     (void)args;

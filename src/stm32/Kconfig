@@ -125,12 +125,14 @@ endchoice
 config C5_LEVELBOARD
     bool "Creator 5 levelBoard compatibility"
     depends on MACH_N32G430F8S7
+    select C5_BOARD
     select ARMCM_EXPLICIT_RESET_ENTRY
     default n
 
 config C5_EBOARD
     bool "Creator 5 eBoard compatibility"
     depends on MACH_N32G455
+    select C5_BOARD
     select ARMCM_FLASH_SIZE_IS_TOTAL
     select ARMCM_EXPLICIT_RESET_ENTRY
     default n
@@ -138,6 +140,7 @@ config C5_EBOARD
 config C5_HEATERBOARD
     bool "Creator 5 heaterBoard compatibility"
     depends on MACH_N32G455 && !C5_EBOARD
+    select C5_BOARD
     select ARMCM_FLASH_SIZE_IS_TOTAL
     select ARMCM_EXPLICIT_RESET_ENTRY
     default n
@@ -145,7 +148,11 @@ config C5_HEATERBOARD
 config C5_MAINBOARDGD
     bool "Creator 5 mainBoardGD compatibility"
     depends on MACH_GD32H737VGT6
+    select C5_BOARD
     default n
+
+config C5_BOARD
+    bool
 
 config ARMCM_FLASH_SIZE_IS_TOTAL
     bool

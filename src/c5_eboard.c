@@ -499,14 +499,6 @@ c5_eboard_shutdown(void)
 DECL_SHUTDOWN(c5_eboard_shutdown);
 
 void
-command_get_mcu_version(uint32_t *args)
-{
-    (void)args;
-    sendf("mcu_version year=%u date=%u version=%u", 2026u, 919u, 2u);
-}
-DECL_COMMAND(command_get_mcu_version, "get_mcu_version");
-
-void
 command_set_trigger_threshold(uint32_t *args)
 {
     int32_t threshold = (int32_t)args[0];
