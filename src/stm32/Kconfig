@@ -154,6 +154,37 @@ config C5_MAINBOARDGD
 config C5_BOARD
     bool
 
+# Creator 5 boards build only the optional features that the stock
+# firmware for the same board advertises.  These defaults take
+# precedence over the generic "default y" in src/Kconfig because this
+# file is sourced first.
+config WANT_ST7920
+    default n if C5_BOARD
+config WANT_HD44780
+    default n if C5_BOARD
+config WANT_HX71X
+    default n if C5_BOARD
+config WANT_TRIGGER_ANALOG
+    default n if C5_BOARD
+config WANT_BMI160
+    default n if C5_BOARD
+config WANT_MPU9250
+    default n if C5_BOARD
+config WANT_ICM20948
+    default n if C5_BOARD
+config WANT_ADS1220
+    default n if C5_BOARD
+config WANT_ADS131M0X
+    default n if C5_BOARD
+config WANT_LDC1612
+    default n if C5_BOARD
+config WANT_TMCUART
+    default n if C5_MAINBOARDGD
+config WANT_NEOPIXEL
+    default n if C5_MAINBOARDGD
+config WANT_PULSE_COUNTER
+    default n if C5_MAINBOARDGD
+
 config ARMCM_FLASH_SIZE_IS_TOTAL
     bool
 
