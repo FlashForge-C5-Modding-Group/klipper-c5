@@ -282,8 +282,9 @@ is enabled.
 `ENDSTOP_PROBE NAME=<config_name> AXIS=<X|Y|Z> TARGET=<pos>`: Move
 the given axis toward TARGET until the endstop triggers, back off by
 `retract`, and repeat until `samples` results agree within
-`samples_tolerance`. The average trigger position is reported and made
-available as `last_result` in the
+`samples_tolerance`. A sample that triggers before the axis moves is
+discarded and probed again (up to 6 times). The average trigger position
+is reported and made available as `last_result` in the
 [c5_endstop_probe status](Status_Reference.md#c5_endstop_probe).
 
 ### [c5_tool_sensors]
