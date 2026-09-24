@@ -60,6 +60,14 @@ Note that only the rp2XXX micro-controllers report a non-zero
 `tx_retries` field and the rp2XXX micro-controllers always report
 `tx_error` as zero and `bus_state` as "active".
 
+## c5_endstop_probe
+
+The following information is available in
+[c5_endstop_probe some_name](Config_Reference.md#c5_endstop_probe)
+objects:
+- `last_result`: The average trigger position of the last successful
+  `ENDSTOP_PROBE` command (0.0 before the first one).
+
 ## configfile
 
 The following information is available in the `configfile` object

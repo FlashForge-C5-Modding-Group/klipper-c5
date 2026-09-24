@@ -4435,6 +4435,43 @@ bus_voltage:
 #   harmonics. The defaults disable resonance damping.
 ```
 
+## Creator 5 endstop probing
+
+### [c5_endstop_probe]
+
+Probe along X, Y or Z with an arbitrary endstop pin, as needed by the
+FlashForge Creator 5 tool calibrations (for example the levelBoard
+eddy-current station). One may define any number of sections with a
+"c5_endstop_probe" prefix. The endstop is also reported by
+`QUERY_ENDSTOPS` under the section name.
+
+```
+[c5_endstop_probe my_probe]
+pin:
+#   The endstop pin. This parameter must be provided.
+axes:
+#   The axes (a combination of the letters x, y and z) this endstop may
+#   probe along. The steppers of these axes stop when it triggers. This
+#   parameter must be provided.
+#speed: 5.0
+#   The probing speed (in mm/s). The default is 5.
+#retract: 3.0
+#   The distance (in mm) to back off after each trigger. The default
+#   is 3.
+#samples: 3
+#   The number of samples to take. The default is 3.
+#samples_tolerance: 0.02
+#   The maximum spread (in mm) between samples. The default is 0.02.
+#samples_tolerance_retries: 10
+#   The number of times to restart sampling when the spread exceeds
+#   samples_tolerance. The default is 10.
+#rebaseline: False
+#   If true, an endstop that is already triggered before a sample is
+#   re-baselined with the Creator 5 levelBoard "get_basic_param"
+#   command (up to 6 times) instead of failing immediately. The
+#   default is False.
+```
+
 ## Run-time stepper motor current configuration
 
 ### [ad5206]

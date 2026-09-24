@@ -271,6 +271,21 @@ V3.0 or V3.1 may also support `set_5V_output_mode`,
 `BLTOUCH_STORE MODE=<output_mode>`: This stores an output mode in the
 EEPROM of a BLTouch V3.1 Available output_modes are: `5V`, `OD`
 
+### [c5_endstop_probe]
+
+The following command is available when a
+[c5_endstop_probe config section](Config_Reference.md#c5_endstop_probe)
+is enabled.
+
+#### ENDSTOP_PROBE
+
+`ENDSTOP_PROBE NAME=<config_name> AXIS=<X|Y|Z> TARGET=<pos>`: Move
+the given axis toward TARGET until the endstop triggers, back off by
+`retract`, and repeat until `samples` results agree within
+`samples_tolerance`. The average trigger position is reported and made
+available as `last_result` in the
+[c5_endstop_probe status](Status_Reference.md#c5_endstop_probe).
+
 ### [configfile]
 
 The configfile module is automatically loaded.
