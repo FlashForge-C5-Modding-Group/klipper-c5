@@ -4386,6 +4386,55 @@ run_current:
 #   sensorless homing.
 ```
 
+## Creator 5 motor control configuration
+
+### [mclib]
+
+Configure a stepper motor driven by the FlashForge Creator 5 mainBoardGD
+motor-control firmware (stepper_x, stepper_y or stepper_z). To use this
+feature, define a config section with an "mclib" prefix followed by the
+name of the corresponding stepper config section (for example,
+"[mclib stepper_x]"). The microsteps setting of the stepper config
+section is sent to the motor controller.
+
+```
+[mclib stepper_x]
+motor_rs:
+#   The motor phase resistance (in Ohms). This parameter must be
+#   provided.
+motor_ls:
+#   The motor phase inductance (in Henries). This parameter must be
+#   provided.
+motor_km:
+#   The motor torque constant (in N*m/A). This parameter must be
+#   provided.
+bus_voltage:
+#   The motor supply voltage (in Volts). It is only used to derive the
+#   default stall_threshold. This parameter must be provided.
+#run_current: 1.0
+#   The current (in amps) used while the motor is moving. The
+#   maximum is 4.0. The default is 1.0.
+#hold_current:
+#   The current (in amps) used while the motor is idle. The default
+#   is to use the same value as run_current.
+#interpolate: True
+#   If true, enable step interpolation. The default is True.
+#stall_threshold:
+#   The stall detection threshold. The default is bus_voltage * 1000.
+#td1_amp: 0
+#td1_phase1: 0
+#td1_phase2: 0
+#td2_amp: 0
+#td2_phase1: 0
+#td2_phase2: 0
+#td4_amp: 0
+#td4_phase1: 0
+#td4_phase2: 0
+#   Resonance damping amplitude (in amps, at most run_current) and
+#   phases (in radians, not negative) for the first, second and fourth
+#   harmonics. The defaults disable resonance damping.
+```
+
 ## Run-time stepper motor current configuration
 
 ### [ad5206]
