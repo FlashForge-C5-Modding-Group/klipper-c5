@@ -4435,7 +4435,7 @@ bus_voltage:
 #   harmonics. The defaults disable resonance damping.
 ```
 
-## Creator 5 endstop probing
+## Creator 5 tool changer support
 
 ### [c5_endstop_probe]
 
@@ -4470,6 +4470,26 @@ axes:
 #   re-baselined with the Creator 5 levelBoard "get_basic_param"
 #   command (up to 6 times) instead of failing immediately. The
 #   default is False.
+```
+
+### [c5_tool_sensors]
+
+Wait for the FlashForge Creator 5 tool dock and mount sensors during
+tool changes. The sensors are
+[gcode_button](Config_Reference.md#gcode_button) sections.
+
+```
+[c5_tool_sensors]
+dock_buttons:
+#   A comma separated list of gcode_button names, one per tool, that
+#   report the tool is in its dock. This parameter must be provided.
+mount_buttons:
+#   A comma separated list of gcode_button names that report the
+#   carriage holds a tool (any of them pressed). This parameter must be
+#   provided.
+#timeout: 1.0
+#   The default maximum time (in seconds) TOOL_SENSOR_WAIT waits. The
+#   default is 1 second.
 ```
 
 ## Run-time stepper motor current configuration
