@@ -286,6 +286,21 @@ the given axis toward TARGET until the endstop triggers, back off by
 available as `last_result` in the
 [c5_endstop_probe status](Status_Reference.md#c5_endstop_probe).
 
+### [c5_tool_sensors]
+
+The following command is available when the
+[c5_tool_sensors config section](Config_Reference.md#c5_tool_sensors)
+is enabled.
+
+#### TOOL_SENSOR_WAIT
+
+`TOOL_SENSOR_WAIT [TOOL=<index>] [HELD=<0|1>] [DOCKED=<0|1>]
+[TIMEOUT=<seconds>]`: Wait for all queued moves to complete, then until
+the carriage mount sensors report HELD and the dock sensor of TOOL
+reports DOCKED (a parameter that is not given is not checked), or until
+the timeout expires. The command does not fail on timeout; check the
+sensors afterwards.
+
 ### [configfile]
 
 The configfile module is automatically loaded.
