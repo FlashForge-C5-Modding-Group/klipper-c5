@@ -144,7 +144,9 @@ class GCodeDispatch:
                 "gcode command %s already registered" % (cmd,))
         if not self.is_traditional_gcode(cmd):
             if (cmd.upper() != cmd or not cmd.replace('_', 'A').isalnum()
-                or cmd[0].isdigit() or cmd[1:2].isdigit()):
+                or cmd[0].isdigit()
+                or (cmd[1:2].isdigit() and not re.match(
+                    r'^[A-Z][0-9]+_[A-Z0-9_]+$', cmd))):
                 raise self.printer.config_error(
                     "Can't register '%s' as it is an invalid name" % (cmd,))
             origfunc = func
@@ -213,6 +215,11 @@ class GCodeDispatch:
                 cmd = ''.join(parts[3:5]).strip()
             else:
                 cmd = ''.join(parts[:3]).strip()
+            # The traditional parser reads C5_FOO as C5.  Commands with a
+            # numeric family prefix and an underscore are extended commands;
+            # retain their complete name for lookup and argument parsing.
+            if re.match(r'^[A-Z][0-9]+_[A-Z0-9_]+(?:\s|$)', line.upper()):
+                cmd = line.split(None, 1)[0].upper()
             # Build gcode "params" dictionary
             params = { parts[i]: parts[i+1].strip()
                        for i in range(1, len(parts), 2) }
