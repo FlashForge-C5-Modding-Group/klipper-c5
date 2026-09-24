@@ -1055,6 +1055,27 @@ acceleration above the specified limits. The
 velocity change (in mm/s) of the motor during the junction of two
 moves (the default is 1mm/s).
 
+### [mclib]
+
+The following commands are available when an
+[mclib config section](Config_Reference.md#mclib) is enabled.
+
+#### MCLIB_SET_CURRENT
+
+`MCLIB_SET_CURRENT STEPPER=<name> [CURRENT=<amps>]
+[HOLDCURRENT=<amps>]`: Set the run and hold current of the motor. A
+parameter that is not given keeps its current value (the hold current
+is limited to the run current). The change takes effect immediately
+and is not synchronized with queued moves.
+
+#### MCLIB_SET_RESONANCE_DAMP
+
+`MCLIB_SET_RESONANCE_DAMP STEPPER=<name> [TDX=<1|2|4>] [AMP=<amps>]
+[PHASE1=<radians>] [PHASE2=<radians>]`: Set the resonance damping of
+one harmonic (default TDX=1). A parameter that is not given keeps its
+current value. The change takes effect immediately and is not saved to
+the config file.
+
 ### [mcp4018]
 
 The following command is available when a
