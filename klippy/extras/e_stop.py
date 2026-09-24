@@ -89,8 +89,10 @@ class EStopEndstopWrapper:
     #     return None
     def e_stop_move(self, pos, speed):
         phoming = self.printer.lookup_object('homing')
+        # Keep the vendor-compatible no-movement sentinel path.  This fork's
+        # probing_move() maps rase=False to check_movement=False.
         epos = phoming.probing_move(self, pos, speed, rase=False,
-                                         safe_mode=False)
+                                    safe_mode=False)
         return epos
     def get_position_endstop(self):
         return self.position_endstop
@@ -115,8 +117,8 @@ class EStopFunc:
         self.position_offset = config.getfloat('offset', 0.)
         self.back_v = config.getfloat('back_v', 2.0)
         self.err_v = config.getfloat('error_v', 0.05)
-        self.main_cnt = config.getfloat('main_cycle_cnt', 3.0)
-        self.sub_cnt = config.getfloat('sub_cycle_cnt', 3.0)
+        self.main_cnt = config.getint('main_cycle_cnt', 3, minval=0)
+        self.sub_cnt = config.getint('sub_cycle_cnt', 3, minval=1)
         self._last_probe_error = None
 
     # def _probe(self, speed):
@@ -335,12 +337,16 @@ class EStopFunc:
         #return epos[:3]
         return s_pos
     def run_probe(self, gcmd):
-        toolhead = self.printer.lookup_object('toolhead')
-        #probexy = toolhead.get_position()[:2]
         positions = []
         retries = 0
+        attempts = 0
+        max_attempts = (self.main_cnt + 1) * self.sub_cnt * 2
         # Probe position
         while len(positions) < self.sub_cnt:
+            attempts += 1
+            if attempts > max_attempts:
+                raise gcmd.error('ESTOP %s did not produce stable samples'
+                                 % self.stepper_name)
             pos = self._probe(self.speed)
             if pos == 9999:
                 continue

@@ -44,7 +44,7 @@ class HdHomeEndstopWrapper:
         phoming = self.printer.lookup_object('homing')
         return phoming.probing_move(self, pos, speed)
     def get_position_endstop(self):
-        return self.x_endstop
+        return self.position_endstop
 
 
 class HdlmtHome:
@@ -95,6 +95,16 @@ class HdlmtHome:
         pos = self._probe(self.speed)
         positions.append(pos)
         return pos
+    def measure_axis(self, target):
+        # Allow callers to use the same endstop measurement as HDHOME without
+        # parsing the human-readable G-code response.
+        previous_target = self.position_offset
+        try:
+            self.position_offset = target
+            pos = self._probe(self.speed)
+            return pos['XYZ'.index(self.stepper_name)]
+        finally:
+            self.position_offset = previous_target
     cmd_HDHOME_help = "measure XYZ position mm value use hd limit"
     def cmd_HDHOME(self, gcmd):
         self.position_offset = gcmd.get_float('TARGET', self.position_offset)

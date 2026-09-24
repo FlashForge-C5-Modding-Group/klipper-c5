@@ -1,0 +1,931 @@
+# Creator 5 toolchanger, levelboard calibration, and motion interlocks.
+# Copyright (C) 2026
+# This file may be distributed under the terms of the GNU GPLv3 license.
+import json
+import logging
+import math
+import os
+import shutil
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime
+
+
+# Config::initExtruderConfig() in the factory firmwareExe binary.  These are
+# nominal positions; saved measurements in the printer's config take priority.
+FACTORY_DOCKS = ((298.219, 56.472), (298.605, 107.100),
+                 (298.200, 156.920), (298.238, 207.140))
+FACTORY_MEASUREMENTS = ((15.800, 215.280, 1.460),
+                        (15.820, 215.280, 1.467),
+                        (15.550, 216.085, 1.406),
+                        (15.864, 215.340, 1.437))
+# CommMgr::cmdXYCalibrationManualFrontHome() in firmwareExe.i64 uses this
+# temporary coordinate after the operator aligns the carriage by hand.
+HOLDER_REFERENCE_X = 295.
+HOLDER_REFERENCE_Y_BASE = 80.
+HOLDER_REFERENCE_Y_PITCH = 50.
+
+
+class Creator5Toolchanger:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.configfile = self.printer.lookup_object('configfile')
+        self.section = config.get_name()
+        self.docks = [[config.getfloat('t%d_dock_x' % i, value[0]),
+                       config.getfloat('t%d_dock_y' % i, value[1])]
+                      for i, value in enumerate(FACTORY_DOCKS)]
+        self.measurements = [[config.getfloat('t%d_measure_x' % i, value[0]),
+                              config.getfloat('t%d_measure_y' % i, value[1]),
+                              config.getfloat('t%d_measure_z' % i, value[2])]
+                             for i, value in enumerate(FACTORY_MEASUREMENTS)]
+        self.station_x = config.getfloat('station_x', 28.815)
+        self.station_y = config.getfloat('station_y', 215.097)
+        self.station_z = config.getfloat('station_z', -1.078)
+        self.extruder_json_path = config.get(
+            'extruder_json_path', '/usr/data/firmwareRes/config/extruder.json')
+        self._load_extruder_json()
+        self.zoffset_json_path = config.get(
+            'zoffset_json_path', '/usr/data/firmwareRes/config/zoffset.json')
+        self.z_adjustments = [0.] * 4
+        self._load_zoffset_json()
+        self.tool_fixture_shift_x = config.getfloat('tool_fixture_shift_x',
+                                                    -12.5)
+        self.scan_span = config.getfloat('scan_span', 7., above=0.)
+        self.scan_height = config.getfloat('scan_height', None)
+        self.reference_scan_height = config.getfloat('reference_scan_height',
+                                                     None)
+        self.z_probe_target = config.getfloat('z_probe_target', -8.)
+        self.safe_z = config.getfloat('safe_z', 10., above=0.)
+        self.max_mount_correction = config.getfloat(
+            'max_mount_correction', 2., above=0.)
+        self.max_offset_correction = config.getfloat(
+            'max_offset_correction', 3., above=0.)
+        self.pickup_accel = config.getfloat('pickup_accel', 8000., above=0.)
+        self.approach_x = config.getfloat('approach_x', 250.)
+        self.pre_dock_x = config.getfloat('pre_dock_x', 280.)
+        self.pullback = config.getfloat('pullback', 20., above=0.)
+        self.pickup_latch_wait_ms = config.getint('pickup_latch_wait_ms',
+                                                  1800, minval=0)
+        self.release_latch_wait_ms = config.getint('release_latch_wait_ms',
+                                                   800, minval=0)
+        self.sensor_settle_ms = config.getint('sensor_settle_ms', 150,
+                                              minval=0)
+        self.position_calibration_timeout = config.getfloat(
+            'position_calibration_timeout', 30., above=0.)
+        self.position_calibration_release_wait_ms = config.getint(
+            'position_calibration_release_wait_ms', 5000, minval=0)
+        self.position_calibration_accel = config.getfloat(
+            'position_calibration_accel', 1000., above=0.)
+        self.purge_x = config.getfloat('purge_x', 266.5)
+        self.purge_y = config.getfloat('purge_y', 13.8)
+        self.purge_z = config.getfloat('purge_z', 1.0)
+        self.purge_length = config.getfloat('purge_length', 12., minval=0.)
+        self.purge_speed = config.getfloat('purge_speed', 3., above=0.)
+        self.door_buttons = config.getlist('door_buttons', [])
+        self.dock_buttons = config.getlist('dock_buttons',
+            ['extruder_pos%d' % (i + 1) for i in range(4)])
+        self.grab_buttons = config.getlist('grab_buttons',
+            ['extruder_grab%d' % (i + 1) for i in range(4)])
+        if len(self.dock_buttons) != 4 or len(self.grab_buttons) != 4:
+            raise config.error('Creator 5 requires four dock and grab buttons')
+        self.active = None
+        self.busy = False
+        for name, handler in (
+            ('C5_TOOL_STATUS', self.cmd_status),
+            ('C5_TOOL_SELECT', self.cmd_select),
+            ('C5_TOOL_DOCK', self.cmd_dock),
+            ('C5_TOOL_PURGE', self.cmd_purge),
+            ('C5_CHECK_LOAD_TOOL', self.cmd_check_load_tool),
+            ('C5_CALIBRATE_ALL_OFFSETS', self.cmd_calibrate_all_offsets),
+            ('C5_HOME_FOR_PRINT', self.cmd_home_for_print),
+            ('C5_RECOVER_ATTACHED', self.cmd_recover_attached),
+            ('C5_TOOL_OFFSET_CALIBRATE', self.cmd_offset_calibrate),
+            ('C5_LEVELBOARD_REFERENCE_CALIBRATE',
+             self.cmd_reference_calibrate),
+            ('C5_SAVE_OFFSETS_JSON', self.cmd_save_offsets_json),
+            ('C5_CALIBRATE_ATTACHED', self.cmd_calibrate_attached),
+            ('C5_MOUNT_COORDS', self.cmd_mount_coords),
+            ('C5_MOUNT_CORRECT', self.cmd_mount_correct),
+            ('C5_MOUNT_PROBE', self.cmd_mount_probe),
+            ('EXTRUDER_POSITION_CALIBRATE',
+             self.cmd_extruder_position_calibrate),
+            ('C5_EXTRUDER_POSITION_CALIBRATE',
+             self.cmd_extruder_position_calibrate)):
+            self.gcode.register_command(name, handler)
+
+    def _read_stock_json(self, path):
+        with open(path, 'r') as source:
+            raw = source.read()
+        data, end = json.JSONDecoder().raw_decode(raw.lstrip())
+        if not isinstance(data, dict):
+            raise ValueError('%s must contain a JSON object' % path)
+        suffix = raw.lstrip()[end:].strip()
+        if suffix and not (suffix.startswith('/*') and suffix.endswith('*/')):
+            raise ValueError('%s has unexpected trailing content' % path)
+        return data, suffix
+
+    def _load_extruder_json(self):
+        if not os.path.isfile(self.extruder_json_path):
+            return
+        try:
+            data, suffix = self._read_stock_json(self.extruder_json_path)
+            for tool in range(4):
+                for axis, index in (('x', 0), ('y', 1), ('z', 2)):
+                    key = 't%d_offset_%s' % (tool, axis)
+                    if key in data:
+                        value = float(data[key])
+                        if not math.isfinite(value):
+                            raise ValueError('%s is not finite' % key)
+                        self.measurements[tool][index] = value
+                xkey = 'x_check_pos' + (str(tool) if tool else '')
+                ykey = 'y_check_pos' + (str(tool) if tool else '')
+                for key, index in ((xkey, 0), (ykey, 1)):
+                    if key in data:
+                        value = float(data[key])
+                        if not math.isfinite(value):
+                            raise ValueError('%s is not finite' % key)
+                        self.docks[tool][index] = value
+            for key, attr in (('x_station_pos', 'station_x'),
+                              ('y_station_pos', 'station_y'),
+                              ('z_station_pos', 'station_z')):
+                if key in data:
+                    value = float(data[key])
+                    if not math.isfinite(value):
+                        raise ValueError('%s is not finite' % key)
+                    setattr(self, attr, value)
+        except (OSError, ValueError, TypeError) as exc:
+            raise self.printer.config_error('Invalid %s: %s' % (
+                self.extruder_json_path, exc))
+
+    def _load_zoffset_json(self):
+        if not os.path.isfile(self.zoffset_json_path):
+            return
+        try:
+            data, suffix = self._read_stock_json(self.zoffset_json_path)
+            for tool in range(4):
+                key = 'z_offset_t%d' % (tool + 1)
+                value = float(data.get(key, 0.))
+                if not math.isfinite(value):
+                    raise ValueError('%s is not finite' % key)
+                self.z_adjustments[tool] = value
+        except (OSError, ValueError, TypeError) as exc:
+            raise self.printer.config_error('Invalid %s: %s' % (
+                self.zoffset_json_path, exc))
+
+    def cmd_save_offsets_json(self, gcmd):
+        if self.busy:
+            raise gcmd.error('Cannot save offsets while toolchanger is moving')
+        if not os.path.isfile(self.extruder_json_path):
+            raise gcmd.error('Missing stock %s; refusing to create it'
+                             % self.extruder_json_path)
+        try:
+            data, suffix = self._read_stock_json(self.extruder_json_path)
+            for tool in range(4):
+                for axis, value in zip('xyz', self.measurements[tool]):
+                    data['t%d_offset_%s' % (tool, axis)] = value
+                data['x_check_pos' + (str(tool) if tool else '')] = (
+                    self.docks[tool][0])
+                data['y_check_pos' + (str(tool) if tool else '')] = (
+                    self.docks[tool][1])
+            data['x_station_pos'] = self.station_x
+            data['y_station_pos'] = self.station_y
+            data['z_station_pos'] = self.station_z
+            directory = os.path.dirname(self.extruder_json_path)
+            backup = self.extruder_json_path + '.bak-' + (
+                datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+            shutil.copy2(self.extruder_json_path, backup)
+            fd, temp_path = tempfile.mkstemp(prefix='.extruder-',
+                                             suffix='.tmp', dir=directory)
+            try:
+                os.chmod(temp_path, os.stat(self.extruder_json_path).st_mode)
+                with os.fdopen(fd, 'w') as target:
+                    json.dump(data, target, indent=3, sort_keys=True)
+                    target.write('\n')
+                    if suffix:
+                        target.write(suffix + '\n')
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.replace(temp_path, self.extruder_json_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+        except (OSError, ValueError, TypeError) as exc:
+            raise gcmd.error('Could not save extruder offsets: %s' % exc)
+        gcmd.respond_info('Saved offsets to %s (backup: %s)' % (
+            self.extruder_json_path, backup))
+
+    def _save_holder_position(self, gcmd, tool, x, y):
+        # Extruder Position Calibrate changes only x/y_check_pos. The t*_offset
+        # keys belong to the separate Extruder Offset Calibration workflow.
+        if not os.path.isfile(self.extruder_json_path):
+            raise gcmd.error('Missing stock %s; refusing to create it'
+                             % self.extruder_json_path)
+        temp_path = None
+        try:
+            data, suffix = self._read_stock_json(self.extruder_json_path)
+            key_suffix = str(tool) if tool else ''
+            data['x_check_pos' + key_suffix] = x
+            data['y_check_pos' + key_suffix] = y
+            directory = os.path.dirname(self.extruder_json_path)
+            backup = self.extruder_json_path + '.bak-' + (
+                datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+            shutil.copy2(self.extruder_json_path, backup)
+            fd, temp_path = tempfile.mkstemp(prefix='.extruder-holder-',
+                                             suffix='.tmp', dir=directory)
+            with os.fdopen(fd, 'w') as target:
+                os.chmod(temp_path, os.stat(self.extruder_json_path).st_mode)
+                json.dump(data, target, indent=3, sort_keys=True)
+                target.write('\n')
+                if suffix:
+                    target.write(suffix + '\n')
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temp_path, self.extruder_json_path)
+            temp_path = None
+        except (OSError, ValueError, TypeError) as exc:
+            raise gcmd.error('Could not save holder position: %s' % exc)
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.unlink(temp_path)
+        gcmd.respond_info('Saved T%d holder X=%.4f Y=%.4f to %s '
+                          '(backup: %s)' % (
+                              tool, x, y, self.extruder_json_path, backup))
+
+    def _button(self, name, gcmd):
+        obj = self.printer.lookup_object('gcode_button ' + name, None)
+        if obj is None:
+            raise gcmd.error('Missing gcode_button %s' % name)
+        return obj.get_status().get('state') == 'PRESSED'
+
+    def _sensor_state(self, gcmd):
+        dock = [self._button(name, gcmd) for name in self.dock_buttons]
+        grab = [self._button(name, gcmd) for name in self.grab_buttons]
+        if any(dock[i] and grab[i] for i in range(4)):
+            raise gcmd.error('Conflicting dock/grab sensors; motion blocked')
+        attached = [i for i in range(4) if grab[i] and not dock[i]]
+        if len(attached) > 1:
+            raise gcmd.error('Multiple heads appear attached; motion blocked')
+        return dock, grab, attached[0] if attached else None
+
+    def _validate_sensor_state(self, gcmd, dock, attached):
+        # All four Creator 5 heads are fixed.  A head that is neither docked
+        # nor detected as attached is an invalid state, not an empty slot.
+        if attached is None:
+            missing = [i for i, value in enumerate(dock) if not value]
+        else:
+            missing = [i for i, value in enumerate(dock)
+                       if i != attached and not value]
+        if missing:
+            names = ','.join('T%d' % i for i in missing)
+            raise gcmd.error('Missing dock confirmation for %s; motion blocked'
+                             % names)
+
+    def _preflight(self, gcmd, axes='xyz', allow_open_doors=False):
+        if self.busy:
+            raise gcmd.error('Creator 5 toolchanger is already moving')
+        if not allow_open_doors:
+            for name in self.door_buttons:
+                if self._button(name, gcmd):
+                    raise gcmd.error('Door %s is open' % name)
+        status = self.printer.lookup_object('toolhead').get_status(
+            self.printer.get_reactor().monotonic())
+        homed = status.get('homed_axes', '')
+        if any(axis not in homed for axis in axes):
+            raise gcmd.error('Home %s before Creator 5 motion' % axes.upper())
+        dock, grab, attached = self._sensor_state(gcmd)
+        self._validate_sensor_state(gcmd, dock, attached)
+        return dock, grab, attached
+
+    def _run(self, script):
+        self.gcode.run_script_from_command(script)
+
+    def _pause_ms(self, milliseconds):
+        reactor = self.printer.get_reactor()
+        reactor.pause(reactor.monotonic() + milliseconds / 1000.)
+
+    def _move(self, x=None, y=None, z=None, feed=4800, machine=True):
+        values = [value for value in (x, y, z) if value is not None]
+        if (not all(math.isfinite(value) for value in values)
+                or not math.isfinite(feed) or feed <= 0):
+            raise self.printer.command_error(
+                'Motion coordinates and feed must be finite')
+        if machine:
+            # Dock and fixture coordinates are physical carriage positions,
+            # independent of G92, nozzle offsets, mesh, and speed overrides.
+            toolhead = self.printer.lookup_object('toolhead')
+            try:
+                toolhead.manual_move([x, y, z], feed / 60.)
+            finally:
+                # Rebase G-code's cached position through its current transform
+                # without changing that transform or the caller's origin.
+                self.printer.lookup_object('gcode_move').reset_last_position()
+            return
+        parts = ['G1']
+        for axis, value in (('X', x), ('Y', y), ('Z', z)):
+            if value is not None:
+                parts.append('%s%.4f' % (axis, value))
+        parts.append('F%d' % feed)
+        self._run(' '.join(parts))
+
+    def _raise_z(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        if toolhead.get_position()[2] < self.safe_z:
+            self._move(z=self.safe_z, feed=1200)
+
+    def _verify(self, gcmd, expected, parked=None):
+        try:
+            self._run('M400')
+            self._pause_ms(self.sensor_settle_ms)
+            dock, _, attached = self._sensor_state(gcmd)
+            self._validate_sensor_state(gcmd, dock, attached)
+            if attached != expected:
+                raise gcmd.error('Tool sensor verification failed; heaters disabled')
+            if parked is not None and not dock[parked]:
+                raise gcmd.error('T%d was not confirmed in its dock' % parked)
+        except Exception:
+            # A failed tool motion must fail closed even when the sensor
+            # state is contradictory or the requested dock is not confirmed.
+            try:
+                self._run('TURN_OFF_HEATERS')
+            except Exception:
+                # Preserve the original verification error for diagnosis.
+                logging.exception(
+                    'Creator 5 heater shutdown failed after tool verification')
+            raise
+        self.active = attached
+        return dock
+
+    def _dock(self, gcmd, tool, raise_z=True):
+        x, y = self.docks[tool]
+        # Nozzle offsets no longer apply once the head is being parked.
+        self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+        if raise_z:
+            self._raise_z()
+        self._move(x=self.approach_x)
+        self._move(y=y)
+        self._move(x=x - 10., feed=1200)
+        self._move(x=x, feed=1200)
+        self._run('M400')
+        self._run('MOTOR_RELEASE')
+        self._pause_ms(self.release_latch_wait_ms)
+        self._move(x=self.approach_x)
+        self._verify(gcmd, None, parked=tool)
+
+    def _pickup(self, gcmd, tool):
+        x, y = self.docks[tool]
+        self._raise_z()
+        self._move(x=self.approach_x)
+        self._move(y=y)
+        self._move(x=self.pre_dock_x, feed=2400)
+        self._move(x=x, feed=1200)
+        self._run('M400')
+        if not self._button(self.grab_buttons[tool], gcmd):
+            raise gcmd.error('T%d grab sensor did not engage at mount' % tool)
+        self._run('MOTOR_GRAB')
+        self._move(x=x - self.pullback)
+        self._run('MOTOR_GRAB2')
+        self._pause_ms(self.pickup_latch_wait_ms)
+        self._move(x=self.approach_x)
+        self._verify(gcmd, tool)
+        self._apply_offsets(tool)
+        extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+
+    def _with_motion(self, gcmd, operation):
+        old_accel = self.printer.lookup_object('toolhead').get_max_velocity()[1]
+        gcode_move = self.printer.lookup_object('gcode_move')
+        was_absolute = gcode_move.get_status().get('absolute_coordinates')
+        self.busy = True
+        try:
+            self._run('G90')
+            self._run('SET_VELOCITY_LIMIT ACCEL=%.0f' % self.pickup_accel)
+            return operation()
+        finally:
+            try:
+                self._run('SET_VELOCITY_LIMIT ACCEL=%.4f' % old_accel)
+                if not was_absolute:
+                    self._run('G91')
+            finally:
+                self.busy = False
+
+    @contextmanager
+    def _calibration_transaction(self):
+        measurements = [list(values) for values in self.measurements]
+        station = self.station_x, self.station_y, self.station_z
+        origin = tuple(self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][:3])
+        try:
+            yield
+        except Exception:
+            self.measurements = measurements
+            self.station_x, self.station_y, self.station_z = station
+            self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f Z=%.4f MOVE=0'
+                      % origin)
+            raise
+
+    def cmd_home_for_print(self, gcmd):
+        dock, grab, attached = self._preflight(gcmd, axes='')
+        if attached is not None:
+            self.cmd_recover_attached(gcmd)
+            dock, grab, attached = self._preflight(gcmd, axes='')
+        if attached is not None:
+            raise gcmd.error('Attached head remains after recovery; Z homing blocked')
+        if not all(dock):
+            raise gcmd.error('Confirm all heads are docked before print homing')
+        self._run('G28')
+
+    def cmd_recover_attached(self, gcmd):
+        dock, grab, attached = self._preflight(gcmd, axes='')
+        if attached is None:
+            return
+        # safe_z_home supplies a relative clearance hop even when Z is not
+        # referenced. G28 X Y does not home/probe Z. Docking then uses XY only.
+        safe_home = self.printer.lookup_object('safe_z_home', None)
+        if safe_home is None or safe_home.z_hop < self.safe_z:
+            raise gcmd.error('Attached-head recovery requires safe_z_home '
+                             'z_hop of at least %.1f mm' % self.safe_z)
+        self._run('G28 X Y')
+        dock, grab, current = self._preflight(gcmd, axes='xy')
+        if current != attached:
+            raise gcmd.error('Attached head changed during XY homing')
+        self._with_motion(gcmd, lambda: self._dock(
+            gcmd, attached, raise_z=False))
+        # Clear AFC selection bookkeeping too, including a head discovered
+        # physically after restart. Its custom unselect is idempotent here.
+        self._run('AFC_UNSELECT_TOOL')
+
+    def cmd_status(self, gcmd):
+        dock, grab, attached = self._sensor_state(gcmd)
+        self.active = attached
+        gcmd.respond_info('attached=%s dock=%s grab=%s' % (
+            'none' if attached is None else 'T%d' % attached,
+            ''.join('1' if v else '0' for v in dock),
+            ''.join('1' if v else '0' for v in grab)))
+
+    def cmd_select(self, gcmd):
+        tool = gcmd.get_int('T', minval=0, maxval=3)
+        dock, grab, attached = self._preflight(gcmd)
+        if attached == tool:
+            # AFC may select a head that was already mounted at Klippy start.
+            # Restore its active extruder and offsets even without pickup motion.
+            self._apply_offsets(tool)
+            extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+            self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+            self.active = tool
+            gcmd.respond_info('T%d is already attached' % tool)
+            return
+        if not dock[tool]:
+            raise gcmd.error('T%d is not in its dock' % tool)
+        def change():
+            if attached is not None:
+                self._dock(gcmd, attached)
+            self._pickup(gcmd, tool)
+        self._with_motion(gcmd, change)
+
+    def cmd_dock(self, gcmd):
+        dock, grab, attached = self._preflight(gcmd, axes='')
+        if attached is not None:
+            self._preflight(gcmd)
+            self._with_motion(gcmd, lambda: self._dock(gcmd, attached))
+
+    def cmd_mount_coords(self, gcmd):
+        for i, (x, y) in enumerate(self.docks):
+            gcmd.respond_info('T%d mount X=%.4f Y=%.4f' % (i, x, y))
+
+    def cmd_mount_correct(self, gcmd):
+        tool = gcmd.get_int('T', minval=0, maxval=3)
+        x = gcmd.get_float('X')
+        y = gcmd.get_float('Y')
+        if self.busy:
+            raise gcmd.error('Cannot correct mounts while toolchanger is moving')
+        if not all(math.isfinite(value) for value in (x, y)):
+            raise gcmd.error('Mount coordinates must be finite')
+        old = self.docks[tool]
+        if (abs(x - old[0]) > self.max_mount_correction
+                or abs(y - old[1]) > self.max_mount_correction):
+            raise gcmd.error('Mount deviation exceeds configured limit')
+        if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
+            self._save_holder_position(gcmd, tool, x, y)
+        self.docks[tool] = [x, y]
+        gcmd.respond_info('T%d mount correction DX=%+.4f DY=%+.4f'
+                          % (tool, x - old[0], y - old[1]))
+
+    def _estop(self, axis, target, gcmd):
+        obj = self.printer.lookup_object('e_stop ' + axis, None)
+        if obj is None:
+            raise gcmd.error('Missing [e_stop %s] for levelboard calibration'
+                             % axis)
+        old_target = obj.position_offset
+        try:
+            obj.position_offset = target
+            value = obj.run_probe(gcmd)
+        finally:
+            obj.position_offset = old_target
+        if value is None or not math.isfinite(value):
+            raise gcmd.error('Invalid levelboard %s probe result' % axis)
+        return value
+
+    def _scan_xy(self, gcmd, cx, cy, z):
+        if z is None:
+            raise gcmd.error('Set scan_height before levelboard XY scanning')
+        if not math.isfinite(z):
+            raise gcmd.error('Levelboard scan height must be finite')
+        points = []
+        for axis, direction in (('X', 1), ('Y', 1),
+                                ('X', -1), ('Y', -1)):
+            self._raise_z()
+            start_x = cx + (self.scan_span * direction if axis == 'X' else 0.)
+            start_y = cy + (self.scan_span * direction if axis == 'Y' else 0.)
+            self._move(x=start_x, y=start_y, feed=1200)
+            self._move(z=z, feed=600)
+            start = start_x if axis == 'X' else start_y
+            result = self._estop(axis, start - 2. * self.scan_span * direction,
+                                 gcmd)
+            center = cx if axis == 'X' else cy
+            if abs(result - center) > self.scan_span:
+                raise gcmd.error('Levelboard %s edge outside scan range' % axis)
+            points.append(result)
+        self._raise_z()
+        if (abs(points[0] - points[2]) < 0.25
+                or abs(points[1] - points[3]) < 0.25):
+            raise gcmd.error('Levelboard scan did not resolve both fixture edges')
+        return ((points[0] + points[2]) / 2.,
+                (points[1] + points[3]) / 2.)
+
+    def _calibrate_tool_xy(self, gcmd, tool, scan_height=None):
+        cx = self.station_x + self.tool_fixture_shift_x
+        cy = self.station_y
+        if scan_height is None:
+            scan_height = self.scan_height
+        x, y = self._scan_xy(gcmd, cx, cy, scan_height)
+        old = self.measurements[tool]
+        if (abs(x - old[0]) > self.max_offset_correction
+                or abs(y - old[1]) > self.max_offset_correction):
+            raise gcmd.error('T%d offset deviation exceeds configured limit'
+                             % tool)
+        old[0], old[1] = x, y
+        gcmd.respond_info('T%d levelboard XY X=%.4f Y=%.4f' % (tool, x, y))
+
+    def _probe_fixture_z(self, gcmd, x, y):
+        self._move(z=self.safe_z, feed=1200)
+        self._move(x=x, y=y, feed=1200)
+        z = self._estop('Z', self.z_probe_target, gcmd)
+        self._raise_z()
+        return z
+
+    def _calibrate_tool_z(self, gcmd, tool):
+        z = self._probe_fixture_z(gcmd,
+                                  self.station_x + self.tool_fixture_shift_x,
+                                  self.station_y)
+        if abs(z - self.measurements[tool][2]) > self.max_offset_correction:
+            raise gcmd.error('T%d Z deviation exceeds configured limit' % tool)
+        self.measurements[tool][2] = z
+        gcmd.respond_info('T%d levelboard Z=%.4f' % (tool, z))
+        return z
+
+    def _apply_offsets(self, tool):
+        offsets = [self.measurements[tool][axis]
+                   - self.measurements[0][axis] for axis in range(3)]
+        offsets[2] += self.z_adjustments[tool]
+        self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f Z=%.4f MOVE=0'
+                  % tuple(offsets))
+
+    def cmd_reference_calibrate(self, gcmd):
+        if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
+            raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
+        scan_height = gcmd.get_float('SCAN_Z', self.reference_scan_height)
+        if scan_height is not None and not math.isfinite(scan_height):
+            raise gcmd.error('SCAN_Z must be finite')
+        dock, grab, attached = self._preflight(gcmd)
+        if attached is not None:
+            raise gcmd.error('Dock the mounted head before reference scanning')
+        def calibrate():
+            self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+            z = self._probe_fixture_z(gcmd, self.station_x, self.station_y)
+            if abs(z - self.station_z) > self.max_offset_correction:
+                raise gcmd.error('Levelboard reference Z deviation exceeds limit')
+            if scan_height is None:
+                actual_scan_height = z + 0.6
+            else:
+                actual_scan_height = scan_height
+            x, y = self._scan_xy(gcmd, self.station_x, self.station_y,
+                                 actual_scan_height)
+            if (abs(x - self.station_x) > self.max_offset_correction
+                    or abs(y - self.station_y) > self.max_offset_correction):
+                raise gcmd.error('Levelboard reference deviation exceeds limit')
+            self.station_x, self.station_y, self.station_z = x, y, z
+            gcmd.respond_info('Levelboard reference X=%.4f Y=%.4f Z=%.4f'
+                              % (x, y, z))
+        with self._calibration_transaction():
+            self._with_motion(gcmd, calibrate)
+        if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
+            self.configfile.set(self.section, 'station_x',
+                                '%.4f' % self.station_x)
+            self.configfile.set(self.section, 'station_y',
+                                '%.4f' % self.station_y)
+            self.configfile.set(self.section, 'station_z',
+                                '%.4f' % self.station_z)
+
+    def cmd_calibrate_all_offsets(self, gcmd):
+        if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
+            raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
+        save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
+        self._preflight(gcmd)
+        stats = self.printer.lookup_object('print_stats', None)
+        if stats is not None and stats.get_status(
+                self.printer.get_reactor().monotonic()).get('state') in (
+                    'printing', 'paused'):
+            raise gcmd.error('Finish or cancel the print before calibration')
+        # One transaction spans reference, all four heads, and the atomic JSON
+        # replacement. Never stage individual tools in SAVE_CONFIG: JSON is the
+        # authoritative set loaded at startup, and a later failure must leave
+        # neither a partial runtime set nor partial pending config values.
+        with self._calibration_transaction():
+            self._run('C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
+                      'BUILDPLATE_REMOVED=1')
+            for tool in range(4):
+                heater = 'extruder' if tool == 0 else 'extruder%d' % tool
+                self._run('AFC_SELECT_TOOL TOOL=%s' % heater)
+                self._run('C5_TOOL_OFFSET_CALIBRATE T=%d Z=1 SAVE=0 '
+                          'BUILDPLATE_REMOVED=1' % tool)
+                self._run('AFC_UNSELECT_TOOL')
+            if save:
+                self.cmd_save_offsets_json(gcmd)
+
+    def cmd_check_load_tool(self, gcmd):
+        _, _, attached = self._preflight(gcmd, axes='')
+        requested = gcmd.get_int('T', attached, minval=0, maxval=3)
+        if attached is None or requested != attached:
+            raise gcmd.error('Loading requires the requested tool to be attached')
+        heater = 'extruder' if attached == 0 else 'extruder%d' % attached
+        active = self.printer.lookup_object('toolhead').get_extruder().get_name()
+        if active != heater:
+            raise gcmd.error('Active hotend does not match the attached tool')
+
+    def cmd_offset_calibrate(self, gcmd):
+        if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
+            raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
+        tool = gcmd.get_int('T', minval=0, maxval=3)
+        include_z = gcmd.get_int('Z', 0, minval=0, maxval=1)
+        scan_height = gcmd.get_float('SCAN_Z', self.scan_height)
+        if scan_height is not None and not math.isfinite(scan_height):
+            raise gcmd.error('SCAN_Z must be finite')
+        if scan_height is None and not include_z:
+            raise gcmd.error('Set scan_height or provide SCAN_Z before scanning')
+        dock, grab, attached = self._preflight(gcmd)
+        if attached != tool:
+            raise gcmd.error('Attach T%d before offset calibration' % tool)
+        def calibrate():
+            self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+            if include_z:
+                z = self._calibrate_tool_z(gcmd, tool)
+                actual_scan_height = z + 0.6 if scan_height is None else scan_height
+            else:
+                actual_scan_height = scan_height
+            self._calibrate_tool_xy(gcmd, tool, actual_scan_height)
+            self._apply_offsets(tool)
+        with self._calibration_transaction():
+            self._with_motion(gcmd, calibrate)
+        if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
+            axes = 'xyz' if include_z else 'xy'
+            for axis, value in zip(axes, self.measurements[tool]):
+                self.configfile.set(self.section, 't%d_measure_%s' % (tool, axis),
+                                    '%.4f' % value)
+
+    def cmd_calibrate_attached(self, gcmd):
+        if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
+            raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
+        dock, grab, attached = self._preflight(gcmd)
+        if attached is None:
+            gcmd.respond_info('No head attached')
+            return
+        def calibrate_then_park():
+            with self._calibration_transaction():
+                self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+                self._calibrate_tool_xy(gcmd, attached)
+                self._apply_offsets(attached)
+                self._dock(gcmd, attached)
+        self._with_motion(gcmd, calibrate_then_park)
+
+    def cmd_mount_probe(self, gcmd):
+        tool = gcmd.get_int('T', minval=0, maxval=3)
+        dock, grab, attached = self._preflight(gcmd)
+        if attached is not None or not dock[tool]:
+            raise gcmd.error('Park all heads before mount probe')
+        x = gcmd.get_float('CENTER_X')
+        y = gcmd.get_float('CENTER_Y')
+        z = gcmd.get_float('SCAN_Z')
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            raise gcmd.error('Mount probe coordinates must be finite')
+        def measure():
+            measured_x, measured_y = self._scan_xy(gcmd, x, y, z)
+            dx, dy = measured_x - x, measured_y - y
+            if (abs(dx) > self.max_mount_correction
+                    or abs(dy) > self.max_mount_correction):
+                raise gcmd.error('Mount probe deviation exceeds limit')
+            if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
+                self._save_holder_position(gcmd, tool,
+                                           self.docks[tool][0] + dx,
+                                           self.docks[tool][1] + dy)
+            self.cmd_mount_correct_values(gcmd, tool, dx, dy)
+        self._with_motion(gcmd, measure)
+
+    def cmd_mount_correct_values(self, gcmd, tool, dx, dy):
+        self.docks[tool][0] += dx
+        self.docks[tool][1] += dy
+        gcmd.respond_info('T%d mount measured DX=%+.4f DY=%+.4f; corrected X=%.4f Y=%.4f'
+                          % (tool, dx, dy, *self.docks[tool]))
+
+    def _wait_for_holder_contact(self, gcmd, tool):
+        reactor = self.printer.get_reactor()
+        deadline = reactor.monotonic() + self.position_calibration_timeout
+        while reactor.monotonic() < deadline:
+            if (self._button(self.dock_buttons[tool], gcmd)
+                    and self._button(self.grab_buttons[tool], gcmd)):
+                if any(self._button(name, gcmd) for i, name in
+                       enumerate(self.grab_buttons) if i != tool):
+                    raise gcmd.error('Another toolhead also reports attached')
+                return
+            reactor.pause(min(reactor.monotonic() + .05, deadline))
+        raise gcmd.error('Timed out waiting for T%d holder contact; '
+                         'home XY before other motion' % tool)
+
+    def _measure_holder_position(self, gcmd, tool):
+        x_home = self.printer.lookup_object('hd_home X', None)
+        y_home = self.printer.lookup_object('hd_home Y', None)
+        if x_home is None or y_home is None:
+            raise gcmd.error('Extruder Position Calibrate needs '
+                             '[hd_home X] and [hd_home Y]')
+        y_reference = (HOLDER_REFERENCE_Y_BASE
+                       + HOLDER_REFERENCE_Y_PITCH * tool)
+        # The operator moved the carriage while XY motors were disabled.
+        # Contact with both holder and grab sensors is the only permitted
+        # reference before re-establishing a temporary XY coordinate.
+        self._run('SET_STEPPER_ENABLE STEPPER=stepper_x ENABLE=1')
+        self._run('SET_STEPPER_ENABLE STEPPER=stepper_y ENABLE=1')
+        self._run('SET_KINEMATIC_POSITION X=%.3f Y=%.3f SET_HOMED=xy' % (
+            HOLDER_REFERENCE_X, y_reference))
+        self._move(x=HOLDER_REFERENCE_X - 5., feed=2400)
+        self._run('M400')
+        self._pause_ms(self.sensor_settle_ms)
+        if (self._button(self.dock_buttons[tool], gcmd)
+                or not self._button(self.grab_buttons[tool], gcmd)):
+            raise gcmd.error('T%d did not leave its holder with the '
+                             'carriage; calibration stopped' % tool)
+        self._move(x=240., feed=6000)
+        x_result = x_home.measure_axis(-5.)
+        y_result = y_home.measure_axis(0.)
+        x = abs(HOLDER_REFERENCE_X - x_result)
+        y = y_reference - y_result
+        if not all(math.isfinite(value) for value in (x, y)):
+            raise gcmd.error('Non-finite holder measurement')
+        old_x, old_y = self.docks[tool]
+        if (abs(x - old_x) > self.max_mount_correction
+                or abs(y - old_y) > self.max_mount_correction):
+            raise gcmd.error('T%d holder X=%.4f Y=%.4f exceeds the '
+                             '%.2f mm correction limit; no automatic '
+                             're-dock or save was attempted' % (
+                                 tool, x, y, self.max_mount_correction))
+        return x, y
+
+    def cmd_extruder_position_calibrate(self, gcmd):
+        tool = gcmd.get_int('T', None, minval=0, maxval=3)
+        if tool is None:
+            gcmd.respond_info('Select a holder: '
+                              'EXTRUDER_POSITION_CALIBRATE T=0..3')
+            return
+        if not os.path.isfile(self.extruder_json_path):
+            raise gcmd.error('Missing stock %s; refusing to calibrate'
+                             % self.extruder_json_path)
+        eventtime = self.printer.get_reactor().monotonic()
+        print_stats = self.printer.lookup_object('print_stats', None)
+        if (print_stats is not None and print_stats.get_status(eventtime).get(
+                'state') in ('printing', 'paused')):
+            raise gcmd.error('Extruder Position Calibrate is unavailable '
+                             'during a print')
+        for i in range(4):
+            heater = self.printer.lookup_object(
+                'extruder' if i == 0 else 'extruder%d' % i, None)
+            if (heater is not None and heater.get_status(eventtime).get(
+                    'temperature', 0.) > 50.):
+                raise gcmd.error('Cool all toolheads below 50 C before '
+                                 'manual holder calibration')
+        dock, grab, attached = self._preflight(gcmd, allow_open_doors=True)
+        if attached is not None or not all(dock) or any(grab):
+            raise gcmd.error('Park all toolheads before holder calibration')
+        toolhead = self.printer.lookup_object('toolhead')
+        if toolhead.get_position()[2] < self.safe_z:
+            raise gcmd.error('Raise Z above %.1f before holder calibration'
+                             % self.safe_z)
+
+        def calibrate():
+            xy_disabled = False
+            state_saved = False
+            complete = False
+            try:
+                self._run('M400')
+                self._run('SET_VELOCITY_LIMIT ACCEL=%.0f'
+                          % self.position_calibration_accel)
+                self._run('SAVE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE')
+                state_saved = True
+                self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+                xy_disabled = True
+                self._run('SET_STEPPER_ENABLE STEPPER=stepper_x ENABLE=0')
+                self._run('SET_STEPPER_ENABLE STEPPER=stepper_y ENABLE=0')
+                toolhead.get_kinematics().clear_homing_state('xy')
+                gcmd.respond_info('Move the master carriage by hand to T%d '
+                                  'until its holder and grab sensors both '
+                                  'activate. Release your hand when asked.'
+                                  % tool)
+                self._wait_for_holder_contact(gcmd, tool)
+                gcmd.respond_info('T%d detected. Release your hand and '
+                                  'close the doors; measurement starts in '
+                                  '%.1f seconds.' % (
+                                      tool,
+                                      self.position_calibration_release_wait_ms
+                                      / 1000.))
+                self._pause_ms(self.position_calibration_release_wait_ms)
+                if (not self._button(self.dock_buttons[tool], gcmd)
+                        or not self._button(self.grab_buttons[tool], gcmd)):
+                    raise gcmd.error('T%d holder contact was lost' % tool)
+                if any(self._button(name, gcmd) for i, name in
+                       enumerate(self.grab_buttons) if i != tool):
+                    raise gcmd.error('Another toolhead also reports attached')
+                for name in self.door_buttons:
+                    if self._button(name, gcmd):
+                        raise gcmd.error('Close door %s before automatic '
+                                         'holder measurement' % name)
+                x, y = self._measure_holder_position(gcmd, tool)
+                for name in self.door_buttons:
+                    if self._button(name, gcmd):
+                        raise gcmd.error('Door %s opened during holder '
+                                         'measurement; no re-dock or save'
+                                         % name)
+                # HDHOME returned measurements in the temporary frame.
+                # Establish real XY coordinates before travelling to a dock.
+                self._run('G28 X Y')
+                previous_dock = self.docks[tool]
+                self.docks[tool] = [x, y]
+                try:
+                    self._dock(gcmd, tool)
+                    self._save_holder_position(gcmd, tool, x, y)
+                except Exception:
+                    self.docks[tool] = previous_dock
+                    raise
+                complete = True
+            finally:
+                try:
+                    if xy_disabled and not complete:
+                        try:
+                            self._run('SET_STEPPER_ENABLE STEPPER=stepper_x ENABLE=1')
+                        finally:
+                            try:
+                                self._run('SET_STEPPER_ENABLE STEPPER=stepper_y ENABLE=1')
+                            finally:
+                                toolhead.get_kinematics().clear_homing_state('xy')
+                finally:
+                    if state_saved and not complete:
+                        self._run('RESTORE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE MOVE=0')
+        self._with_motion(gcmd, calibrate)
+
+    def cmd_purge(self, gcmd):
+        length = gcmd.get_float('LENGTH', self.purge_length,
+                                minval=0., maxval=80.)
+        if not math.isfinite(length):
+            raise gcmd.error('LENGTH must be finite')
+        dock, grab, attached = self._preflight(gcmd)
+        if attached is None:
+            raise gcmd.error('No attached tool for purge')
+        extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
+        heater = self.printer.lookup_object(extruder)
+        if not heater.get_status(self.printer.get_reactor().monotonic()).get(
+                'can_extrude'):
+            raise gcmd.error('T%d is not hot enough to purge' % attached)
+        def purge():
+            # The carriage has one physical drive. These logical extruder
+            # objects select the attached hotend's temperature/flow context.
+            self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+            self._run('SAVE_GCODE_STATE NAME=C5_PURGE_PREP')
+            self._raise_z()
+            try:
+                self._move(x=self.purge_x, y=self.purge_y, feed=3000,
+                           machine=False)
+                self._move(z=self.purge_z, feed=600, machine=False)
+                self._run('M83')
+                self._run('G1 E%.3f F%.0f' % (length,
+                                              self.purge_speed * 60.))
+                self._run('G1 E-1 F1200')
+                self._raise_z()
+            finally:
+                self._run('RESTORE_GCODE_STATE NAME=C5_PURGE_PREP')
+        self._with_motion(gcmd, purge)
+
+    def get_status(self, eventtime=None):
+        return {'active_tool': self.active, 'busy': self.busy,
+                'dock_positions': [list(p) for p in self.docks],
+                'tool_measurements': [list(p) for p in self.measurements]}
+
+
+def load_config(config):
+    return Creator5Toolchanger(config)

@@ -4,7 +4,6 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
-from . import output_pin
 
 
 class FF_eddy:
@@ -52,6 +51,9 @@ class FF_eddy:
     def cmd_GET_BASIC_PARAM(self, gcmd):
         num = gcmd.get_int('NUM', 0)
         result = self.get_basic_param_cmd.send([num])
+        self.value = result['value']
+        self.diff = result['reserve']
+        self.last_update_time = self.reactor.monotonic()
         gcmd.respond_info(
             "%s result: value=%d,diff=%d"
             % (self.name, result['value'], result['reserve']))
@@ -60,10 +62,9 @@ class FF_eddy:
     def cmd_REMOVE_PEEL(self, gcmd):
         action = gcmd.get_int('ACTION', 0)
         peel_data = self.peel_cmd.send([action])
-        msg = "Value:[name=%s,value=%d,reserve=%d]" % (self.name, result['value'], result['reserve'])
-        logging.warning("[GET_BASIC_PARAM],MSG[%s]", msg)
-        #gcmd.respond_info(
-        #    "%s peel_data=%d" % (self.name, peel_data['value']))
+        self.diff = peel_data['value']
+        self.last_update_time = self.reactor.monotonic()
+        gcmd.respond_info('%s peel_data=%d' % (self.name, self.diff))
 
     cmd_SET_TRIGGER_THRESHOLD_help = "Set eddy trigger threshold"
     def cmd_SET_TRIGGER_THRESHOLD(self, gcmd):
@@ -73,6 +74,11 @@ class FF_eddy:
         self.trigger_threshold = threshold
         gcmd.respond_info(
             "%s trigger_threshold=%d" % (self.name, threshold))
+
+    def get_status(self, eventtime=None):
+        return {'value': self.value, 'diff': self.diff,
+                'trigger_threshold': self.trigger_threshold,
+                'last_update_time': self.last_update_time}
 
 
 def load_config_prefix(config):

@@ -46,6 +46,11 @@ class MCLIB:
         self.td4_amp = int(config.getfloat('td4_amp', 0., minval=0., maxval=run_current)* 1000)
         self.td4_phase1 = int(config.getfloat('td4_phase1', 0.)* 1000)
         self.td4_phase2 = int(config.getfloat('td4_phase2', 0.)* 1000)  
+        self.calibrated_damping = {
+            1: (self.td1_amp, self.td1_phase1, self.td1_phase2),
+            2: (self.td2_amp, self.td2_phase1, self.td2_phase2),
+            4: (self.td4_amp, self.td4_phase1, self.td4_phase2),
+        }
 
         self.printer.register_event_handler("klippy:mcu_identify",
                                             self._handle_mcu_identify)
@@ -60,6 +65,9 @@ class MCLIB:
             gcode.register_mux_command("MCLIB_SET_RESONANCE_DAMP", "STEPPER", self.name,
                                    self.cmd_MCLIB_SET_RESONANCE_DAMP,
                                    desc=self.cmd_MCLIB_SET_RESONANCE_DAMP_help)
+            gcode.register_mux_command("MCLIB_APPLY_CALIBRATION", "STEPPER",
+                                       self.name, self.cmd_MCLIB_APPLY_CALIBRATION,
+                                       desc=self.cmd_MCLIB_APPLY_CALIBRATION_help)
 
     def _handle_mcu_identify(self):
         # Lookup stepper object
@@ -125,14 +133,27 @@ class MCLIB:
 
         if self.set_resonance_damp_cmd is None:
             # Send setup message via mcu initialization
-            self.mcu.add_config_cmd("mclib_set_resonance_damp oid=%d td=1 amp=%u phase1=%u phase2=%u"
-                                    % (self.oid, self.td1_amp, self.td1_phase1, self.td1_phase2))
-            self.mcu.add_config_cmd("mclib_set_resonance_damp oid=%d td=2 amp=%u phase1=%u phase2=%u"
-                                    % (self.oid, self.td2_amp, self.td2_phase1, self.td2_phase2))
-            self.mcu.add_config_cmd("mclib_set_resonance_damp oid=%d td=4 amp=%u phase1=%u phase2=%u"
-                                    % (self.oid, self.td4_amp, self.td4_phase1, self.td4_phase2))
+            self.mcu.add_config_cmd(
+                "mclib_set_resonance_damp oid=%d tdx=%d amp=%u phase1=%u phase2=%u"
+                % (self.oid, tdx, amp, phase1, phase2))
             return
         self.set_resonance_damp_cmd.send([self.oid, tdx, amp, phase1, phase2])
+
+    cmd_MCLIB_APPLY_CALIBRATION_help = (
+        "Restore saved MCLib resonance damping for this stepper")
+    def cmd_MCLIB_APPLY_CALIBRATION(self, gcmd):
+        # Values are read from [mclib stepper_*] at startup, including values
+        # written by SAVE_CONFIG after VFA calibration.
+        for tdx, (amp, phase1, phase2) in sorted(
+                self.calibrated_damping.items()):
+            if self.set_resonance_damp_cmd is None:
+                self.mcu.add_config_cmd(
+                    "mclib_set_resonance_damp oid=%d tdx=%d amp=%u phase1=%u phase2=%u"
+                    % (self.oid, tdx, amp, phase1, phase2))
+            else:
+                self.set_resonance_damp_cmd.send(
+                    [self.oid, tdx, amp, phase1, phase2])
+        gcmd.respond_info("Restored MCLib calibration for %s" % self.name)
 
 def load_config_prefix(config):
     return MCLIB(config)
