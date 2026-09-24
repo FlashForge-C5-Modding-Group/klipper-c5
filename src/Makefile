@@ -1,6 +1,7 @@
 # Main code build rules
 
 src-y += sched.c command.c basecmd.c debugcmds.c
+src-$(CONFIG_C5_BOARD) += c5_version.c
 src-$(CONFIG_C5_MAINBOARDGD) += c5_mainboardgd.c c5_mclib.c
 src-$(CONFIG_C5_LEVELBOARD) += c5_levelboard.c
 src-$(CONFIG_C5_EBOARD) += c5_eboard.c c5_eboard_pa.c
