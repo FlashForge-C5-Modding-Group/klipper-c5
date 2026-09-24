@@ -97,12 +97,9 @@ MAINBOARD_REQUIRED_COMMANDS = {
     "mclib_config_microstep oid=%c interpolate=%c mstep=%u",
     "mclib_config_stalldetect oid=%c stallthrs=%u",
     "mclib_set_current oid=%c run_current=%u hold_current=%u",
-    "mclib_set_pid_params oid=%c kp=%u ki=%u",
     ("mclib_set_resonance_damp oid=%c tdx=%c amp=%u phase1=%u "
      "phase2=%u"),
-    "mclib_identify_motor oid=%c umax=%u umin=%u",
-    "get_mcu_version", "remove_peel action=%u",
-    "pa_action action=%u pc=%u", "get_emcu_pa_value",
+    "get_mcu_version",
 }
 
 MAINBOARD_REQUIRED_RESPONSES = {
@@ -117,7 +114,7 @@ MAINBOARD_REQUIRED_RESPONSES = {
     "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
     "analog_in_state oid=%c next_clock=%u value=%hu",
     "buttons_state oid=%c ack_count=%c state=%*s",
-    "mcu_version year=%u date=%u version=%u", "pa_value value=%u",
+    "mcu_version year=%u date=%u version=%u",
 }
 
 MAINBOARD_OPTIONAL_GENERIC_RESPONSES = {
@@ -892,6 +889,8 @@ class MainboardProfileTests(unittest.TestCase):
             ("responses", "param_value value=%u reserve=%u"),
             ("responses", "trigger_threshold threshold=%i"),
             ("responses", "peel_data value=%i"),
+            ("commands", "pa_action action=%u pc=%u"),
+            ("responses", "pa_value value=%u"),
             ("output", "GDMainboard close=%hu Close_num=%hu Temp_waketime=%hu"),
         )
         for table, msgformat in forbidden:

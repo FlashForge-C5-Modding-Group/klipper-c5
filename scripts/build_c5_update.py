@@ -329,6 +329,16 @@ def _package_pin_enumeration(port_masks, adc_temperature=False):
     return pins
 
 
+# Optional upstream drivers that no stock C5 firmware advertises; the C5
+# Kconfig defaults leave them out (src/stm32/Kconfig).
+TRIMMED_DRIVER_COMMANDS = {
+    "config_st7920", "config_hd44780", "config_hx71x",
+    "config_trigger_analog", "config_bmi160", "config_mpu9250",
+    "config_icm20948", "config_ads1220", "config_ads131m0x",
+    "config_ldc1612",
+}
+
+
 BOARD_PROFILES = {
     "eBoard": {
         "firmware_name": "eBoard.hex",
@@ -428,7 +438,7 @@ BOARD_PROFILES = {
             "trigger_threshold threshold=%i", "param_value value=%u reserve=%u",
             "peel_data value=%i", "pa_value value=%u",
         },
-        "forbidden_commands": {"config_reset"},
+        "forbidden_commands": {"config_reset"} | TRIMMED_DRIVER_COMMANDS,
         "forbidden_responses": {"endstop_recover_state", "pa_action"},
         "forbidden_format_names": {"Levelboard"},
     },
@@ -490,9 +500,6 @@ BOARD_PROFILES = {
             ("buttons_query oid=%c clock=%u rest_ticks=%u "
              "retransmit_count=%c invert=%c"),
             "buttons_ack oid=%c count=%c", "get_mcu_version",
-            "set_trigger_threshold threshold=%i", "get_basic_param num=%u",
-            "pa_action action=%u pc=%u", "get_emcu_pa_value",
-            "remove_peel action=%u",
         },
         "required_responses": {
             "identify_response offset=%u data=%.*s",
@@ -505,7 +512,10 @@ BOARD_PROFILES = {
             "buttons_state oid=%c ack_count=%c state=%*s",
             "mcu_version year=%u date=%u version=%u",
         },
-        "forbidden_commands": {"config_reset"},
+        "forbidden_commands": {
+            "config_reset", "set_trigger_threshold", "get_basic_param",
+            "pa_action", "get_emcu_pa_value", "remove_peel",
+        } | TRIMMED_DRIVER_COMMANDS,
         "forbidden_responses": {
             "trigger_threshold", "param_value", "pa_value", "peel_data",
             "pa_action",
@@ -575,7 +585,7 @@ BOARD_PROFILES = {
             "shutdown clock=%u static_string_id=%hu",
         },
         "forbidden_commands": {"config_reset", "config_analog_in",
-                                 "query_analog_in"},
+                               "query_analog_in"} | TRIMMED_DRIVER_COMMANDS,
         "forbidden_responses": {"endstop_recover_state"},
         "forbidden_format_names": {"Levelboard"},
     },
@@ -668,12 +678,9 @@ BOARD_PROFILES = {
             "mclib_config_microstep oid=%c interpolate=%c mstep=%u",
             "mclib_config_stalldetect oid=%c stallthrs=%u",
             "mclib_set_current oid=%c run_current=%u hold_current=%u",
-            "mclib_set_pid_params oid=%c kp=%u ki=%u",
             ("mclib_set_resonance_damp oid=%c tdx=%c amp=%u phase1=%u "
              "phase2=%u"),
-            "mclib_identify_motor oid=%c umax=%u umin=%u",
-            "get_mcu_version", "remove_peel action=%u",
-            "pa_action action=%u pc=%u", "get_emcu_pa_value",
+            "get_mcu_version",
         },
         "required_responses": {
             "identify_response offset=%u data=%.*s",
@@ -687,18 +694,21 @@ BOARD_PROFILES = {
             "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u",
             "analog_in_state oid=%c next_clock=%u value=%hu",
             "buttons_state oid=%c ack_count=%c state=%*s",
-            "mcu_version year=%u date=%u version=%u", "pa_value value=%u",
+            "mcu_version year=%u date=%u version=%u",
         },
         "forbidden_commands": {
             "config_reset", "endstop_recover_state", "get_basic_param",
             "set_trigger_threshold", "config_pwm_out", "queue_pwm_out",
             "config_spi", "spi_set_bus", "spi_transfer", "spi_send",
             "config_spi_shutdown", "config_lis2dw", "query_lis2dw",
-            "query_lis2dw_status",
-        },
+            "query_lis2dw_status", "mclib_set_pid_params",
+            "mclib_identify_motor", "remove_peel", "pa_action",
+            "get_emcu_pa_value", "config_tmcuart", "config_neopixel",
+            "config_counter",
+        } | TRIMMED_DRIVER_COMMANDS,
         "forbidden_responses": {
             "endstop_recover_state", "param_value", "peel_data",
-            "trigger_threshold", "spi_transfer_response",
+            "trigger_threshold", "spi_transfer_response", "pa_value",
         },
         "forbidden_format_names": {
             "Eboard", "Eheaterboard", "GDMainboard", "Levelboard",
