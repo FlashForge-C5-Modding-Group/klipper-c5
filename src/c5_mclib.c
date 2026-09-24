@@ -517,17 +517,6 @@ c5_mclib_current(struct c5_mclib_motor *m,
 }
 
 void
-c5_mclib_pid(struct c5_mclib_motor *m, uint32_t kp, uint32_t ki)
-{
-    float proportional = (float)kp / 1000.0f;
-    float integral = (float)ki / 1000.0f;
-    m->d_pi.kp = proportional;
-    m->q_pi.kp = proportional;
-    m->d_pi.ki = integral;
-    m->q_pi.ki = integral;
-}
-
-void
 c5_mclib_stall_threshold(struct c5_mclib_motor *m, uint32_t threshold)
 {
     m->stall_threshold = (float)threshold / 1000.0f;

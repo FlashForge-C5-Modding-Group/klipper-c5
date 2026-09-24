@@ -171,22 +171,6 @@ DECL_COMMAND(command_mclib_set_current,
              "mclib_set_current oid=%c run_current=%u hold_current=%u");
 
 void
-command_mclib_set_pid_params(uint32_t *args)
-{
-    struct c5_mclib_motor *motor = lookup_motor(args[0]);
-    struct c5_mclib_motor prepared;
-    c5_mclib_pid(&prepared, args[1], args[2]);
-    irqstatus_t flag = irq_save();
-    motor->d_pi.kp = prepared.d_pi.kp;
-    motor->q_pi.kp = prepared.q_pi.kp;
-    motor->d_pi.ki = prepared.d_pi.ki;
-    motor->q_pi.ki = prepared.q_pi.ki;
-    irq_restore(flag);
-}
-DECL_COMMAND(command_mclib_set_pid_params,
-             "mclib_set_pid_params oid=%c kp=%u ki=%u");
-
-void
 command_mclib_set_resonance_damp(uint32_t *args)
 {
     struct c5_mclib_motor *motor = lookup_motor(args[0]);
@@ -206,33 +190,3 @@ command_mclib_set_resonance_damp(uint32_t *args)
 DECL_COMMAND(command_mclib_set_resonance_damp,
              "mclib_set_resonance_damp oid=%c tdx=%c amp=%u"
                           " phase1=%u phase2=%u");
-
-void
-command_mclib_identify_motor(uint32_t *args)
-{
-    (void)lookup_motor(args[0]);
-}
-DECL_COMMAND(command_mclib_identify_motor,
-             "mclib_identify_motor oid=%c umax=%u umin=%u");
-
-void
-command_mainboardgd_remove_peel(uint32_t *args)
-{
-    (void)args;
-}
-DECL_COMMAND(command_mainboardgd_remove_peel, "remove_peel action=%u");
-
-void
-command_mainboardgd_pa_action(uint32_t *args)
-{
-    (void)args;
-}
-DECL_COMMAND(command_mainboardgd_pa_action, "pa_action action=%u pc=%u");
-
-void
-command_mainboardgd_get_emcu_pa_value(uint32_t *args)
-{
-    (void)args;
-    sendf("pa_value value=%u", 0u);
-}
-DECL_COMMAND(command_mainboardgd_get_emcu_pa_value, "get_emcu_pa_value");

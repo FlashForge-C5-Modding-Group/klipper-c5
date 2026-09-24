@@ -41,6 +41,14 @@ float_bits(float value)
     return bits.u;
 }
 
+// Force explicit PI gains (milli-units) for controller regressions.
+static void
+set_pi_gains(struct c5_mclib_motor *m, uint32_t kp, uint32_t ki)
+{
+    m->d_pi.kp = m->q_pi.kp = (float)kp / 1000.0f;
+    m->d_pi.ki = m->q_pi.ki = (float)ki / 1000.0f;
+}
+
 static void
 expect_u32(const char *name, uint32_t actual, uint32_t expected)
 {
@@ -307,7 +315,7 @@ test_hold_run_and_current_ramp(void)
     struct c5_mclib_output out;
 
     setup_z(&m, 1000, 500);
-    c5_mclib_pid(&m, 5000, 0);
+    set_pi_gains(&m, 5000, 0);
     c5_mclib_enable(&m, 10);
     CHECK(m.mode == MODE_HOLD, "enable must enter HOLD");
     c5_mclib_step(&m, 20);
@@ -519,7 +527,7 @@ test_xy_crossover_resonance_and_limits(void)
           "TDX values at or above 6 must be ignored");
 
     setup_z(&m, 100000, 100000);
-    c5_mclib_pid(&m, 1000000, 1000000);
+    set_pi_gains(&m, 1000000, 1000000);
     c5_mclib_enable(&m, 0);
     c5_mclib_step(&m, 20000);
     c5_mclib_update(&m, 20000, -1000.0f, 1000.0f, &out);
@@ -644,7 +652,7 @@ test_pi_saturation_reversal_recovery(void)
     struct c5_mclib_output out;
 
     setup_z(&m, 1000, 1000);
-    c5_mclib_pid(&m, 0, 100);
+    set_pi_gains(&m, 0, 100);
     c5_mclib_enable(&m, 0);
 
     for (uint16_t i = 0; i < 300; i++)
