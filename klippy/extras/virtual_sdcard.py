@@ -3,7 +3,7 @@
 # Copyright (C) 2018-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, sys, logging, io
+import os, sys, logging, io, re
 
 VALID_GCODE_EXTS = ['gcode', 'g', 'gco']
 
@@ -13,6 +13,48 @@ DEFAULT_ERROR_GCODE = """
 {% endif %}
 """
 
+def creator5_start_command(header):
+    # A slicer-supplied start remains authoritative; never run it twice.
+    if re.search(r'^\s*C5_PRINT_START\b', header, re.I | re.M):
+        return None
+    tool = 0
+    tool_seen = False
+    hotend = bed = None
+    first_layer = None
+    for raw in header.splitlines():
+        meta = re.match(r'^\s*;\s*first_layer_height\s*=\s*([0-9.]+)',
+                        raw, re.I)
+        if meta and first_layer is None:
+            first_layer = float(meta.group(1))
+        line = raw.split(';', 1)[0].strip()
+        match = re.match(r'^T([0-3])(?:\s|$)', line, re.I)
+        if match and not tool_seen:
+            tool = int(match.group(1))
+            tool_seen = True
+        match = re.match(r'^AFC_SELECT_TOOL\s+TOOL=extruder([0-3]?)\b',
+                         line, re.I)
+        if match and not tool_seen:
+            tool = int(match.group(1) or 0)
+            tool_seen = True
+        match = re.match(r'^M(104|109|140|190)\b.*?\bS\s*([0-9.]+)',
+                         line, re.I)
+        if match and hotend is None and match.group(1) in ('104', '109'):
+            value = float(match.group(2))
+            if value > 0:
+                hotend = value
+        elif match and bed is None and match.group(1) in ('140', '190'):
+            value = float(match.group(2))
+            if value > 0:
+                bed = value
+    if hotend is None:
+        raise ValueError('No hotend temperature found in G-code header; '
+                         'add C5_PRINT_START TOOL=n HOTEND=n BED=n')
+    command = 'C5_PRINT_START TOOL=%d HOTEND=%g BED=%g' % (
+        tool, hotend, bed or 0.)
+    if first_layer is not None:
+        command += ' FIRST_LAYER_HEIGHT=%g' % first_layer
+    return command
+
 class VirtualSD:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -21,6 +63,8 @@ class VirtualSD:
         self.sdcard_dirname = os.path.normpath(os.path.expanduser(sd))
         self.current_file = None
         self.file_position = self.file_size = 0
+        self.auto_creator5_start = config.getboolean('auto_creator5_start', False)
+        self.creator5_start_done = False
         # Print Stat Tracking
         self.print_stats = self.printer.load_object(config, 'print_stats')
         # Work timer
@@ -147,6 +191,7 @@ class VirtualSD:
             self.current_file.close()
             self.current_file = None
         self.file_position = self.file_size = 0
+        self.creator5_start_done = False
         self.print_stats.reset()
         self.printer.send_event("virtual_sdcard:reset_file")
     cmd_SDCARD_RESET_FILE_help = "Clears a loaded SD File. Stops the print "\
@@ -210,6 +255,7 @@ class VirtualSD:
         self.current_file = f
         self.file_position = 0
         self.file_size = fsize
+        self.creator5_start_done = False
         self.print_stats.set_current_file(filename)
     def cmd_M24(self, gcmd):
         # Start/resume SD print
@@ -250,7 +296,30 @@ class VirtualSD:
         gcode_mutex = self.gcode.get_mutex()
         partial_input = ""
         lines = []
+        final_line = False
         error_message = None
+        if (self.auto_creator5_start and not self.creator5_start_done
+                and not self.file_position):
+            try:
+                # Read only the header, leaving the file position unchanged.
+                header = self.current_file.read(65536)
+                self.current_file.seek(0)
+                start_command = creator5_start_command(header)
+                self.creator5_start_done = True
+                if start_command is not None:
+                    self.gcode.run_script(start_command)
+            except (ValueError, self.gcode.error) as e:
+                error_message = str(e)
+                self.must_pause_work = True
+            except:
+                logging.exception('virtual_sdcard Creator 5 print start')
+                error_message = 'Creator 5 print start failed'
+                self.must_pause_work = True
+            if error_message is not None:
+                try:
+                    self.gcode.run_script(self.on_error_gcode.render())
+                except:
+                    logging.exception('virtual_sdcard on_error')
         while not self.must_pause_work:
             if not lines:
                 # Read more data
@@ -260,6 +329,14 @@ class VirtualSD:
                     logging.exception("virtual_sdcard read")
                     break
                 if not data:
+                    # A valid file need not end with a newline. Dispatch its
+                    # final command (which may be the print-end macro) before
+                    # reporting completion, without counting a phantom byte.
+                    if partial_input:
+                        lines = [partial_input]
+                        partial_input = ""
+                        final_line = True
+                        continue
                     # End of file
                     self.current_file.close()
                     self.current_file = None
@@ -280,9 +357,11 @@ class VirtualSD:
             self.cmd_from_sd = True
             line = lines.pop()
             if sys.version_info.major >= 3:
-                next_file_position = self.file_position + len(line.encode()) + 1
+                line_length = len(line.encode())
             else:
-                next_file_position = self.file_position + len(line) + 1
+                line_length = len(line)
+            next_file_position = (self.file_position + line_length
+                                  + (0 if final_line else 1))
             self.next_file_position = next_file_position
             try:
                 self.gcode.run_script(line)
@@ -308,6 +387,7 @@ class VirtualSD:
                     return self.reactor.NEVER
                 lines = []
                 partial_input = ""
+                final_line = False
         logging.info("Exiting SD card print (position %d)", self.file_position)
         self.work_timer = None
         self.cmd_from_sd = False

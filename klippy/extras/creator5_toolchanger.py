@@ -47,8 +47,11 @@ class Creator5Toolchanger:
         self._load_extruder_json()
         self.zoffset_json_path = config.get(
             'zoffset_json_path', '/usr/data/firmwareRes/config/zoffset.json')
+        self.test_json_path = config.get(
+            'test_json_path', '/usr/data/firmwareRes/config/test.json')
         self.z_adjustments = [0.] * 4
         self._load_zoffset_json()
+        self.print_z_baseline = [None] * 4
         self.tool_fixture_shift_x = config.getfloat('tool_fixture_shift_x',
                                                     -12.5)
         self.scan_span = config.getfloat('scan_span', 7., above=0.)
@@ -62,6 +65,20 @@ class Creator5Toolchanger:
         self.max_offset_correction = config.getfloat(
             'max_offset_correction', 3., above=0.)
         self.pickup_accel = config.getfloat('pickup_accel', 8000., above=0.)
+        self.clear_travel_speed = config.getfloat(
+            'clear_travel_speed', 80., above=0.)
+        self.clearance_z_speed = config.getfloat(
+            'clearance_z_speed', 20., above=0.)
+        self.dock_approach_speed = config.getfloat(
+            'dock_approach_speed', 20., above=0.)
+        self.pickup_predock_speed = config.getfloat(
+            'pickup_predock_speed', 40., above=0.)
+        self.pickup_latch_speed = config.getfloat(
+            'pickup_latch_speed', 20., above=0.)
+        self.pullback_speed = config.getfloat(
+            'pullback_speed', 80., above=0.)
+        self.departure_speed = config.getfloat(
+            'departure_speed', 80., above=0.)
         self.approach_x = config.getfloat('approach_x', 250.)
         self.pre_dock_x = config.getfloat('pre_dock_x', 280.)
         self.pullback = config.getfloat('pullback', 20., above=0.)
@@ -71,6 +88,8 @@ class Creator5Toolchanger:
                                                    800, minval=0)
         self.sensor_settle_ms = config.getint('sensor_settle_ms', 150,
                                               minval=0)
+        self.toolchange_sensor_settle_ms = config.getint(
+            'toolchange_sensor_settle_ms', 150, minval=0)
         self.position_calibration_timeout = config.getfloat(
             'position_calibration_timeout', 30., above=0.)
         self.position_calibration_release_wait_ms = config.getint(
@@ -104,6 +123,10 @@ class Creator5Toolchanger:
             ('C5_LEVELBOARD_REFERENCE_CALIBRATE',
              self.cmd_reference_calibrate),
             ('C5_SAVE_OFFSETS_JSON', self.cmd_save_offsets_json),
+            ('C5_SAVE_TOUCHSCREEN_Z_OFFSET',
+             self.cmd_save_touchscreen_z_offset),
+            ('C5_AUTO_NOZZLE_Z', self.cmd_auto_nozzle_z),
+            ('C5_VERIFY_NOZZLE_Z', self.cmd_verify_nozzle_z),
             ('C5_CALIBRATE_ATTACHED', self.cmd_calibrate_attached),
             ('C5_MOUNT_COORDS', self.cmd_mount_coords),
             ('C5_MOUNT_CORRECT', self.cmd_mount_correct),
@@ -113,6 +136,27 @@ class Creator5Toolchanger:
             ('C5_EXTRUDER_POSITION_CALIBRATE',
              self.cmd_extruder_position_calibrate)):
             self.gcode.register_command(name, handler)
+        # Register after safe_z_home has installed its G28 handler, so partial
+        # G28 commands can still delegate to Klipper's normal homing path.
+        self.prev_G28 = None
+        self._g28_passthrough = False
+        self.printer.register_event_handler('klippy:ready', self._handle_ready)
+
+    def _handle_ready(self):
+        self.prev_G28 = self.gcode.register_command('G28', None)
+        self.gcode.register_command('G28', self.cmd_G28)
+
+    def cmd_G28(self, gcmd):
+        if self._g28_passthrough:
+            self.prev_G28(gcmd)
+            return
+        requested = [gcmd.get(axis, None) is not None for axis in 'XYZ']
+        if not any(requested) or all(requested):
+            self.cmd_home_for_print(gcmd)
+            return
+        if requested[2] and self.attached_tool_from_pins() is not None:
+            raise gcmd.error('Dock the attached tool before Z homing; use G28')
+        self.prev_G28(gcmd)
 
     def _read_stock_json(self, path):
         with open(path, 'r') as source:
@@ -159,7 +203,9 @@ class Creator5Toolchanger:
                 self.extruder_json_path, exc))
 
     def _load_zoffset_json(self):
+        adjustments = [0.] * 4
         if not os.path.isfile(self.zoffset_json_path):
+            self.z_adjustments = adjustments
             return
         try:
             data, suffix = self._read_stock_json(self.zoffset_json_path)
@@ -168,10 +214,122 @@ class Creator5Toolchanger:
                 value = float(data.get(key, 0.))
                 if not math.isfinite(value):
                     raise ValueError('%s is not finite' % key)
-                self.z_adjustments[tool] = value
+                adjustments[tool] = value
         except (OSError, ValueError, TypeError) as exc:
             raise self.printer.config_error('Invalid %s: %s' % (
                 self.zoffset_json_path, exc))
+        self.z_adjustments = adjustments
+
+    def cmd_save_touchscreen_z_offset(self, gcmd):
+        # The touchscreen's SET_GCODE_OFFSET value is a total G-code Z
+        # offset. Store only the manual part; the levelboard tool difference
+        # is already included when a tool is selected.
+        if self.busy:
+            raise gcmd.error('Cannot save Z offset during a toolchange')
+        dock, grab, tool = self._sensor_state(gcmd)
+        self._validate_sensor_state(gcmd, dock, tool)
+        if tool is None:
+            raise gcmd.error('Attach a tool before saving its Z offset')
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        baseline = self.print_z_baseline[tool]
+        if baseline is None:
+            baseline = self.measurements[tool][2] - self.measurements[0][2]
+        adjustment = origin - baseline
+        if not math.isfinite(adjustment) or abs(adjustment) > 5.:
+            raise gcmd.error('Touchscreen Z adjustment is outside +/-5 mm')
+        if not os.path.isfile(self.zoffset_json_path):
+            raise gcmd.error('Missing stock %s; refusing to create it'
+                             % self.zoffset_json_path)
+        temp_path = None
+        try:
+            data, suffix = self._read_stock_json(self.zoffset_json_path)
+            data['z_offset_t%d' % (tool + 1)] = round(adjustment, 4)
+            directory = os.path.dirname(self.zoffset_json_path)
+            backup = self.zoffset_json_path + '.bak-' + (
+                datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+            shutil.copy2(self.zoffset_json_path, backup)
+            fd, temp_path = tempfile.mkstemp(prefix='.zoffset-',
+                                             suffix='.tmp', dir=directory)
+            os.chmod(temp_path, os.stat(self.zoffset_json_path).st_mode)
+            with os.fdopen(fd, 'w') as target:
+                json.dump(data, target, indent=3, sort_keys=True)
+                target.write('\n')
+                if suffix:
+                    target.write(suffix + '\n')
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temp_path, self.zoffset_json_path)
+            temp_path = None
+        except (OSError, ValueError, TypeError) as exc:
+            raise gcmd.error('Could not save touchscreen Z offset: %s' % exc)
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.unlink(temp_path)
+        self.z_adjustments[tool] = adjustment
+        gcmd.respond_info('Saved T%d touchscreen Z adjustment %.4f mm'
+                          % (tool, adjustment))
+
+    def cmd_auto_nozzle_z(self, gcmd):
+        tool = gcmd.get_int('T', minval=0, maxval=3)
+        hotend = gcmd.get_float('HOTEND', 120., minval=0.)
+        bed = gcmd.get_float('BED', 0., minval=0.)
+        first_layer = gcmd.get_float('FIRST_LAYER_HEIGHT', 0.2, above=0.)
+        dock, grab, attached = self._preflight(gcmd)
+        if attached != tool:
+            raise gcmd.error('Attach T%d before automatic nozzle Z' % tool)
+        if not os.path.isfile(self.extruder_json_path):
+            raise gcmd.error('Missing calibrated %s' % self.extruder_json_path)
+        if not os.path.isfile(self.zoffset_json_path):
+            raise gcmd.error('Missing touchscreen %s' % self.zoffset_json_path)
+        if not os.path.isfile(self.test_json_path):
+            raise gcmd.error('Missing factory test config %s' % self.test_json_path)
+        try:
+            data, suffix = self._read_stock_json(self.extruder_json_path)
+            test_data, _ = self._read_stock_json(self.test_json_path)
+            if test_data.get('generalFirmware', False):
+                raise ValueError('factory generalFirmware mode has no nozzle '
+                                 'offset application')
+            temp_coefficient = float(test_data['tempOffset'])
+            tool_z = float(data['t%d_offset_z' % tool])
+            station_z = float(data['z_station_pos'])
+            if not all(math.isfinite(v) for v in (
+                    tool_z, station_z, temp_coefficient, hotend, bed,
+                    first_layer)):
+                raise ValueError('non-finite Z calibration')
+            self._load_zoffset_json()
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise gcmd.error('Invalid automatic nozzle Z calibration: %s' % exc)
+        baseline = tool_z - station_z
+        correction = ((hotend - 120.) * temp_coefficient
+                      - (0.08 if bed >= 100. else 0.)
+                      - (0.06 if first_layer < 0.11 else 0.))
+        offset = baseline + correction + self.z_adjustments[tool]
+        if not 0.5 <= offset <= 5.:
+            raise gcmd.error('Automatic T%d nozzle Z %.4f mm outside 0.5..5 mm'
+                             % (tool, offset))
+        # Factory BuildPage::startPrint applies this absolute offset with
+        # MOVE=1 before print motion. The earlier crash path was the
+        # preparation purge occurring before this command at all.
+        self._run('SET_GCODE_OFFSET Z=%.4f MOVE=1 MOVE_SPEED=100' % offset)
+        self.print_z_baseline[tool] = baseline + correction
+        gcmd.respond_info('Automatic T%d nozzle Z %.4f mm '
+                          '(tool %.4f - station %.4f + print %.4f + '
+                          'touchscreen %.4f)'
+                          % (tool, offset, tool_z, station_z, correction,
+                             self.z_adjustments[tool]))
+
+    def cmd_verify_nozzle_z(self, gcmd):
+        dock, grab, tool = self._preflight(gcmd)
+        if tool is None or self.print_z_baseline[tool] is None:
+            raise gcmd.error('Automatic nozzle Z is not applied; refusing '
+                             'low-Z print motion')
+        expected = self.print_z_baseline[tool] + self.z_adjustments[tool]
+        actual = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        if not math.isfinite(actual) or abs(actual - expected) > 0.02:
+            raise gcmd.error('Nozzle Z offset changed or reset '
+                             '(expected %.4f, got %.4f)' % (expected, actual))
 
     def cmd_save_offsets_json(self, gcmd):
         if self.busy:
@@ -255,17 +413,24 @@ class Creator5Toolchanger:
     def _button(self, name, gcmd):
         obj = self.printer.lookup_object('gcode_button ' + name, None)
         if obj is None:
-            raise gcmd.error('Missing gcode_button %s' % name)
+            raise self._sensor_error(gcmd, 'Missing gcode_button %s' % name)
         return obj.get_status().get('state') == 'PRESSED'
 
-    def _sensor_state(self, gcmd):
+    def _sensor_error(self, gcmd, message):
+        if gcmd is not None:
+            return gcmd.error(message)
+        return self.printer.command_error(message)
+
+    def _sensor_state(self, gcmd=None):
         dock = [self._button(name, gcmd) for name in self.dock_buttons]
         grab = [self._button(name, gcmd) for name in self.grab_buttons]
         if any(dock[i] and grab[i] for i in range(4)):
-            raise gcmd.error('Conflicting dock/grab sensors; motion blocked')
+            raise self._sensor_error(
+                gcmd, 'Conflicting dock/grab sensors; motion blocked')
         attached = [i for i in range(4) if grab[i] and not dock[i]]
         if len(attached) > 1:
-            raise gcmd.error('Multiple heads appear attached; motion blocked')
+            raise self._sensor_error(
+                gcmd, 'Multiple heads appear attached; motion blocked')
         return dock, grab, attached[0] if attached else None
 
     def _validate_sensor_state(self, gcmd, dock, attached):
@@ -278,16 +443,41 @@ class Creator5Toolchanger:
                        if i != attached and not value]
         if missing:
             names = ','.join('T%d' % i for i in missing)
-            raise gcmd.error('Missing dock confirmation for %s; motion blocked'
-                             % names)
+            raise self._sensor_error(
+                gcmd, 'Missing dock confirmation for %s; motion blocked'
+                % names)
 
-    def _preflight(self, gcmd, axes='xyz', allow_open_doors=False):
-        if self.busy:
-            raise gcmd.error('Creator 5 toolchanger is already moving')
-        if not allow_open_doors:
+    def attached_tool_from_pins(self):
+        # AFC and status clients may query this, but the physical Creator 5
+        # dock/grab inputs remain the sole authority for tool presence.
+        dock, _, attached = self._sensor_state()
+        self._validate_sensor_state(None, dock, attached)
+        return attached
+
+    def _chamber_heater_active(self, gcmd):
+        try:
+            heater = self.printer.lookup_object('heaters').lookup_heater(
+                'chamber_heater')
+            status = heater.get_status(self.printer.get_reactor().monotonic())
+        except Exception as exc:
+            raise gcmd.error('Cannot verify chamber heater state: %s' % exc)
+        return status.get('target', 0.) > 0. or status.get('power', 0.) > 0.
+
+    def _check_chamber_doors(self, gcmd, message):
+        # Open access is permitted with the chamber heater off.  Never
+        # silently bypass a failed heater-state lookup.
+        if not self.door_buttons:
+            return
+        if self._chamber_heater_active(gcmd):
             for name in self.door_buttons:
                 if self._button(name, gcmd):
-                    raise gcmd.error('Door %s is open' % name)
+                    raise gcmd.error(message % name)
+
+    def _preflight(self, gcmd, axes='xyz'):
+        if self.busy:
+            raise gcmd.error('Creator 5 toolchanger is already moving')
+        self._check_chamber_doors(
+            gcmd, 'Door %s is open while chamber heater is enabled')
         status = self.printer.lookup_object('toolhead').get_status(
             self.printer.get_reactor().monotonic())
         homed = status.get('homed_axes', '')
@@ -301,6 +491,8 @@ class Creator5Toolchanger:
         self.gcode.run_script_from_command(script)
 
     def _pause_ms(self, milliseconds):
+        if not milliseconds:
+            return
         reactor = self.printer.get_reactor()
         reactor.pause(reactor.monotonic() + milliseconds / 1000.)
 
@@ -331,12 +523,13 @@ class Creator5Toolchanger:
     def _raise_z(self):
         toolhead = self.printer.lookup_object('toolhead')
         if toolhead.get_position()[2] < self.safe_z:
-            self._move(z=self.safe_z, feed=1200)
+            self._move(z=self.safe_z,
+                       feed=self.clearance_z_speed * 60.)
 
     def _verify(self, gcmd, expected, parked=None):
         try:
             self._run('M400')
-            self._pause_ms(self.sensor_settle_ms)
+            self._pause_ms(self.toolchange_sensor_settle_ms)
             dock, _, attached = self._sensor_state(gcmd)
             self._validate_sensor_state(gcmd, dock, attached)
             if attached != expected:
@@ -358,35 +551,42 @@ class Creator5Toolchanger:
 
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
+        clear_feed = self.clear_travel_speed * 60.
         # Nozzle offsets no longer apply once the head is being parked.
         self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
         if raise_z:
             self._raise_z()
-        self._move(x=self.approach_x)
-        self._move(y=y)
-        self._move(x=x - 10., feed=1200)
-        self._move(x=x, feed=1200)
+        self._move(x=self.approach_x, feed=clear_feed)
+        self._move(y=y, feed=clear_feed)
+        self._move(x=x - 10., feed=self.dock_approach_speed * 60.)
+        self._move(x=x, feed=self.dock_approach_speed * 60.)
         self._run('M400')
         self._run('MOTOR_RELEASE')
         self._pause_ms(self.release_latch_wait_ms)
-        self._move(x=self.approach_x)
+        self._move(x=self.approach_x,
+                   feed=self.departure_speed * 60.)
         self._verify(gcmd, None, parked=tool)
 
-    def _pickup(self, gcmd, tool):
+    def _pickup(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
-        self._raise_z()
-        self._move(x=self.approach_x)
-        self._move(y=y)
-        self._move(x=self.pre_dock_x, feed=2400)
-        self._move(x=x, feed=1200)
+        clear_feed = self.clear_travel_speed * 60.
+        if raise_z:
+            self._raise_z()
+        self._move(x=self.approach_x, feed=clear_feed)
+        self._move(y=y, feed=clear_feed)
+        self._move(x=self.pre_dock_x,
+                   feed=self.pickup_predock_speed * 60.)
+        self._move(x=x, feed=self.pickup_latch_speed * 60.)
         self._run('M400')
         if not self._button(self.grab_buttons[tool], gcmd):
             raise gcmd.error('T%d grab sensor did not engage at mount' % tool)
         self._run('MOTOR_GRAB')
-        self._move(x=x - self.pullback)
+        self._move(x=x - self.pullback,
+                   feed=self.pullback_speed * 60.)
         self._run('MOTOR_GRAB2')
         self._pause_ms(self.pickup_latch_wait_ms)
-        self._move(x=self.approach_x)
+        self._move(x=self.approach_x,
+                   feed=self.departure_speed * 60.)
         self._verify(gcmd, tool)
         self._apply_offsets(tool)
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
@@ -426,6 +626,7 @@ class Creator5Toolchanger:
 
     def cmd_home_for_print(self, gcmd):
         dock, grab, attached = self._preflight(gcmd, axes='')
+        recovered = attached is not None
         if attached is not None:
             self.cmd_recover_attached(gcmd)
             dock, grab, attached = self._preflight(gcmd, axes='')
@@ -433,7 +634,17 @@ class Creator5Toolchanger:
             raise gcmd.error('Attached head remains after recovery; Z homing blocked')
         if not all(dock):
             raise gcmd.error('Confirm all heads are docked before print homing')
-        self._run('G28')
+        if recovered:
+            self._run('G28 Z')
+        else:
+            # Preserve safe_z_home's single-call all-axis sequence when
+            # there was no head to recover.
+            old_passthrough = self._g28_passthrough
+            self._g28_passthrough = True
+            try:
+                self._run('G28')
+            finally:
+                self._g28_passthrough = old_passthrough
 
     def cmd_recover_attached(self, gcmd):
         dock, grab, attached = self._preflight(gcmd, axes='')
@@ -451,9 +662,27 @@ class Creator5Toolchanger:
             raise gcmd.error('Attached head changed during XY homing')
         self._with_motion(gcmd, lambda: self._dock(
             gcmd, attached, raise_z=False))
-        # Clear AFC selection bookkeeping too, including a head discovered
-        # physically after restart. Its custom unselect is idempotent here.
-        self._run('AFC_UNSELECT_TOOL')
+        # AFC's active-tool lookup reads the same physical pins; after this
+        # verified dock it reports no selected head without a second dock call.
+
+    def _prepare_tool_motion(self, gcmd):
+        dock, grab, attached = self._preflight(gcmd, axes='xy')
+        toolhead = self.printer.lookup_object('toolhead')
+        homed = toolhead.get_status(
+            self.printer.get_reactor().monotonic()).get('homed_axes', '')
+        if 'z' in homed:
+            return dock, attached, True
+        # SafeZHoming provides a relative clearance hop without claiming Z is
+        # homed. Re-run XY homing to guarantee that hop before dock travel.
+        safe_home = self.printer.lookup_object('safe_z_home', None)
+        if safe_home is None or safe_home.z_hop < self.safe_z:
+            raise gcmd.error('XY-only tool motion requires safe_z_home '
+                             'z_hop of at least %.1f mm' % self.safe_z)
+        self._run('G28 X Y')
+        new_dock, _, current = self._preflight(gcmd, axes='xy')
+        if current != attached or new_dock != dock:
+            raise gcmd.error('Tool sensors changed during XY homing')
+        return new_dock, current, False
 
     def cmd_status(self, gcmd):
         dock, grab, attached = self._sensor_state(gcmd)
@@ -465,7 +694,10 @@ class Creator5Toolchanger:
 
     def cmd_select(self, gcmd):
         tool = gcmd.get_int('T', minval=0, maxval=3)
-        dock, grab, attached = self._preflight(gcmd)
+        # The touchscreen may have saved a new per-tool Z value since Klippy
+        # started. Refresh before moving or applying offsets for this pickup.
+        self._load_zoffset_json()
+        dock, grab, attached = self._preflight(gcmd, axes='')
         if attached == tool:
             # AFC may select a head that was already mounted at Klippy start.
             # Restore its active extruder and offsets even without pickup motion.
@@ -475,19 +707,21 @@ class Creator5Toolchanger:
             self.active = tool
             gcmd.respond_info('T%d is already attached' % tool)
             return
+        dock, attached, z_homed = self._prepare_tool_motion(gcmd)
         if not dock[tool]:
             raise gcmd.error('T%d is not in its dock' % tool)
         def change():
             if attached is not None:
-                self._dock(gcmd, attached)
-            self._pickup(gcmd, tool)
+                self._dock(gcmd, attached, raise_z=z_homed)
+            self._pickup(gcmd, tool, raise_z=z_homed)
         self._with_motion(gcmd, change)
 
     def cmd_dock(self, gcmd):
         dock, grab, attached = self._preflight(gcmd, axes='')
         if attached is not None:
-            self._preflight(gcmd)
-            self._with_motion(gcmd, lambda: self._dock(gcmd, attached))
+            dock, attached, z_homed = self._prepare_tool_motion(gcmd)
+            self._with_motion(gcmd, lambda: self._dock(
+                gcmd, attached, raise_z=z_homed))
 
     def cmd_mount_coords(self, gcmd):
         for i, (x, y) in enumerate(self.docks):
@@ -585,6 +819,7 @@ class Creator5Toolchanger:
         return z
 
     def _apply_offsets(self, tool):
+        self.print_z_baseline[tool] = None
         offsets = [self.measurements[tool][axis]
                    - self.measurements[0][axis] for axis in range(3)]
         offsets[2] += self.z_adjustments[tool]
@@ -811,7 +1046,7 @@ class Creator5Toolchanger:
                     'temperature', 0.) > 50.):
                 raise gcmd.error('Cool all toolheads below 50 C before '
                                  'manual holder calibration')
-        dock, grab, attached = self._preflight(gcmd, allow_open_doors=True)
+        dock, grab, attached = self._preflight(gcmd)
         if attached is not None or not all(dock) or any(grab):
             raise gcmd.error('Park all toolheads before holder calibration')
         toolhead = self.printer.lookup_object('toolhead')
@@ -839,8 +1074,8 @@ class Creator5Toolchanger:
                                   'activate. Release your hand when asked.'
                                   % tool)
                 self._wait_for_holder_contact(gcmd, tool)
-                gcmd.respond_info('T%d detected. Release your hand and '
-                                  'close the doors; measurement starts in '
+                gcmd.respond_info('T%d detected. Release your hand; '
+                                  'measurement starts in '
                                   '%.1f seconds.' % (
                                       tool,
                                       self.position_calibration_release_wait_ms
@@ -852,16 +1087,13 @@ class Creator5Toolchanger:
                 if any(self._button(name, gcmd) for i, name in
                        enumerate(self.grab_buttons) if i != tool):
                     raise gcmd.error('Another toolhead also reports attached')
-                for name in self.door_buttons:
-                    if self._button(name, gcmd):
-                        raise gcmd.error('Close door %s before automatic '
-                                         'holder measurement' % name)
+                self._check_chamber_doors(
+                    gcmd, 'Close door %s before automatic holder '
+                          'measurement while chamber heater is enabled')
                 x, y = self._measure_holder_position(gcmd, tool)
-                for name in self.door_buttons:
-                    if self._button(name, gcmd):
-                        raise gcmd.error('Door %s opened during holder '
-                                         'measurement; no re-dock or save'
-                                         % name)
+                self._check_chamber_doors(
+                    gcmd, 'Door %s opened during holder measurement; '
+                          'no re-dock or save')
                 # HDHOME returned measurements in the temporary frame.
                 # Establish real XY coordinates before travelling to a dock.
                 self._run('G28 X Y')
@@ -897,6 +1129,7 @@ class Creator5Toolchanger:
         dock, grab, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool for purge')
+        self.cmd_verify_nozzle_z(gcmd)
         extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
         heater = self.printer.lookup_object(extruder)
         if not heater.get_status(self.printer.get_reactor().monotonic()).get(
@@ -922,7 +1155,14 @@ class Creator5Toolchanger:
         self._with_motion(gcmd, purge)
 
     def get_status(self, eventtime=None):
-        return {'active_tool': self.active, 'busy': self.busy,
+        try:
+            active_tool = self.attached_tool_from_pins()
+            sensor_error = None
+        except Exception as exc:
+            active_tool = None
+            sensor_error = str(exc)
+        return {'active_tool': active_tool, 'sensor_error': sensor_error,
+                'busy': self.busy,
                 'dock_positions': [list(p) for p in self.docks],
                 'tool_measurements': [list(p) for p in self.measurements]}
 
