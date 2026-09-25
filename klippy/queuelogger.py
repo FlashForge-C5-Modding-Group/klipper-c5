@@ -52,7 +52,11 @@ class QueueListener(logging.handlers.TimedRotatingFileHandler):
         lines.append(
             "=============== Log rollover at %s ===============" % (
                 time.asctime(),))
-        self.emit(logging.makeLogRecord(
+        # The rollover banner belongs in the newly opened log file.  Calling
+        # self.emit() here re-enters BaseRotatingHandler.emit(), which can
+        # request another rollover and recurse indefinitely when the clock
+        # jumps or rolloverAt is still in the past.
+        logging.FileHandler.emit(self, logging.makeLogRecord(
             {'msg': "\n".join(lines), 'level': logging.INFO}))
 
 MainQueueHandler = None
