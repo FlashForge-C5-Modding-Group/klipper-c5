@@ -21,6 +21,7 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.file_size = len(text.encode())
         sd.auto_creator5_start = False
         sd.creator5_start_done = False
+        sd.creator5_preloaded_definitions = set()
         sd.must_pause_work = sd.cmd_from_sd = False
         sd.work_timer = object()
         sd.reactor = mock.Mock(NOW=0., NEVER=999.)
@@ -127,6 +128,25 @@ class VirtualSDEOFTests(unittest.TestCase):
             'C5_PRINT_START TOOL=0 HOTEND=220 BED=0', 'M109 S220',
             'G92 E0', 'G1 X10'])
         self.assertEqual(sd.file_position, sd.file_size)
+
+    def test_object_polygons_are_available_before_adaptive_start_once(self):
+        define = ('EXCLUDE_OBJECT_DEFINE NAME=cube '
+                  'POLYGON=[[10,10],[20,10],[20,20],[10,20]]')
+        sd = self.make_sd('; résumé\n' + define + '\nM109 S220\nG1 X10\n')
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(commands[:3], [
+            'EXCLUDE_OBJECT_DEFINE RESET=1', define,
+            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0'])
+        self.assertEqual(commands.count(define), 1)
+        self.assertEqual(commands[-2:], ['M109 S220', 'G1 X10'])
+        self.assertEqual(sd.file_position, sd.file_size)
+
+    def test_partial_object_definition_is_not_preloaded(self):
+        header = (';' + 'x' * 65500 + '\n'
+                  'EXCLUDE_OBJECT_DEFINE NAME=x POLYGON=[')[:65536]
+        self.assertEqual(MODULE.creator5_object_definitions(header), [])
 
     def test_missing_temperature_stops_before_motion(self):
         sd = self.make_sd('G1 X10\n')

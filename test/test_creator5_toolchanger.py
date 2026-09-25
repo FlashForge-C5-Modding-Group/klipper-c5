@@ -46,12 +46,17 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.extruder_json_path = self.path
         self.board.test_json_path = os.path.join(self.temp.name, 'test.json')
         with open(self.board.test_json_path, 'w') as target:
-            target.write('{"generalFirmware": false, "tempOffset": 0.00045}\n')
+            target.write('{"generalFirmware": false, "tempOffset": 0.00045, '
+                         '"cylinder_x": 28.5, "cylinder_y": 214.5}\n')
         self.board.measurements = [[15., 215., 1.] for _ in range(4)]
         self.board.docks = [[298., 50. + i * 50.] for i in range(4)]
         self.board.station_x = 29.
         self.board.station_y = 214.
         self.board.station_z = -1.
+        self.board.plate_check_x = 43.
+        self.board.plate_check_y = 226.
+        self.board.plate_check_min_delta = .8
+        self.board._stock_pin_approach_z = None
         self.board.print_z_baseline = [None] * 4
         self.board.busy = False
         self.board.toolchange_sensor_settle_ms = 0
@@ -59,6 +64,19 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (.1, .2, .3, 0.)}
+
+    def test_flow_calibration_misc_switch_controls_live_state(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        switch = MODULE.Creator5FlowSwitch(printer, gcode, True)
+        printer.add_object.assert_called_once_with(
+            'filament_switch_sensor flow_calibration', switch)
+        self.assertTrue(switch.get_status(0.)['enabled'])
+        switch.cmd_set(GCmd(ENABLE=0))
+        self.assertFalse(switch.get_status(0.)['enabled'])
+        self.assertFalse(switch.get_status(0.)['filament_detected'])
+        switch.cmd_set(GCmd(ENABLE=1))
+        self.assertTrue(switch.get_status(0.)['enabled'])
+        self.assertEqual(gcode.register_mux_command.call_count, 2)
 
     def test_open_door_blocks_only_with_chamber_heater_active(self):
         heater = mock.Mock()
@@ -438,10 +456,9 @@ class Creator5OffsetTests(unittest.TestCase):
                          mock.call('ACTIVATE_EXTRUDER EXTRUDER=extruder1'))
         self.board._run.assert_any_call('G1 E12.000 F180')
         self.board._run.assert_any_call('G1 E-5 F1200')
-        self.board._move.assert_any_call(x=200., y=80., feed=3000,
+        self.board._move.assert_any_call(y=13.8, feed=6000,
                                          machine=False)
-        self.board._move.assert_any_call(y=13.8, feed=24000,
-                                         machine=False)
+        self.board._move.assert_any_call(z=1., feed=600, machine=False)
         moves = [call.kwargs for call in self.board._move.call_args_list]
         x250 = next(i for i, move in enumerate(moves)
                     if move.get('x') == 250.)
@@ -451,6 +468,13 @@ class Creator5OffsetTests(unittest.TestCase):
                        if move.get('x') == 266.5)
         self.assertLess(x250, low_y)
         self.assertLess(low_y, final_x)
+        final_z = next(i for i, move in enumerate(moves)
+                       if move.get('z') == 1.)
+        self.assertLess(final_x, final_z)
+        scripts = [call.args[0] for call in self.board._run.call_args_list]
+        self.assertLess(scripts.index('G1 E12.000 F180'),
+                        scripts.index('G1 E-5 F1200'))
+        self.assertGreaterEqual(scripts.count('M400'), 2)
         self.board._run.reset_mock()
         heater.get_status.return_value = {'can_extrude': False}
         with self.assertRaisesRegex(RuntimeError, 'not hot enough'):
@@ -651,9 +675,11 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._run.assert_called_once_with('G1 Z1.0000 F600')
 
     def test_all_offsets_failure_rolls_back_entire_batch(self):
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._check_plate_removed = mock.Mock(return_value=0.)
         original = [list(v) for v in self.board.measurements]
         station = self.board.station_x
-        self.board._preflight = mock.Mock()
+        self.board._preflight = mock.Mock(return_value=([], [], None))
         self.board.configfile = mock.Mock()
         commands = []
         def run(command):
@@ -677,8 +703,10 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertFalse(any('TOOL=extruder3' in cmd for cmd in commands))
 
     def test_all_offsets_json_failure_also_rolls_back(self):
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._check_plate_removed = mock.Mock(return_value=0.)
         original = [list(v) for v in self.board.measurements]
-        self.board._preflight = mock.Mock()
+        self.board._preflight = mock.Mock(return_value=([], [], None))
         self.board.configfile = mock.Mock()
         def run(command):
             if command.startswith('C5_TOOL_OFFSET_CALIBRATE'):
@@ -693,7 +721,9 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.configfile.set.assert_not_called()
 
     def test_all_offsets_saves_once_after_final_dock(self):
-        self.board._preflight = mock.Mock()
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._check_plate_removed = mock.Mock(return_value=0.)
+        self.board._preflight = mock.Mock(return_value=([], [], None))
         self.board._run = mock.Mock()
         self.board.configfile = mock.Mock()
         def save(command):
@@ -705,6 +735,83 @@ class Creator5OffsetTests(unittest.TestCase):
             BUILDPLATE_REMOVED=1, SAVE=1))
         self.board.cmd_save_offsets_json.assert_called_once()
         self.board.configfile.set.assert_not_called()
+
+    def test_stock_pin_checks_plate_before_levelboard_or_tool_pickup(self):
+        self.board._preflight = mock.Mock(return_value=([], [], None))
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._probe_stock_pin = mock.Mock(side_effect=(0., -1.))
+        self.board._run = mock.Mock()
+        self.board.cmd_calibrate_all_offsets(GCmd(BUILDPLATE_REMOVED=1,
+                                                   SAVE=0))
+        self.assertEqual(self.board._probe_stock_pin.call_count, 2)
+        self.assertEqual(self.board._probe_stock_pin.call_args_list[0].args[1:],
+                         (43., 226.))
+        self.assertEqual(self.board._probe_stock_pin.call_args_list[1].args[1:],
+                         (28.5, 214.5))
+        self.assertEqual(self.board._run.call_args_list[0].args[0],
+                         'C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
+                         'BUILDPLATE_REMOVED=1')
+        self.assertIsNone(self.board._stock_pin_approach_z)
+
+    def test_stock_pin_rejects_plate_present_before_tool_motion(self):
+        self.board._preflight = mock.Mock(return_value=([], [], None))
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._probe_stock_pin = mock.Mock(side_effect=(0., -.2))
+        self.board._run = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, 'Build plate may'):
+            self.board.cmd_calibrate_all_offsets(GCmd(BUILDPLATE_REMOVED=1,
+                                                       SAVE=0))
+        self.assertFalse(any('AFC_SELECT_TOOL' in c.args[0]
+                             for c in self.board._run.call_args_list))
+
+    def test_stock_pin_never_probes_with_head_attached(self):
+        self.board._preflight = mock.Mock(return_value=([], [], 2))
+        self.board._probe_stock_pin = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, 'Dock the mounted head'):
+            self.board.cmd_calibrate_all_offsets(GCmd(BUILDPLATE_REMOVED=1,
+                                                       SAVE=0))
+        self.board._probe_stock_pin.assert_not_called()
+
+    def test_stock_pin_approach_never_exceeds_configured_probe_floor(self):
+        self.board.safe_z = 10.
+        self.board.z_probe_target = -8.
+        self.board._move = mock.Mock()
+        self.board._raise_z = mock.Mock()
+        self.board._estop = mock.Mock(return_value=1.)
+        self.board._stock_pin_approach_z = -5.
+        self.board._probe_fixture_z(GCmd(), 28., 215.)
+        self.board._estop.assert_called_once_with('Z', -5., mock.ANY)
+        self.board._estop.reset_mock()
+        self.board._stock_pin_approach_z = -12.
+        self.board._probe_fixture_z(GCmd(), 28., 215.)
+        self.board._estop.assert_called_once_with('Z', -8., mock.ANY)
+
+    def test_stock_pin_uses_three_repeatable_probe_samples(self):
+        session = mock.Mock()
+        session.pull_probed_results.return_value = [
+            mock.Mock(bed_z=z) for z in (1.00, 1.02, 1.01)]
+        probe = mock.Mock()
+        probe.start_probe_session.return_value = session
+        self.board.printer.lookup_object.return_value = probe
+        self.board._move = mock.Mock()
+        self.board._raise_z = mock.Mock()
+        self.assertAlmostEqual(self.board._probe_stock_pin(GCmd(), 43., 226.),
+                               1.01)
+        self.assertEqual(session.run_probe.call_count, 3)
+        session.end_probe_session.assert_called_once()
+
+    def test_stock_pin_rejects_inconsistent_samples(self):
+        session = mock.Mock()
+        session.pull_probed_results.return_value = [
+            mock.Mock(bed_z=z) for z in (1.00, 1.12, 1.01)]
+        probe = mock.Mock()
+        probe.start_probe_session.return_value = session
+        self.board.printer.lookup_object.return_value = probe
+        self.board._move = mock.Mock()
+        self.board._raise_z = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, 'not repeatable'):
+            self.board._probe_stock_pin(GCmd(), 43., 226.)
+        session.end_probe_session.assert_called_once()
 
     def test_load_check_requires_attached_and_matching_active_hotend(self):
         self.board._preflight = mock.Mock(return_value=([], [], 1))

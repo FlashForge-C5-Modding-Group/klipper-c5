@@ -75,6 +75,22 @@ def creator5_slicer_z_offset(line):
     return bool(re.match(r'^G92\b', command, re.I)
                 and re.search(r'\bZ\s*=?\s*[-+]?(?:\d|\.)', command, re.I))
 
+def creator5_object_definitions(header):
+    # Moonraker inserts object polygons in the file header.  Auto print-start
+    # runs before the file, so adaptive bed mesh needs those definitions now.
+    definitions = []
+    offset = 0
+    for raw in header.splitlines(True):
+        # A capped header read may end midway through a JSON polygon.  Let
+        # normal file playback handle that line rather than dispatching it.
+        if len(header) >= 65536 and not raw.endswith(('\n', '\r')):
+            break
+        command = raw.split(';', 1)[0].strip()
+        if re.match(r'^EXCLUDE_OBJECT_DEFINE\s+', command, re.I):
+            definitions.append((offset, command))
+        offset += len(raw.encode())
+    return definitions
+
 class VirtualSD:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -85,6 +101,7 @@ class VirtualSD:
         self.file_position = self.file_size = 0
         self.auto_creator5_start = config.getboolean('auto_creator5_start', False)
         self.creator5_start_done = False
+        self.creator5_preloaded_definitions = set()
         # Print Stat Tracking
         self.print_stats = self.printer.load_object(config, 'print_stats')
         # Work timer
@@ -212,6 +229,7 @@ class VirtualSD:
             self.current_file = None
         self.file_position = self.file_size = 0
         self.creator5_start_done = False
+        self.creator5_preloaded_definitions = set()
         self.print_stats.reset()
         self.printer.send_event("virtual_sdcard:reset_file")
     cmd_SDCARD_RESET_FILE_help = "Clears a loaded SD File. Stops the print "\
@@ -276,6 +294,7 @@ class VirtualSD:
         self.file_position = 0
         self.file_size = fsize
         self.creator5_start_done = False
+        self.creator5_preloaded_definitions = set()
         self.print_stats.set_current_file(filename)
     def cmd_M24(self, gcmd):
         # Start/resume SD print
@@ -324,6 +343,12 @@ class VirtualSD:
                 # Read only the header, leaving the file position unchanged.
                 header = self.current_file.read(65536)
                 self.current_file.seek(0)
+                definitions = creator5_object_definitions(header)
+                if definitions:
+                    self.gcode.run_script('EXCLUDE_OBJECT_DEFINE RESET=1')
+                    for offset, definition in definitions:
+                        self.gcode.run_script(definition)
+                        self.creator5_preloaded_definitions.add(offset)
                 start_command = creator5_start_command(header)
                 self.creator5_start_done = True
                 if start_command is not None:
@@ -384,7 +409,9 @@ class VirtualSD:
                                   + (0 if final_line else 1))
             self.next_file_position = next_file_position
             try:
-                if self.auto_creator5_start and creator5_slicer_z_offset(line):
+                if self.file_position in self.creator5_preloaded_definitions:
+                    pass
+                elif self.auto_creator5_start and creator5_slicer_z_offset(line):
                     logging.warning('Ignoring slicer Z offset in Creator 5 '
                                     'print file: %s', line.strip())
                 else:

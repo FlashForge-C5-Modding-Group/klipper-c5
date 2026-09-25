@@ -26,6 +26,32 @@ HOLDER_REFERENCE_Y_BASE = 80.
 HOLDER_REFERENCE_Y_PITCH = 50.
 
 
+class Creator5FlowSwitch:
+    """Mainsail Misc switch, analogous to AFC's virtual quiet_mode sensor.
+
+    This is a setting, never a real filament sensor or a runout source.
+    """
+    def __init__(self, printer, gcode, enabled):
+        self.enabled = bool(enabled)
+        printer.add_object('filament_switch_sensor flow_calibration', self)
+        gcode.register_mux_command('SET_FILAMENT_SENSOR', 'SENSOR',
+                                   'flow_calibration', self.cmd_set)
+        gcode.register_mux_command('QUERY_FILAMENT_SENSOR', 'SENSOR',
+                                   'flow_calibration', self.cmd_query)
+
+    def get_status(self, eventtime):
+        return {'enabled': self.enabled, 'filament_detected': self.enabled}
+
+    def cmd_set(self, gcmd):
+        self.enabled = bool(gcmd.get_int('ENABLE', 1, minval=0, maxval=1))
+        gcmd.respond_info('Creator 5 flow calibration %s'
+                          % ('enabled' if self.enabled else 'disabled'))
+
+    def cmd_query(self, gcmd):
+        gcmd.respond_info('Creator 5 flow calibration %s'
+                          % ('enabled' if self.enabled else 'disabled'))
+
+
 class Creator5Toolchanger:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -59,6 +85,13 @@ class Creator5Toolchanger:
         self.reference_scan_height = config.getfloat('reference_scan_height',
                                                      None)
         self.z_probe_target = config.getfloat('z_probe_target', -8.)
+        # CommMgr::checkPlatformRemove() probes these two locations with the
+        # carriage's ordinary [probe] before touching the levelboard target.
+        self.plate_check_x = config.getfloat('plate_check_x', 43.)
+        self.plate_check_y = config.getfloat('plate_check_y', 226.)
+        self.plate_check_min_delta = config.getfloat(
+            'plate_check_min_delta', .8, above=0.)
+        self._stock_pin_approach_z = None
         self.safe_z = config.getfloat('safe_z', 10., above=0.)
         self.max_mount_correction = config.getfloat(
             'max_mount_correction', 2., above=0.)
@@ -115,12 +148,17 @@ class Creator5Toolchanger:
             raise config.error('Creator 5 requires four dock and grab buttons')
         self.active = None
         self.busy = False
+        self.flow_switch = Creator5FlowSwitch(
+            self.printer, self.gcode,
+            config.getboolean('flow_calibration_default', True))
         for name, handler in (
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),
             ('C5_TOOL_DOCK', self.cmd_dock),
             ('C5_TOOL_PURGE', self.cmd_purge),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
+            ('C5_MISC_FLOW_ON', self.cmd_flow_on),
+            ('C5_MISC_FLOW_OFF', self.cmd_flow_off),
             ('C5_COOL_FOR_DOCK', self.cmd_cool_for_dock),
             ('C5_CHECK_LOAD_TOOL', self.cmd_check_load_tool),
             ('C5_CALIBRATE_ALL_OFFSETS', self.cmd_calibrate_all_offsets),
@@ -152,6 +190,14 @@ class Creator5Toolchanger:
     def _handle_ready(self):
         self.prev_G28 = self.gcode.register_command('G28', None)
         self.gcode.register_command('G28', self.cmd_G28)
+
+    def cmd_flow_on(self, gcmd):
+        self.flow_switch.enabled = True
+        gcmd.respond_info('Creator 5 flow calibration enabled')
+
+    def cmd_flow_off(self, gcmd):
+        self.flow_switch.enabled = False
+        gcmd.respond_info('Creator 5 flow calibration disabled')
 
     def cmd_G28(self, gcmd):
         if self._g28_passthrough:
@@ -830,10 +876,59 @@ class Creator5Toolchanger:
         old[0], old[1] = x, y
         gcmd.respond_info('T%d levelboard XY X=%.4f Y=%.4f' % (tool, x, y))
 
-    def _probe_fixture_z(self, gcmd, x, y):
+    def _probe_stock_pin(self, gcmd, x, y):
+        probe = self.printer.lookup_object('probe', None)
+        if probe is None:
+            raise gcmd.error('Stock [probe] pin is required for offset calibration')
+        self._raise_z()
+        self._move(x=x, y=y, feed=2400)
+        session = probe.start_probe_session(gcmd)
+        try:
+            for _ in range(3):
+                session.run_probe(gcmd)
+            positions = session.pull_probed_results()
+        finally:
+            session.end_probe_session()
+            self._raise_z()
+        values = [pos.bed_z for pos in positions]
+        if (len(values) != 3 or not all(math.isfinite(z) for z in values)
+                or max(values) - min(values) >= .1):
+            raise gcmd.error('Stock calibration pin is not repeatable within 0.1 mm')
+        return sum(values) / len(values)
+
+    def _check_plate_removed(self, gcmd):
+        # Stock checkPlatformRemove(): compare the regular pin's contact
+        # height at X43/Y226 with the cylinder position from test.json.
+        if not os.path.isfile(self.test_json_path):
+            raise gcmd.error('Missing factory test config %s' % self.test_json_path)
+        try:
+            data, _ = self._read_stock_json(self.test_json_path)
+            cylinder_x = float(data['cylinder_x'])
+            cylinder_y = float(data['cylinder_y'])
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise gcmd.error('Invalid factory cylinder position: %s' % exc)
+        if not all(math.isfinite(v) for v in (cylinder_x, cylinder_y)):
+            raise gcmd.error('Factory cylinder position must be finite')
+        first = self._probe_stock_pin(gcmd, self.plate_check_x,
+                                      self.plate_check_y)
+        second = self._probe_stock_pin(gcmd, cylinder_x, cylinder_y)
+        if abs(first - second) < self.plate_check_min_delta:
+            raise gcmd.error('Build plate may still be installed; ordinary '
+                             'calibration pin heights differ by less than '
+                             '%.2f mm' % self.plate_check_min_delta)
+        gcmd.respond_info('Stock calibration pin Z=%.4f / %.4f; plate '
+                          'removal verified' % (first, second))
+        return first
+
+    def _probe_fixture_z(self, gcmd, x, y, target=None):
         self._move(z=self.safe_z, feed=1200)
         self._move(x=x, y=y, feed=1200)
-        z = self._estop('Z', self.z_probe_target, gcmd)
+        if target is None:
+            target = self.z_probe_target
+            if self._stock_pin_approach_z is not None:
+                # Never descend farther than the configured hard floor.
+                target = max(target, self._stock_pin_approach_z)
+        z = self._estop('Z', target, gcmd)
         self._raise_z()
         return z
 
@@ -900,7 +995,9 @@ class Creator5Toolchanger:
         if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
             raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
         save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
-        self._preflight(gcmd)
+        _, _, attached = self._preflight(gcmd)
+        if attached is not None:
+            raise gcmd.error('Dock the mounted head before the stock pin check')
         stats = self.printer.lookup_object('print_stats', None)
         if stats is not None and stats.get_status(
                 self.printer.get_reactor().monotonic()).get('state') in (
@@ -911,16 +1008,23 @@ class Creator5Toolchanger:
         # authoritative set loaded at startup, and a later failure must leave
         # neither a partial runtime set nor partial pending config values.
         with self._calibration_transaction():
-            self._run('C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
-                      'BUILDPLATE_REMOVED=1')
-            for tool in range(4):
-                heater = 'extruder' if tool == 0 else 'extruder%d' % tool
-                self._run('AFC_SELECT_TOOL TOOL=%s' % heater)
-                self._run('C5_TOOL_OFFSET_CALIBRATE T=%d Z=1 SAVE=0 '
-                          'BUILDPLATE_REMOVED=1' % tool)
-                self._run('AFC_UNSELECT_TOOL')
-            if save:
-                self.cmd_save_offsets_json(gcmd)
+            # Stock firmware uses the ordinary eboard probe first. Its Z
+            # reference bounds the following levelboard contact approach.
+            pin_z = self._with_motion(gcmd, lambda: self._check_plate_removed(gcmd))
+            self._stock_pin_approach_z = pin_z - 5.
+            try:
+                self._run('C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
+                          'BUILDPLATE_REMOVED=1')
+                for tool in range(4):
+                    heater = 'extruder' if tool == 0 else 'extruder%d' % tool
+                    self._run('AFC_SELECT_TOOL TOOL=%s' % heater)
+                    self._run('C5_TOOL_OFFSET_CALIBRATE T=%d Z=1 SAVE=0 '
+                              'BUILDPLATE_REMOVED=1' % tool)
+                    self._run('AFC_UNSELECT_TOOL')
+                if save:
+                    self.cmd_save_offsets_json(gcmd)
+            finally:
+                self._stock_pin_approach_z = None
 
     def cmd_check_load_tool(self, gcmd):
         _, _, attached = self._preflight(gcmd, axes='')
@@ -1177,21 +1281,26 @@ class Creator5Toolchanger:
             self._raise_z()
             try:
                 self._run('G90')
-                # clearNozzlePrint purges at the end of the PA-stroke area,
-                # then travels to the low-Y nozzle-preparation position.
-                self._move(x=200., y=80., feed=3000, machine=False)
-                self._move(z=self.flow_test_z, feed=600, machine=False)
+                # Enter the front-right preparation area from the inboard
+                # side. The old code extruded at X200/Y80, then moved to the
+                # bucket only after retracting; no purge was visible there.
+                self._move(x=250., feed=6000, machine=False)
+                self._move(y=self.purge_y, feed=6000, machine=False)
+                self._move(x=self.purge_x, feed=3000, machine=False)
+                self._move(z=self.purge_z, feed=600, machine=False)
                 self._run('M83')
                 self._run('G1 E%.3f F%.0f' % (length,
                                               self.purge_speed * 60.))
                 self._run('M400')
                 self._run('G1 E-5 F1200')
-                self._move(x=250., feed=6000, machine=False)
-                self._move(y=self.purge_y, feed=24000, machine=False)
-                self._move(x=self.purge_x, feed=6000, machine=False)
-                self._move(z=self.purge_z, feed=600, machine=False)
+                self._run('M400')
             finally:
-                self._run('RESTORE_GCODE_STATE NAME=C5_PURGE_PREP')
+                try:
+                    self._raise_z()
+                finally:
+                    self._run('RESTORE_GCODE_STATE NAME=C5_PURGE_PREP')
+        gcmd.respond_info('T%d purging %.1f mm at X%.1f Y%.1f before cooldown'
+                          % (attached, length, self.purge_x, self.purge_y))
         self._with_motion(gcmd, purge)
 
     def cmd_flow_strokes(self, gcmd):
@@ -1209,6 +1318,8 @@ class Creator5Toolchanger:
         pa = self.printer.lookup_object('pa_adjust', None)
         if pa is None:
             raise gcmd.error('Flow calibration requires [pa_adjust] on eboard')
+        gcmd.respond_info('Starting T%d flow calibration strokes'
+                          % attached)
         old_pa = heater.get_status(eventtime).get('pressure_advance', 0.)
         candidates = (.0100, .0200, .0150, .0350, .0250, .0300, .0400)
         segments = ((60, 1.13573, 1080), (100, 2.27146, 10980),
