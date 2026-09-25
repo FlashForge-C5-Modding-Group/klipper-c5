@@ -101,6 +101,11 @@ class Creator5Toolchanger:
         self.purge_z = config.getfloat('purge_z', 1.0)
         self.purge_length = config.getfloat('purge_length', 12., minval=0.)
         self.purge_speed = config.getfloat('purge_speed', 3., above=0.)
+        # Factory clearNozzlePrint positions the nozzle about 8 mm above the
+        # bed before paTestMgr. The repeated strokes measure extrusion, not
+        # adhesion, and must not be printed into the bed.
+        self.flow_test_z = config.getfloat('flow_test_z', 8.,
+                                           minval=5., maxval=15.)
         self.door_buttons = config.getlist('door_buttons', [])
         self.dock_buttons = config.getlist('dock_buttons',
             ['extruder_pos%d' % (i + 1) for i in range(4)])
@@ -115,6 +120,8 @@ class Creator5Toolchanger:
             ('C5_TOOL_SELECT', self.cmd_select),
             ('C5_TOOL_DOCK', self.cmd_dock),
             ('C5_TOOL_PURGE', self.cmd_purge),
+            ('C5_FLOW_STROKES', self.cmd_flow_strokes),
+            ('C5_COOL_FOR_DOCK', self.cmd_cool_for_dock),
             ('C5_CHECK_LOAD_TOOL', self.cmd_check_load_tool),
             ('C5_CALIBRATE_ALL_OFFSETS', self.cmd_calibrate_all_offsets),
             ('C5_HOME_FOR_PRINT', self.cmd_home_for_print),
@@ -234,7 +241,7 @@ class Creator5Toolchanger:
             'homing_origin'][2]
         baseline = self.print_z_baseline[tool]
         if baseline is None:
-            baseline = self.measurements[tool][2] - self.measurements[0][2]
+            baseline = self.measurements[tool][2] - self.station_z
         adjustment = origin - baseline
         if not math.isfinite(adjustment) or abs(adjustment) > 5.:
             raise gcmd.error('Touchscreen Z adjustment is outside +/-5 mm')
@@ -454,6 +461,18 @@ class Creator5Toolchanger:
         self._validate_sensor_state(None, dock, attached)
         return attached
 
+    def validate_nozzle_z_offset(self, gcmd, offset):
+        # The physical grab inputs, not AFC's logical lane state, decide
+        # whether a nozzle is present.  Zero is permitted only with no tool.
+        if offset >= 0.5:
+            return
+        dock, _, attached = self._sensor_state(gcmd)
+        self._validate_sensor_state(gcmd, dock, attached)
+        if attached is not None:
+            raise gcmd.error('Refusing nozzle Z offset %.4f with T%d '
+                             'attached; use C5_AUTO_NOZZLE_Z'
+                             % (offset, attached))
+
     def _chamber_heater_active(self, gcmd):
         try:
             heater = self.printer.lookup_object('heaters').lookup_heater(
@@ -552,8 +571,14 @@ class Creator5Toolchanger:
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
-        # Nozzle offsets no longer apply once the head is being parked.
-        self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+        # Do not clear nozzle Z while a tool is physically mounted.  A
+        # previously selected tool may have been left at zero by a slicer.
+        origin_z = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        if not math.isfinite(origin_z) or origin_z < 0.5:
+            self._apply_offsets(tool)
+        # Dock motion uses physical coordinates, independent of XY offsets.
+        self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
         if raise_z:
             self._raise_z()
         self._move(x=self.approach_x, feed=clear_feed)
@@ -570,6 +595,10 @@ class Creator5Toolchanger:
     def _pickup(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
+        # Establish a calibrated, positive nozzle clearance before the latch
+        # can make the tool physically attached.  Print-specific thermal Z
+        # compensation is applied later by C5_AUTO_NOZZLE_Z.
+        self._apply_offsets(tool)
         if raise_z:
             self._raise_z()
         self._move(x=self.approach_x, feed=clear_feed)
@@ -821,8 +850,13 @@ class Creator5Toolchanger:
     def _apply_offsets(self, tool):
         self.print_z_baseline[tool] = None
         offsets = [self.measurements[tool][axis]
-                   - self.measurements[0][axis] for axis in range(3)]
-        offsets[2] += self.z_adjustments[tool]
+                   - self.measurements[0][axis] for axis in range(2)]
+        offsets.append(self.measurements[tool][2] - self.station_z
+                       + self.z_adjustments[tool])
+        if not all(math.isfinite(value) for value in offsets) or not (
+                0.5 <= offsets[2] <= 5.):
+            raise self.printer.command_error(
+                'Unsafe T%d nozzle Z offset; refusing tool motion' % tool)
         self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f Z=%.4f MOVE=0'
                   % tuple(offsets))
 
@@ -836,7 +870,7 @@ class Creator5Toolchanger:
         if attached is not None:
             raise gcmd.error('Dock the mounted head before reference scanning')
         def calibrate():
-            self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+            self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
             z = self._probe_fixture_z(gcmd, self.station_x, self.station_y)
             if abs(z - self.station_z) > self.max_offset_correction:
                 raise gcmd.error('Levelboard reference Z deviation exceeds limit')
@@ -912,7 +946,7 @@ class Creator5Toolchanger:
         if attached != tool:
             raise gcmd.error('Attach T%d before offset calibration' % tool)
         def calibrate():
-            self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+            self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
             if include_z:
                 z = self._calibrate_tool_z(gcmd, tool)
                 actual_scan_height = z + 0.6 if scan_height is None else scan_height
@@ -937,7 +971,7 @@ class Creator5Toolchanger:
             return
         def calibrate_then_park():
             with self._calibration_transaction():
-                self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+                self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
                 self._calibrate_tool_xy(gcmd, attached)
                 self._apply_offsets(attached)
                 self._dock(gcmd, attached)
@@ -1064,7 +1098,7 @@ class Creator5Toolchanger:
                           % self.position_calibration_accel)
                 self._run('SAVE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE')
                 state_saved = True
-                self._run('SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+                self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
                 xy_disabled = True
                 self._run('SET_STEPPER_ENABLE STEPPER=stepper_x ENABLE=0')
                 self._run('SET_STEPPER_ENABLE STEPPER=stepper_y ENABLE=0')
@@ -1124,8 +1158,8 @@ class Creator5Toolchanger:
     def cmd_purge(self, gcmd):
         length = gcmd.get_float('LENGTH', self.purge_length,
                                 minval=0., maxval=80.)
-        if not math.isfinite(length):
-            raise gcmd.error('LENGTH must be finite')
+        if not math.isfinite(length) or length <= 0.:
+            raise gcmd.error('LENGTH must be finite and positive')
         dock, grab, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool for purge')
@@ -1142,17 +1176,138 @@ class Creator5Toolchanger:
             self._run('SAVE_GCODE_STATE NAME=C5_PURGE_PREP')
             self._raise_z()
             try:
-                self._move(x=self.purge_x, y=self.purge_y, feed=3000,
-                           machine=False)
-                self._move(z=self.purge_z, feed=600, machine=False)
+                self._run('G90')
+                # clearNozzlePrint purges at the end of the PA-stroke area,
+                # then travels to the low-Y nozzle-preparation position.
+                self._move(x=200., y=80., feed=3000, machine=False)
+                self._move(z=self.flow_test_z, feed=600, machine=False)
                 self._run('M83')
                 self._run('G1 E%.3f F%.0f' % (length,
                                               self.purge_speed * 60.))
-                self._run('G1 E-1 F1200')
-                self._raise_z()
+                self._run('M400')
+                self._run('G1 E-5 F1200')
+                self._move(x=250., feed=6000, machine=False)
+                self._move(y=self.purge_y, feed=24000, machine=False)
+                self._move(x=self.purge_x, feed=6000, machine=False)
+                self._move(z=self.purge_z, feed=600, machine=False)
             finally:
                 self._run('RESTORE_GCODE_STATE NAME=C5_PURGE_PREP')
         self._with_motion(gcmd, purge)
+
+    def cmd_flow_strokes(self, gcmd):
+        """Run the stock alternating-speed eboard PA/flow measurement."""
+        _, _, attached = self._preflight(gcmd)
+        if attached is None:
+            raise gcmd.error('No attached tool for flow calibration')
+        self.cmd_verify_nozzle_z(gcmd)
+        extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
+        eventtime = self.printer.get_reactor().monotonic()
+        heater = self.printer.lookup_object(extruder)
+        if not heater.get_status(eventtime).get('can_extrude'):
+            raise gcmd.error('T%d is not hot enough for flow calibration'
+                             % attached)
+        pa = self.printer.lookup_object('pa_adjust', None)
+        if pa is None:
+            raise gcmd.error('Flow calibration requires [pa_adjust] on eboard')
+        old_pa = heater.get_status(eventtime).get('pressure_advance', 0.)
+        candidates = (.0100, .0200, .0150, .0350, .0250, .0300, .0400)
+        segments = ((60, 1.13573, 1080), (100, 2.27146, 10980),
+                    (120, 1.13573, 1080), (140, 1.13573, 1080),
+                    (180, 2.27146, 10980), (200, 1.13573, 1080))
+
+        def measure():
+            self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+            self._run('SAVE_GCODE_STATE NAME=C5_FLOW_TEST')
+            picks = []
+            calibrated = False
+            try:
+                self._run('G90')
+                self._run('M83')
+                self._run('G92 E0')
+                self._run('SET_VELOCITY_LIMIT ACCEL=5000')
+                self._raise_z()
+                for repeat in range(5):
+                    successful = []
+                    for index, advance in enumerate(candidates):
+                        # The factory repeats at these same XY positions for
+                        # every pass, at clearance height above the bed.
+                        self._move(x=40., y=50. + index * 5.,
+                                   feed=30000, machine=False)
+                        self._move(z=self.flow_test_z, feed=1200,
+                                   machine=False)
+                        pa.pa_action(11, 666)
+                        try:
+                            self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
+                                      'ADVANCE=%.4f' % (extruder, advance))
+                            for x, amount, feed in segments:
+                                self._run('G1 X%d E%.5f F%d' %
+                                          (x, amount, feed))
+                        finally:
+                            self._run('M400')
+                            pa.pa_action(0, 666)
+                        if pa.pa_get_value() == 9:
+                            successful.append(advance)
+                        self._raise_z()
+                    if successful:
+                        picks.append(min(successful))
+                    if len(picks) >= 3:
+                        break
+                if len(picks) >= 3:
+                    result = sum(picks[:3]) / 3.
+                    self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
+                              'ADVANCE=%.5f' % (extruder, result))
+                    calibrated = True
+                    gcmd.respond_info('T%d flow test: pressure advance %.5f'
+                                      % (attached, result))
+                else:
+                    gcmd.respond_info('T%d flow test had fewer than three '
+                                      'valid eboard readings; keeping prior '
+                                      'pressure advance' % attached)
+            finally:
+                try:
+                    pa.pa_action(0, 666)
+                    self._raise_z()
+                    if not calibrated:
+                        self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
+                                  'ADVANCE=%.5f' % (extruder, old_pa))
+                finally:
+                    self._run('RESTORE_GCODE_STATE NAME=C5_FLOW_TEST MOVE=0')
+
+        self._with_motion(gcmd, measure)
+
+    def cmd_cool_for_dock(self, gcmd):
+        hotend = gcmd.get_float('HOTEND', above=0.)
+        if not math.isfinite(hotend):
+            raise gcmd.error('HOTEND must be finite')
+        _, _, attached = self._preflight(gcmd)
+        if attached is None:
+            raise gcmd.error('No attached tool to cool before docking')
+        extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
+        target = max(0., hotend - 100.)
+        reactor = self.printer.get_reactor()
+        heater = self.printer.lookup_object(extruder)
+        # The stock clearNozzlePrint uses operation temperature minus 100 C:
+        # e.g. 220 C -> 120 C, with a 180-second temperature check.
+        self._run('M106 P1 S153')
+        try:
+            self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=%.1f'
+                      % (extruder, target))
+            deadline = reactor.monotonic() + 180.
+            while True:
+                now = reactor.monotonic()
+                actual = heater.get_status(now).get('temperature')
+                if actual is None or not math.isfinite(actual):
+                    raise gcmd.error('Cannot verify T%d temperature' % attached)
+                if actual <= target + 3.:
+                    break
+                if now >= deadline:
+                    self._run('TURN_OFF_HEATERS')
+                    raise gcmd.error('T%d did not cool to %.1f C before '
+                                     'docking' % (attached, target))
+                reactor.pause(min(deadline, now + 1.))
+            self._raise_z()
+        finally:
+            self._run('M106 P1 S0')
 
     def get_status(self, eventtime=None):
         try:

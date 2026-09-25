@@ -101,6 +101,13 @@ class VirtualSDEOFTests(unittest.TestCase):
                          'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 '
                          'FIRST_LAYER_HEIGHT=0.08')
 
+    def test_automatic_start_prefers_print_wait_over_early_preheat(self):
+        sd = self.make_sd('M104 S300\nM109 S220\nG1 X10\n')
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        self.assertEqual(sd.gcode.run_script.call_args_list[0].args[0],
+                         'C5_PRINT_START TOOL=0 HOTEND=220 BED=0')
+
     def test_existing_start_is_not_duplicated(self):
         sd = self.make_sd('C5_PRINT_START TOOL=1 HOTEND=210 BED=50\nG1 X10')
         sd.auto_creator5_start = True
@@ -108,6 +115,18 @@ class VirtualSDEOFTests(unittest.TestCase):
         self.assertEqual(sd.gcode.run_script.call_args_list[0].args[0],
                          'C5_PRINT_START TOOL=1 HOTEND=210 BED=50')
         self.assertEqual(sd.gcode.run_script.call_count, 2)
+
+    def test_slicer_z_offset_cannot_override_calibrated_nozzle(self):
+        sd = self.make_sd('M109 S220\nSET_GCODE_OFFSET Z=0 MOVE=1\n'
+                          'SET_GCODE_OFFSET Z_ADJUST=-1\nG92 Z0\n'
+                          'G92 E0\nG1 X10\n')
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(commands, [
+            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0', 'M109 S220',
+            'G92 E0', 'G1 X10'])
+        self.assertEqual(sd.file_position, sd.file_size)
 
     def test_missing_temperature_stops_before_motion(self):
         sd = self.make_sd('G1 X10\n')

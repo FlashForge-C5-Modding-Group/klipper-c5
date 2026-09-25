@@ -115,6 +115,7 @@ class Creator5OffsetTests(unittest.TestCase):
         board._run = mock.Mock()
         board._pause_ms = mock.Mock()
         board._verify = mock.Mock()
+        board.z_adjustments = [0.] * 4
 
         board._dock(GCmd(), 0, raise_z=False)
 
@@ -127,6 +128,11 @@ class Creator5OffsetTests(unittest.TestCase):
         ])
         board._pause_ms.assert_called_once_with(50)
         board._verify.assert_called_once_with(mock.ANY, None, parked=0)
+        self.assertEqual(board._run.call_args_list[0], mock.call(
+            'SET_GCODE_OFFSET X=0.0000 Y=0.0000 Z=2.0000 MOVE=0'))
+        board._run.assert_any_call('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
+        self.assertFalse(any(' Z=0 ' in call.args[0] for call in
+                             board._run.call_args_list))
 
     def test_pickup_speeds_come_from_config(self):
         board = self.board
@@ -226,7 +232,7 @@ class Creator5OffsetTests(unittest.TestCase):
         backups = list(Path(self.temp.name).glob('extruder.json.bak-*'))
         self.assertEqual(len(backups), 1)
 
-    def test_applies_relative_xyz_plus_manual_z(self):
+    def test_applies_relative_xy_and_positive_absolute_nozzle_z(self):
         self.board.measurements[0] = [16.25, 214., 1.3]
         self.board.measurements[1] = [15.95, 213.5, 1.2]
         self.board.z_adjustments = [0., 0.04, 0., 0.]
@@ -234,7 +240,17 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._run = commands.append
         self.board._apply_offsets(1)
         self.assertEqual(commands, [
-            'SET_GCODE_OFFSET X=-0.3000 Y=-0.5000 Z=-0.0600 MOVE=0'])
+            'SET_GCODE_OFFSET X=-0.3000 Y=-0.5000 Z=2.2400 MOVE=0'])
+
+    def test_attached_nozzle_rejects_zero_offset(self):
+        self.board._sensor_state = lambda command: ([False] * 4, [], 0)
+        self.board._validate_sensor_state = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError,
+                                    'Refusing nozzle Z offset 0.0000'):
+            self.board.validate_nozzle_z_offset(GCmd(), 0.)
+        self.board.validate_nozzle_z_offset(GCmd(), 2.86)
+        self.board._sensor_state = lambda command: ([True] * 4, [], None)
+        self.board.validate_nozzle_z_offset(GCmd(), 0.)
 
     def test_reloads_touchscreen_zoffset_before_selecting_tool(self):
         zpath = os.path.join(self.temp.name, 'zoffset.json')
@@ -271,7 +287,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._sensor_state = lambda command: ([True] * 4, [], 1)
         self.board._validate_sensor_state = lambda *args: None
         self.board.printer.lookup_object.return_value.get_status.return_value = {
-            'homing_origin': (0., 0., 0.15, 0.)}
+            'homing_origin': (0., 0., 2.45, 0.)}
         self.board.cmd_save_touchscreen_z_offset(GCmd())
         data, suffix = self.board._read_stock_json(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.25)
@@ -367,7 +383,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.cmd_offset_calibrate(GCmd(
             BUILDPLATE_REMOVED=1, T=1, Z=1, SAVE=0))
         self.assertEqual(calls[0],
-                         'SET_GCODE_OFFSET X=0 Y=0 Z=0 MOVE=0')
+                         'SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
         self.assertEqual(calls[1], ('z', 1))
         self.assertEqual(calls[2][0:2], ('xy', 1))
         self.assertAlmostEqual(calls[2][2], 1.83)
@@ -405,6 +421,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.purge_length = 12.
         self.board.purge_x, self.board.purge_y, self.board.purge_z = 266.5, 13.8, 1.
         self.board.purge_speed = 3.
+        self.board.flow_test_z = 8.
         self.board._preflight = lambda command: ([], [], 1)
         self.board.cmd_verify_nozzle_z = mock.Mock()
         toolhead, heater, other = mock.Mock(), mock.Mock(), mock.Mock()
@@ -420,11 +437,69 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(self.board._run.call_args_list[0],
                          mock.call('ACTIVATE_EXTRUDER EXTRUDER=extruder1'))
         self.board._run.assert_any_call('G1 E12.000 F180')
+        self.board._run.assert_any_call('G1 E-5 F1200')
+        self.board._move.assert_any_call(x=200., y=80., feed=3000,
+                                         machine=False)
+        self.board._move.assert_any_call(y=13.8, feed=24000,
+                                         machine=False)
+        moves = [call.kwargs for call in self.board._move.call_args_list]
+        x250 = next(i for i, move in enumerate(moves)
+                    if move.get('x') == 250.)
+        low_y = next(i for i, move in enumerate(moves)
+                     if move.get('y') == 13.8)
+        final_x = next(i for i, move in enumerate(moves)
+                       if move.get('x') == 266.5)
+        self.assertLess(x250, low_y)
+        self.assertLess(low_y, final_x)
         self.board._run.reset_mock()
         heater.get_status.return_value = {'can_extrude': False}
         with self.assertRaisesRegex(RuntimeError, 'not hot enough'):
             self.board.cmd_purge(GCmd())
         self.board._run.assert_not_called()
+
+    def test_flow_strokes_repeat_same_positions_and_apply_eboard_result(self):
+        self.board.flow_test_z = 8.
+        self.board._preflight = lambda command: ([], [], 0)
+        self.board.cmd_verify_nozzle_z = mock.Mock()
+        self.board._with_motion = lambda command, operation: operation()
+        self.board._raise_z = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._run = mock.Mock()
+        heater, pa = mock.Mock(), mock.Mock()
+        heater.get_status.return_value = {
+            'can_extrude': True, 'pressure_advance': .02}
+        pa.pa_get_value.return_value = 9
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+        command = GCmd()
+        self.board.cmd_flow_strokes(command)
+        self.assertEqual(pa.pa_get_value.call_count, 21)
+        self.board._move.assert_any_call(x=40., y=50., feed=30000,
+                                         machine=False)
+        self.board._move.assert_any_call(x=40., y=80., feed=30000,
+                                         machine=False)
+        self.board._run.assert_any_call('G1 X100 E2.27146 F10980')
+        self.board._run.assert_any_call(
+            'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.01000')
+        self.assertIn('pressure advance 0.01000', command.message)
+
+    def test_cool_for_dock_uses_stock_minus_100_rule(self):
+        self.board._preflight = lambda command: ([], [], 1)
+        self.board._raise_z = mock.Mock()
+        self.board._run = mock.Mock()
+        heater = mock.Mock()
+        heater.get_status.side_effect = [
+            {'temperature': 220.}, {'temperature': 121.}]
+        self.board.printer.lookup_object.side_effect = (
+            lambda name: {'extruder1': heater}[name])
+        reactor = self.board.printer.get_reactor.return_value
+        reactor.monotonic.side_effect = [0., 1., 2.]
+        self.board.cmd_cool_for_dock(GCmd(HOTEND=220.))
+        self.board._run.assert_any_call(
+            'SET_HEATER_TEMPERATURE HEATER=extruder1 TARGET=120.0')
+        self.board._run.assert_any_call('M106 P1 S153')
+        self.board._run.assert_any_call('M106 P1 S0')
+        self.board._raise_z.assert_called_once()
 
     def test_print_homing_recovers_head_then_homes_only_z(self):
         calls = []

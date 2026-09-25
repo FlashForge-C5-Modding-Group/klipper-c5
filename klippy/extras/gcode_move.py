@@ -206,6 +206,15 @@ class GCodeMove:
         self.extrude_factor = new_extrude_factor
     cmd_SET_GCODE_OFFSET_help = "Set a virtual offset to g-code positions"
     def cmd_SET_GCODE_OFFSET(self, gcmd):
+        requested_z = gcmd.get_float('Z', None)
+        if requested_z is None:
+            z_adjust = gcmd.get_float('Z_ADJUST', None)
+            if z_adjust is not None:
+                requested_z = self.homing_position[2] + z_adjust
+        if requested_z is not None:
+            creator5 = self.printer.lookup_object('creator5_toolchanger', None)
+            if creator5 is not None:
+                creator5.validate_nozzle_z_offset(gcmd, requested_z)
         move_delta = [0., 0., 0., 0.]
         for pos, axis in enumerate('XYZE'):
             offset = gcmd.get_float(axis, None)
@@ -242,6 +251,10 @@ class GCodeMove:
         state = self.saved_states.get(state_name)
         if state is None:
             raise gcmd.error("Unknown g-code state: %s" % (state_name,))
+        creator5 = self.printer.lookup_object('creator5_toolchanger', None)
+        if creator5 is not None:
+            creator5.validate_nozzle_z_offset(
+                gcmd, state['homing_position'][2])
         # Restore state
         self.absolute_coord = state['absolute_coord']
         self.allow_absolute_extrude = state['allow_absolute_extrude']

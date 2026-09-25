@@ -30,11 +30,16 @@ class PrinterPA:
         action = gcmd.get_int('ACTION', 0)
         #材料
         pc = gcmd.get_int('PC', 0)
+        self.pa_action(action, pc)
+
+    def pa_action(self, action, pc):
         self._pa_action_cmd.send([action, pc])
+
+    def pa_get_value(self):
+        return self._pa_value_get_cmd.send()["value"]
 
     def cmd_PA_GET(self, gcmd):
         # Get PA value
-        result = self._pa_value_get_cmd.send()
-        gcmd.respond_info("Result is value=%s" % (result["value"],))
+        gcmd.respond_info("Result is value=%s" % (self.pa_get_value(),))
 def load_config(config):
     return PrinterPA(config)

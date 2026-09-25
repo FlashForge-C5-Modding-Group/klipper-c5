@@ -20,6 +20,7 @@ def creator5_start_command(header):
     tool = 0
     tool_seen = False
     hotend = bed = None
+    preheat = None
     first_layer = None
     for raw in header.splitlines():
         meta = re.match(r'^\s*;\s*first_layer_height\s*=\s*([0-9.]+)',
@@ -38,14 +39,21 @@ def creator5_start_command(header):
             tool_seen = True
         match = re.match(r'^M(104|109|140|190)\b.*?\bS\s*([0-9.]+)',
                          line, re.I)
-        if match and hotend is None and match.group(1) in ('104', '109'):
+        if match and match.group(1) in ('104', '109'):
             value = float(match.group(2))
             if value > 0:
-                hotend = value
+                # M104 may be an early high preheat. M109 is the temperature
+                # the slicer actually waits for before extrusion.
+                if match.group(1) == '109' and hotend is None:
+                    hotend = value
+                elif match.group(1) == '104' and preheat is None:
+                    preheat = value
         elif match and bed is None and match.group(1) in ('140', '190'):
             value = float(match.group(2))
             if value > 0:
                 bed = value
+    if hotend is None:
+        hotend = preheat
     if hotend is None:
         raise ValueError('No hotend temperature found in G-code header; '
                          'add C5_PRINT_START TOOL=n HOTEND=n BED=n')
@@ -54,6 +62,18 @@ def creator5_start_command(header):
     if first_layer is not None:
         command += ' FIRST_LAYER_HEIGHT=%g' % first_layer
     return command
+
+def creator5_slicer_z_offset(line):
+    # The calibrated Creator 5 nozzle Z comes from the toolchanger, not from
+    # slicer start G-code.  Ignore only Z-bearing offset commands in print
+    # files; host-side calibration and touchscreen commands still work.
+    command = line.split(';', 1)[0].strip()
+    if (re.match(r'^SET_GCODE_OFFSET\s+', command, re.I)
+            and re.search(r'\bZ(?:_ADJUST)?\s*=', command, re.I)):
+        return True
+    # G92 Z also replaces the file's Z origin; G92 E remains valid.
+    return bool(re.match(r'^G92\b', command, re.I)
+                and re.search(r'\bZ\s*=?\s*[-+]?(?:\d|\.)', command, re.I))
 
 class VirtualSD:
     def __init__(self, config):
@@ -364,7 +384,11 @@ class VirtualSD:
                                   + (0 if final_line else 1))
             self.next_file_position = next_file_position
             try:
-                self.gcode.run_script(line)
+                if self.auto_creator5_start and creator5_slicer_z_offset(line):
+                    logging.warning('Ignoring slicer Z offset in Creator 5 '
+                                    'print file: %s', line.strip())
+                else:
+                    self.gcode.run_script(line)
             except self.gcode.error as e:
                 error_message = str(e)
                 try:
