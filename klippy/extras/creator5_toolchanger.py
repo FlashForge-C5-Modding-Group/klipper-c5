@@ -112,6 +112,8 @@ class Creator5Toolchanger:
             'clear_travel_speed', 80., above=0.)
         self.clearance_z_speed = config.getfloat(
             'clearance_z_speed', 20., above=0.)
+        self.lower_bed_speed = config.getfloat(
+            'lower_bed_speed', 10., above=0.)
         self.dock_approach_speed = config.getfloat(
             'dock_approach_speed', 20., above=0.)
         self.pickup_predock_speed = config.getfloat(
@@ -190,11 +192,15 @@ class Creator5Toolchanger:
         self.purge_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge',
             config.getboolean('purge_default', True))
+        self.lower_bed_on_end_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'lower_bed_on_end',
+            config.getboolean('lower_bed_on_end_default', False))
         for name, handler in (
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),
             ('C5_TOOL_DOCK', self.cmd_dock),
             ('C5_TOOL_PURGE', self.cmd_purge),
+            ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
             ('C5_MISC_FLOW_ON', self.cmd_flow_on),
             ('C5_MISC_FLOW_OFF', self.cmd_flow_off),
@@ -237,6 +243,21 @@ class Creator5Toolchanger:
     def cmd_flow_off(self, gcmd):
         self.flow_switch.enabled = False
         gcmd.respond_info('Creator 5 flow calibration disabled')
+
+    def cmd_lower_bed(self, gcmd):
+        """Move to the physical Z maximum, without G-code or nozzle offsets."""
+        toolhead = self.printer.lookup_object('toolhead')
+        status = toolhead.get_status(self.printer.get_reactor().monotonic())
+        if 'z' not in status.get('homed_axes', ''):
+            raise gcmd.error('Home Z before lowering the bed')
+        z_max = status['axis_maximum'].z
+        current_z = toolhead.get_position()[2]
+        if not math.isfinite(z_max) or not math.isfinite(current_z):
+            raise gcmd.error('Cannot determine the physical Z travel limit')
+        if current_z > z_max + .001:
+            raise gcmd.error('Current Z position exceeds the travel limit')
+        if current_z < z_max - .001:
+            self._move(z=z_max, feed=self.lower_bed_speed * 60.)
 
     def cmd_G28(self, gcmd):
         if self._g28_passthrough:

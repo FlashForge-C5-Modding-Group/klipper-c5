@@ -177,6 +177,10 @@ class afc:
         # Auto spool switch settings
         self.auto_spool_switch: bool              = config.getboolean("auto_spool_switch", False)                    # Trigger spool switch based on remaining filament weight
         self.auto_spool_switch_threshold: float   = config.getfloat("auto_spool_switch_threshold", 25.0, minval=0.)  # Weight threshold in grams
+        self.track_filament_weight = config.getboolean('track_filament_weight', True)
+        self.enable_td1_detection = config.getboolean('enable_td1_detection', True)
+        if self.auto_spool_switch and not self.track_filament_weight:
+            raise config.error('auto_spool_switch requires track_filament_weight')
 
         #LED SETTINGS
         # All variables use: (R,G,B,W) 0 = off, 1 = full brightness.
@@ -417,7 +421,8 @@ class afc:
                         break
 
                     self.toolhead.dwell(1)
-            self.td1_defined, self._td1_present, self.lane_data_enabled = self.moonraker.check_for_td1()
+            if self.enable_td1_detection:
+                self.td1_defined, self._td1_present, self.lane_data_enabled = self.moonraker.check_for_td1()
             self.afc_stats = AFCStats(self.moonraker, self.logger, len(self.tools) > 1)
             self.print_data_metadata = AFC_PrintFileMetaData(moonraker=self.moonraker,
                                                              logger=self.logger)
@@ -600,6 +605,8 @@ class afc:
 
     @property
     def td1_present(self):
+        if not self.enable_td1_detection:
+            return False
         present = self._td1_present
         current_time = self.reactor.monotonic()
         if (self.printer.state_message == 'Printer is ready'

@@ -66,6 +66,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.pickup_departure_speed = 80.
         self.board.post_select_accel = None
         self.board.flow_verdict_settle_ms = 50
+        self.board.lower_bed_speed = 10.
         self.board._g28_passthrough = False
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
@@ -98,6 +99,45 @@ class Creator5OffsetTests(unittest.TestCase):
         switch.cmd_query(command)
         self.assertEqual(command.message, 'Creator 5 purge disabled')
         self.assertEqual(gcode.register_mux_command.call_count, 2)
+
+    def test_lower_bed_on_end_misc_switch_starts_disabled(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        switch = MODULE.Creator5MiscSwitch(
+            printer, gcode, 'lower_bed_on_end', False)
+        printer.add_object.assert_called_once_with(
+            'filament_switch_sensor lower_bed_on_end', switch)
+        self.assertFalse(switch.get_status(0.)['enabled'])
+        switch.cmd_set(GCmd(ENABLE=1))
+        self.assertTrue(switch.get_status(0.)['enabled'])
+
+    def test_lower_bed_uses_machine_z_limit(self):
+        toolhead = mock.Mock()
+        toolhead.get_status.return_value = {
+            'homed_axes': 'xyz', 'axis_maximum': mock.Mock(z=270.)}
+        toolhead.get_position.return_value = [10., 20., 100., 0.]
+        self.board.printer.lookup_object.return_value = toolhead
+        self.board._move = mock.Mock()
+
+        self.board.cmd_lower_bed(GCmd())
+
+        self.board._move.assert_called_once_with(z=270., feed=600.)
+
+    def test_lower_bed_requires_homed_z_and_skips_at_max(self):
+        toolhead = mock.Mock()
+        toolhead.get_status.return_value = {
+            'homed_axes': 'xy', 'axis_maximum': mock.Mock(z=270.)}
+        toolhead.get_position.return_value = [10., 20., 100., 0.]
+        self.board.printer.lookup_object.return_value = toolhead
+        self.board._move = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, 'Home Z'):
+            self.board.cmd_lower_bed(GCmd())
+        self.board._move.assert_not_called()
+
+        toolhead.get_status.return_value['homed_axes'] = 'xyz'
+        toolhead.get_position.return_value = [10., 20., 270., 0.]
+        self.board.cmd_lower_bed(GCmd())
+        self.board._move.assert_not_called()
 
     def test_open_door_blocks_only_with_chamber_heater_active(self):
         heater = mock.Mock()

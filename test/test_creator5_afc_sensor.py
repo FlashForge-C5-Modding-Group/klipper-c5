@@ -28,6 +28,25 @@ def load_method(filename, class_name, method_name, symbols=None):
 
 
 class Creator5AfcSensorTest(unittest.TestCase):
+    def test_unused_td1_probe_is_disabled_without_moonraker_query(self):
+        get_td1_present = load_method('AFC.py', 'afc', 'td1_present')
+        afc = types.SimpleNamespace(enable_td1_detection=False,
+                                    moonraker=mock.Mock())
+        self.assertFalse(get_td1_present.fget(afc))
+        afc.moonraker.check_for_td1.assert_not_called()
+
+    def test_unused_weight_timer_is_not_started_for_standalone_tools(self):
+        enable = load_method('AFC_lane.py', 'AFCLane',
+                             'enable_weight_timer')
+        disable = load_method('AFC_lane.py', 'AFCLane',
+                              'disable_weight_timer')
+        lane = types.SimpleNamespace(cb_update_weight=None,
+                                     reactor=mock.Mock(), afc=mock.Mock())
+        enable(lane)
+        disable(lane)
+        lane.reactor.update_timer.assert_not_called()
+        lane.afc.save_vars.assert_not_called()
+
     def test_only_pin_confirmed_head_reports_idle_or_printing(self):
         state = types.SimpleNamespace(ERROR='Error', PARKED='Parked',
                                       PRINTING='Printing',

@@ -106,7 +106,9 @@ class AFCLane:
         self.logger             = self.afc.logger
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("afc:moonraker_connect", self.handle_moonraker_connect)
-        self.cb_update_weight   = self.reactor.register_timer( self.update_weight_callback )
+        self.cb_update_weight = (self.reactor.register_timer(
+            self.update_weight_callback) if self.afc.track_filament_weight
+            else None)
 
         self.unit_obj: afcUnit  = None
         self.hub_obj: Optional[afc_hub|None] = None
@@ -1414,6 +1416,8 @@ class AFCLane:
         Helper function to enable weight callback timer, should be called once a lane is loaded
         to extruder or extruder is switched for multi-toolhead setups.
         """
+        if self.cb_update_weight is None:
+            return
         self.past_extruder_position = self.afc.function.get_extruder_pos(
             None, self.past_extruder_position, self.extruder_obj.toolhead_extruder
         )
@@ -1425,6 +1429,8 @@ class AFCLane:
         to file. Should only be called when lane is unloaded from extruder or when
         swapping extruders for multi-toolhead setups.
         """
+        if self.cb_update_weight is None:
+            return
         self.update_weight_callback( None ) # get final movement before disabling timer
         self.reactor.update_timer( self.cb_update_weight, self.reactor.NEVER)
         self.past_extruder_position = -1
