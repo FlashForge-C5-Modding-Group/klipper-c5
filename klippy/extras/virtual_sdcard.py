@@ -101,12 +101,14 @@ class VirtualSD:
         self.file_position = self.file_size = 0
         self.auto_creator5_start = config.getboolean('auto_creator5_start', False)
         self.creator5_start_done = False
+        self.creator5_stop_done = False
         self.creator5_preloaded_definitions = set()
         # Print Stat Tracking
         self.print_stats = self.printer.load_object(config, 'print_stats')
         # Work timer
         self.reactor = self.printer.get_reactor()
         self.must_pause_work = self.cmd_from_sd = False
+        self.cancelled_work = False
         self.next_file_position = 0
         self.work_timer = None
         # Error handling
@@ -215,6 +217,7 @@ class VirtualSD:
     def do_cancel(self):
         if self.current_file is not None:
             self.do_pause()
+            self.cancelled_work = True
             self.current_file.close()
             self.current_file = None
             self.print_stats.note_cancel()
@@ -229,6 +232,8 @@ class VirtualSD:
             self.current_file = None
         self.file_position = self.file_size = 0
         self.creator5_start_done = False
+        self.creator5_stop_done = False
+        self.cancelled_work = False
         self.creator5_preloaded_definitions = set()
         self.print_stats.reset()
         self.printer.send_event("virtual_sdcard:reset_file")
@@ -294,6 +299,8 @@ class VirtualSD:
         self.file_position = 0
         self.file_size = fsize
         self.creator5_start_done = False
+        self.creator5_stop_done = False
+        self.cancelled_work = False
         self.creator5_preloaded_definitions = set()
         self.print_stats.set_current_file(filename)
     def cmd_M24(self, gcmd):
@@ -383,10 +390,31 @@ class VirtualSD:
                         final_line = True
                         continue
                     # End of file
+                    if (self.auto_creator5_start and self.creator5_start_done
+                            and not self.creator5_stop_done):
+                        try:
+                            self.gcode.run_script('C5_PRINT_STOP')
+                            self.creator5_stop_done = True
+                        except self.gcode.error as e:
+                            error_message = str(e)
+                            try:
+                                self.gcode.run_script(
+                                    self.on_error_gcode.render())
+                            except:
+                                logging.exception('virtual_sdcard on_error')
+                        except:
+                            logging.exception('virtual_sdcard Creator 5 print stop')
+                            error_message = 'Creator 5 print stop failed'
+                            try:
+                                self.gcode.run_script(
+                                    self.on_error_gcode.render())
+                            except:
+                                logging.exception('virtual_sdcard on_error')
                     self.current_file.close()
                     self.current_file = None
-                    logging.info("Finished SD card print")
-                    self.gcode.respond_raw("Done printing file")
+                    if error_message is None:
+                        logging.info("Finished SD card print")
+                        self.gcode.respond_raw("Done printing file")
                     break
                 lines = data.split('\n')
                 lines[0] = partial_input + lines[0]
@@ -416,6 +444,9 @@ class VirtualSD:
                                     'print file: %s', line.strip())
                 else:
                     self.gcode.run_script(line)
+                    if re.match(r'^\s*C5_PRINT_STOP(?:\s|$)',
+                                line.split(';', 1)[0], re.I):
+                        self.creator5_stop_done = True
             except self.gcode.error as e:
                 error_message = str(e)
                 try:
@@ -444,6 +475,8 @@ class VirtualSD:
         self.cmd_from_sd = False
         if error_message is not None:
             self.print_stats.note_error(error_message)
+        elif self.cancelled_work:
+            pass  # do_cancel() already reported the cancellation.
         elif self.current_file is not None:
             self.print_stats.note_pause()
         else:

@@ -58,8 +58,14 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.plate_check_min_delta = .8
         self.board._stock_pin_approach_z = None
         self.board.print_z_baseline = [None] * 4
+        self.board._button_objects = {}
+        self.board._ui_sensor_cache = None
         self.board.busy = False
         self.board.toolchange_sensor_settle_ms = 0
+        self.board.pullback_slow_distance = 20.
+        self.board.pickup_departure_speed = 80.
+        self.board.post_select_accel = None
+        self.board.flow_verdict_settle_ms = 50
         self.board._g28_passthrough = False
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
@@ -76,6 +82,21 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertFalse(switch.get_status(0.)['filament_detected'])
         switch.cmd_set(GCmd(ENABLE=1))
         self.assertTrue(switch.get_status(0.)['enabled'])
+        self.assertEqual(gcode.register_mux_command.call_count, 2)
+
+    def test_purge_misc_switch_controls_live_state(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        switch = MODULE.Creator5MiscSwitch(printer, gcode, 'purge', True)
+        printer.add_object.assert_called_once_with(
+            'filament_switch_sensor purge', switch)
+        self.assertTrue(switch.get_status(0.)['enabled'])
+        command = GCmd(ENABLE=0)
+        switch.cmd_set(command)
+        self.assertFalse(switch.get_status(0.)['enabled'])
+        self.assertFalse(switch.get_status(0.)['filament_detected'])
+        self.assertEqual(command.message, 'Creator 5 purge disabled')
+        switch.cmd_query(command)
+        self.assertEqual(command.message, 'Creator 5 purge disabled')
         self.assertEqual(gcode.register_mux_command.call_count, 2)
 
     def test_open_door_blocks_only_with_chamber_heater_active(self):
@@ -122,6 +143,28 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertIn('Conflicting dock/grab',
                       self.board.get_status()['sensor_error'])
 
+    def test_ui_status_polling_is_bounded_but_safety_reads_live_pins(self):
+        states = {'dock0': 'RELEASED', 'dock1': 'PRESSED',
+                  'dock2': 'PRESSED', 'dock3': 'PRESSED',
+                  'grab0': 'PRESSED', 'grab1': 'RELEASED',
+                  'grab2': 'RELEASED', 'grab3': 'RELEASED'}
+        self.board.dock_buttons = ['dock%d' % i for i in range(4)]
+        self.board.grab_buttons = ['grab%d' % i for i in range(4)]
+        self.board.printer.command_error = RuntimeError
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: mock.Mock(
+                get_status=lambda: {'state': states[name.split()[-1]]})
+            if name.startswith('gcode_button ') else default)
+        self.assertEqual(self.board.get_status(1.)['active_tool'], 0)
+        self.assertEqual(self.board.printer.lookup_object.call_count, 8)
+        states['grab0'] = 'RELEASED'
+        self.assertEqual(self.board.get_status(1.1)['active_tool'], 0)
+        self.assertEqual(self.board.printer.lookup_object.call_count, 8)
+        with self.assertRaisesRegex(RuntimeError, 'Missing dock'):
+            self.board.attached_tool_from_pins()
+        self.assertIsNone(self.board.get_status(2.1)['active_tool'])
+        self.assertEqual(self.board.printer.lookup_object.call_count, 8)
+
     def test_dock_speeds_and_release_wait_come_from_config(self):
         board = self.board
         board.approach_x = 250.
@@ -162,6 +205,7 @@ class Creator5OffsetTests(unittest.TestCase):
         board.pickup_latch_speed = 25.
         board.pullback_speed = 70.
         board.departure_speed = 90.
+        board.pickup_departure_speed = 90.
         board.pickup_latch_wait_ms = 1800
         board.grab_buttons = ['grab0']
         board._button = mock.Mock(return_value=True)
@@ -183,6 +227,55 @@ class Creator5OffsetTests(unittest.TestCase):
             mock.call(x=250., feed=5400.),
         ])
         board._pause_ms.assert_called_once_with(1800)
+
+    def test_pickup_uses_fast_travel_only_after_latch_clearance(self):
+        board = self.board
+        board.approach_x, board.pre_dock_x = 250., 280.
+        board.pullback, board.pullback_slow_distance = 60., 20.
+        board.clear_travel_speed = 600.
+        board.pickup_predock_speed = board.pickup_latch_speed = 60.
+        board.pullback_speed = 80.
+        board.pickup_departure_speed = 600.
+        board.pickup_latch_wait_ms = 0
+        board.grab_buttons = ['grab0']
+        board._button = mock.Mock(return_value=True)
+        board._raise_z = mock.Mock()
+        board._move = mock.Mock()
+        board._run = mock.Mock()
+        board._pause_ms = mock.Mock()
+        board._verify = mock.Mock()
+        board._apply_offsets = mock.Mock()
+        board._pickup(GCmd(), 0)
+        self.assertEqual(board._move.call_args_list[-3:], [
+            mock.call(x=278., feed=4800.),
+            mock.call(x=238., feed=36000.),
+            mock.call(x=250., feed=36000.)])
+        board._verify.assert_called_once_with(mock.ANY, 0)
+        self.assertEqual(board._run.call_args_list[-1],
+                         mock.call('ACTIVATE_EXTRUDER EXTRUDER=extruder'))
+
+    def test_select_sets_part_accel_only_after_success(self):
+        board = self.board
+        board.pickup_accel = 6000.
+        board._run = mock.Mock()
+        toolhead = mock.Mock()
+        toolhead.get_max_velocity.return_value = (600., 1000.)
+        gcode_move = mock.Mock()
+        gcode_move.get_status.return_value = {'absolute_coordinates': True}
+        board.printer.lookup_object.side_effect = lambda name: {
+            'toolhead': toolhead, 'gcode_move': gcode_move}[name]
+        board._with_motion(GCmd(), lambda: None, final_accel=30000.)
+        self.assertEqual(board._run.call_args_list[-1],
+                         mock.call('SET_VELOCITY_LIMIT ACCEL=30000.0000'))
+        board._run.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, 'pickup failed'):
+            board._with_motion(GCmd(),
+                               lambda: (_ for _ in ()).throw(
+                                   RuntimeError('pickup failed')),
+                               final_accel=30000.)
+        self.assertEqual(board._run.call_args_list[-1],
+                         mock.call('SET_VELOCITY_LIMIT ACCEL=1000.0000'))
+        self.assertFalse(board.busy)
 
     def test_xy_only_tool_motion_uses_safe_home_hop(self):
         board = self.board
@@ -437,7 +530,8 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_purge_selects_attached_hotend_for_shared_drive(self):
         self.board.purge_length = 12.
-        self.board.purge_x, self.board.purge_y, self.board.purge_z = 266.5, 13.8, 1.
+        self.board.purge_x, self.board.purge_y, self.board.purge_z = 270., 250., 8.
+        self.board.prep_approach_x = self.board.prep_approach_y = 250.
         self.board.purge_speed = 3.
         self.board.flow_test_z = 8.
         self.board._preflight = lambda command: ([], [], 1)
@@ -451,44 +545,52 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._raise_z = mock.Mock()
         self.board._move = mock.Mock()
         self.board._run = mock.Mock()
+        self.board._pause_ms = mock.Mock()
         self.board.cmd_purge(GCmd())
         self.assertEqual(self.board._run.call_args_list[0],
                          mock.call('ACTIVATE_EXTRUDER EXTRUDER=extruder1'))
         self.board._run.assert_any_call('G1 E12.000 F180')
         self.board._run.assert_any_call('G1 E-5 F1200')
-        self.board._move.assert_any_call(y=13.8, feed=6000,
+        self.board._move.assert_any_call(y=250., feed=6000,
                                          machine=False)
-        self.board._move.assert_any_call(z=1., feed=600, machine=False)
+        self.board._move.assert_any_call(z=8., feed=600, machine=False)
         moves = [call.kwargs for call in self.board._move.call_args_list]
         x250 = next(i for i, move in enumerate(moves)
                     if move.get('x') == 250.)
         low_y = next(i for i, move in enumerate(moves)
-                     if move.get('y') == 13.8)
+                     if move.get('y') == 250.)
         final_x = next(i for i, move in enumerate(moves)
-                       if move.get('x') == 266.5)
+                       if move.get('x') == 270.)
         self.assertLess(x250, low_y)
         self.assertLess(low_y, final_x)
         final_z = next(i for i, move in enumerate(moves)
-                       if move.get('z') == 1.)
+                     if move.get('z') == 8.)
         self.assertLess(final_x, final_z)
         scripts = [call.args[0] for call in self.board._run.call_args_list]
         self.assertLess(scripts.index('G1 E12.000 F180'),
                         scripts.index('G1 E-5 F1200'))
-        self.assertGreaterEqual(scripts.count('M400'), 2)
+        self.assertEqual(scripts.count('M400'), 1)
         self.board._run.reset_mock()
         heater.get_status.return_value = {'can_extrude': False}
         with self.assertRaisesRegex(RuntimeError, 'not hot enough'):
             self.board.cmd_purge(GCmd())
         self.board._run.assert_not_called()
 
-    def test_flow_strokes_repeat_same_positions_and_apply_eboard_result(self):
+    def test_flow_strokes_stay_over_bucket_and_apply_pa(self):
         self.board.flow_test_z = 8.
+        self.board.flow_sweep_x = 5.
+        self.board.flow_test_accel = 625.
+        self.board.flow_slow_speed = 4.5
+        self.board.flow_fast_speed = 22.875
+        self.board.prep_approach_x = self.board.prep_approach_y = 250.
+        self.board.purge_x, self.board.purge_y = 270., 250.
         self.board._preflight = lambda command: ([], [], 0)
         self.board.cmd_verify_nozzle_z = mock.Mock()
         self.board._with_motion = lambda command, operation: operation()
         self.board._raise_z = mock.Mock()
         self.board._move = mock.Mock()
         self.board._run = mock.Mock()
+        self.board._pause_ms = mock.Mock()
         heater, pa = mock.Mock(), mock.Mock()
         heater.get_status.return_value = {
             'can_extrude': True, 'pressure_advance': .02}
@@ -497,20 +599,63 @@ class Creator5OffsetTests(unittest.TestCase):
             lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
         command = GCmd()
         self.board.cmd_flow_strokes(command)
-        self.assertEqual(pa.pa_get_value.call_count, 21)
-        self.board._move.assert_any_call(x=40., y=50., feed=30000,
+        self.assertEqual(pa.pa_get_value.call_count, 3)
+        self.board._pause_ms.assert_has_calls([mock.call(50)] * 3)
+        self.board._move.assert_any_call(x=270., y=250., feed=3000,
                                          machine=False)
-        self.board._move.assert_any_call(x=40., y=80., feed=30000,
+        self.board._move.assert_any_call(x=267.5, feed=3000,
                                          machine=False)
-        self.board._run.assert_any_call('G1 X100 E2.27146 F10980')
+        self.board._run.assert_any_call('SET_VELOCITY_LIMIT ACCEL=625')
+        self.board._run.assert_any_call('G1 X272.500 E1.13573 F270')
+        self.board._run.assert_any_call('G1 X267.500 E2.27146 F1372')
+        self.assertFalse(any('X' in call.args[0]
+                             and not ('X267.500' in call.args[0]
+                                      or 'X272.500' in call.args[0])
+                             for call in self.board._run.call_args_list
+                             if call.args[0].startswith('G1 ')))
         self.board._run.assert_any_call(
             'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.01000')
         self.assertIn('pressure advance 0.01000', command.message)
 
+    def test_flow_strokes_restore_pa_on_failed_measurement(self):
+        self.board.flow_test_z = 8.
+        self.board.flow_sweep_x = 5.
+        self.board.flow_test_accel = 625.
+        self.board.flow_slow_speed = 4.5
+        self.board.flow_fast_speed = 22.875
+        self.board.prep_approach_x = self.board.prep_approach_y = 250.
+        self.board.purge_x, self.board.purge_y = 270., 250.
+        self.board._preflight = lambda command: ([], [], 0)
+        self.board.cmd_verify_nozzle_z = mock.Mock()
+        self.board._with_motion = lambda command, operation: operation()
+        self.board._raise_z = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._run = mock.Mock()
+        self.board._pause_ms = mock.Mock()
+        heater, pa = mock.Mock(), mock.Mock()
+        heater.get_status.return_value = {
+            'can_extrude': True, 'pressure_advance': .02}
+        pa.pa_get_value.return_value = 0
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+        command = GCmd()
+        self.board.cmd_flow_strokes(command)
+        self.assertEqual(pa.pa_get_value.call_count, 35)
+        self.board._run.assert_any_call(
+            'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.02000')
+        self.assertIn('pressure advance unchanged', command.message)
+
     def test_cool_for_dock_uses_stock_minus_100_rule(self):
         self.board._preflight = lambda command: ([], [], 1)
+        self.board.cmd_verify_nozzle_z = mock.Mock()
         self.board._raise_z = mock.Mock()
+        self.board._move = mock.Mock()
         self.board._run = mock.Mock()
+        self.board.prep_approach_x = self.board.prep_approach_y = 250.
+        self.board.cooldown_x, self.board.cooldown_y = 266.5, 13.8
+        self.board.cooldown_wipe_z = 2.
+        self.board.cooldown_lift_z = 10.
+        self.board.cooldown_fan_speed = .6
         heater = mock.Mock()
         heater.get_status.side_effect = [
             {'temperature': 220.}, {'temperature': 121.}]
@@ -521,9 +666,41 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.cmd_cool_for_dock(GCmd(HOTEND=220.))
         self.board._run.assert_any_call(
             'SET_HEATER_TEMPERATURE HEATER=extruder1 TARGET=120.0')
-        self.board._run.assert_any_call('M106 P1 S153')
-        self.board._run.assert_any_call('M106 P1 S0')
+        self.board._run.assert_any_call(
+            'SET_FAN_SPEED FAN=fanM106 SPEED=0.600')
+        self.board._run.assert_any_call('SET_FAN_SPEED FAN=fanM106 SPEED=0')
+        self.board.cmd_verify_nozzle_z.assert_called_once()
         self.board._raise_z.assert_called_once()
+        self.assertEqual(self.board._move.call_args_list, [
+            mock.call(x=250., y=250., feed=6000, machine=False),
+            mock.call(y=13.8, feed=6000, machine=False),
+            mock.call(x=266.5, feed=3000, machine=False),
+            mock.call(z=2., feed=600, machine=False),
+            mock.call(z=10., feed=600, machine=False)])
+
+    def test_cool_for_dock_lifts_from_wiper_on_timeout(self):
+        self.board._preflight = lambda command: ([], [], 1)
+        self.board.cmd_verify_nozzle_z = mock.Mock()
+        self.board._raise_z = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._run = mock.Mock()
+        self.board.prep_approach_x = self.board.prep_approach_y = 250.
+        self.board.cooldown_x, self.board.cooldown_y = 266.5, 13.8
+        self.board.cooldown_wipe_z = 2.
+        self.board.cooldown_lift_z = 10.
+        self.board.cooldown_fan_speed = .6
+        heater = mock.Mock()
+        heater.get_status.return_value = {'temperature': 220.}
+        self.board.printer.lookup_object.side_effect = (
+            lambda name: {'extruder1': heater}[name])
+        reactor = self.board.printer.get_reactor.return_value
+        reactor.monotonic.side_effect = [0., 181.]
+        with self.assertRaisesRegex(RuntimeError, 'did not cool'):
+            self.board.cmd_cool_for_dock(GCmd(HOTEND=220.))
+        self.board._move.assert_any_call(z=10., feed=600, machine=False)
+        self.board._run.assert_any_call('SET_FAN_SPEED FAN=fanM106 SPEED=0')
+        self.board._run.assert_any_call(
+            'RESTORE_GCODE_STATE NAME=C5_COOLDOWN_TRAVEL MOVE=0')
 
     def test_print_homing_recovers_head_then_homes_only_z(self):
         calls = []

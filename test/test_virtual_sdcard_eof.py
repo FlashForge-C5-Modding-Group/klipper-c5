@@ -21,6 +21,8 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.file_size = len(text.encode())
         sd.auto_creator5_start = False
         sd.creator5_start_done = False
+        sd.creator5_stop_done = False
+        sd.cancelled_work = False
         sd.creator5_preloaded_definitions = set()
         sd.must_pause_work = sd.cmd_from_sd = False
         sd.work_timer = object()
@@ -91,7 +93,7 @@ class VirtualSDEOFTests(unittest.TestCase):
         commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
         self.assertEqual(commands[0],
                          'C5_PRINT_START TOOL=2 HOTEND=220 BED=60')
-        self.assertEqual(commands[-1], 'G1 X10')
+        self.assertEqual(commands[-2:], ['G1 X10', 'C5_PRINT_STOP'])
         self.assertEqual(sd.file_position, sd.file_size)
 
     def test_automatic_start_passes_first_layer_height(self):
@@ -115,7 +117,60 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.work_handler(0.)
         self.assertEqual(sd.gcode.run_script.call_args_list[0].args[0],
                          'C5_PRINT_START TOOL=1 HOTEND=210 BED=50')
-        self.assertEqual(sd.gcode.run_script.call_count, 2)
+        self.assertEqual(sd.gcode.run_script.call_args_list[-1].args[0],
+                         'C5_PRINT_STOP')
+        self.assertEqual(sd.gcode.run_script.call_count, 3)
+
+    def test_existing_end_is_not_run_twice(self):
+        sd = self.make_sd('M109 S220\nG1 X10\nC5_PRINT_STOP')
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(commands.count('C5_PRINT_STOP'), 1)
+        sd.print_stats.note_complete.assert_called_once()
+
+    def test_automatic_end_failure_marks_print_error(self):
+        sd = self.make_sd('M109 S220\nG1 X10')
+        sd.auto_creator5_start = True
+        def dispatch(line):
+            if line == 'C5_PRINT_STOP':
+                raise RuntimeError('dock failed')
+        sd.gcode.run_script.side_effect = dispatch
+        sd.work_handler(0.)
+        sd.print_stats.note_error.assert_called_once_with('dock failed')
+        sd.print_stats.note_complete.assert_not_called()
+        sd.gcode.run_script.assert_called_with('TURN_OFF_HEATERS')
+        sd.gcode.respond_raw.assert_not_called()
+
+    def test_paused_job_runs_end_only_after_resuming_to_eof(self):
+        sd = self.make_sd('M109 S220\nG1 X10\nPAUSE')
+        sd.auto_creator5_start = True
+        def dispatch(line):
+            if line == 'PAUSE':
+                sd.do_pause()
+        sd.gcode.run_script.side_effect = dispatch
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertNotIn('C5_PRINT_STOP', commands)
+        sd.print_stats.note_pause.assert_called_once()
+        sd.do_resume()
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(commands.count('C5_PRINT_STOP'), 1)
+        sd.print_stats.note_complete.assert_called_once()
+
+    def test_cancel_does_not_run_normal_end(self):
+        sd = self.make_sd('M109 S220\nG1 X10\nG1 X20')
+        sd.auto_creator5_start = True
+        def dispatch(line):
+            if line == 'G1 X10':
+                sd.do_cancel()
+        sd.gcode.run_script.side_effect = dispatch
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertNotIn('C5_PRINT_STOP', commands)
+        sd.print_stats.note_cancel.assert_called_once()
+        sd.print_stats.note_complete.assert_not_called()
 
     def test_slicer_z_offset_cannot_override_calibrated_nozzle(self):
         sd = self.make_sd('M109 S220\nSET_GCODE_OFFSET Z=0 MOVE=1\n'
@@ -126,7 +181,7 @@ class VirtualSDEOFTests(unittest.TestCase):
         commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
         self.assertEqual(commands, [
             'C5_PRINT_START TOOL=0 HOTEND=220 BED=0', 'M109 S220',
-            'G92 E0', 'G1 X10'])
+            'G92 E0', 'G1 X10', 'C5_PRINT_STOP'])
         self.assertEqual(sd.file_position, sd.file_size)
 
     def test_object_polygons_are_available_before_adaptive_start_once(self):
@@ -140,7 +195,8 @@ class VirtualSDEOFTests(unittest.TestCase):
             'EXCLUDE_OBJECT_DEFINE RESET=1', define,
             'C5_PRINT_START TOOL=0 HOTEND=220 BED=0'])
         self.assertEqual(commands.count(define), 1)
-        self.assertEqual(commands[-2:], ['M109 S220', 'G1 X10'])
+        self.assertEqual(commands[-3:], ['M109 S220', 'G1 X10',
+                                         'C5_PRINT_STOP'])
         self.assertEqual(sd.file_position, sd.file_size)
 
     def test_partial_object_definition_is_not_preloaded(self):

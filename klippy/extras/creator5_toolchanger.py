@@ -26,30 +26,36 @@ HOLDER_REFERENCE_Y_BASE = 80.
 HOLDER_REFERENCE_Y_PITCH = 50.
 
 
-class Creator5FlowSwitch:
+class Creator5MiscSwitch:
     """Mainsail Misc switch, analogous to AFC's virtual quiet_mode sensor.
 
     This is a setting, never a real filament sensor or a runout source.
     """
-    def __init__(self, printer, gcode, enabled):
+    def __init__(self, printer, gcode, name, enabled):
+        self.name = name
         self.enabled = bool(enabled)
-        printer.add_object('filament_switch_sensor flow_calibration', self)
+        printer.add_object('filament_switch_sensor ' + name, self)
         gcode.register_mux_command('SET_FILAMENT_SENSOR', 'SENSOR',
-                                   'flow_calibration', self.cmd_set)
+                                   name, self.cmd_set)
         gcode.register_mux_command('QUERY_FILAMENT_SENSOR', 'SENSOR',
-                                   'flow_calibration', self.cmd_query)
+                                   name, self.cmd_query)
 
     def get_status(self, eventtime):
         return {'enabled': self.enabled, 'filament_detected': self.enabled}
 
     def cmd_set(self, gcmd):
         self.enabled = bool(gcmd.get_int('ENABLE', 1, minval=0, maxval=1))
-        gcmd.respond_info('Creator 5 flow calibration %s'
-                          % ('enabled' if self.enabled else 'disabled'))
+        gcmd.respond_info('Creator 5 %s %s' % (
+            self.name, 'enabled' if self.enabled else 'disabled'))
 
     def cmd_query(self, gcmd):
-        gcmd.respond_info('Creator 5 flow calibration %s'
-                          % ('enabled' if self.enabled else 'disabled'))
+        gcmd.respond_info('Creator 5 %s %s' % (
+            self.name, 'enabled' if self.enabled else 'disabled'))
+
+
+class Creator5FlowSwitch(Creator5MiscSwitch):
+    def __init__(self, printer, gcode, enabled):
+        super().__init__(printer, gcode, 'flow_calibration', enabled)
 
 
 class Creator5Toolchanger:
@@ -78,6 +84,10 @@ class Creator5Toolchanger:
         self.z_adjustments = [0.] * 4
         self._load_zoffset_json()
         self.print_z_baseline = [None] * 4
+        self._button_objects = {}
+        # UI status may be polled many times per second on a small MIPS host.
+        # Motion interlocks always bypass this one-second status cache.
+        self._ui_sensor_cache = None
         self.tool_fixture_shift_x = config.getfloat('tool_fixture_shift_x',
                                                     -12.5)
         self.scan_span = config.getfloat('scan_span', 7., above=0.)
@@ -110,8 +120,14 @@ class Creator5Toolchanger:
             'pickup_latch_speed', 20., above=0.)
         self.pullback_speed = config.getfloat(
             'pullback_speed', 80., above=0.)
+        self.pullback_slow_distance = config.getfloat(
+            'pullback_slow_distance', 20., above=0.)
         self.departure_speed = config.getfloat(
             'departure_speed', 80., above=0.)
+        self.pickup_departure_speed = config.getfloat(
+            'pickup_departure_speed', self.departure_speed, above=0.)
+        self.post_select_accel = config.getfloat(
+            'post_select_accel', None, above=0.)
         self.approach_x = config.getfloat('approach_x', 250.)
         self.pre_dock_x = config.getfloat('pre_dock_x', 280.)
         self.pullback = config.getfloat('pullback', 20., above=0.)
@@ -129,16 +145,36 @@ class Creator5Toolchanger:
             'position_calibration_release_wait_ms', 5000, minval=0)
         self.position_calibration_accel = config.getfloat(
             'position_calibration_accel', 1000., above=0.)
-        self.purge_x = config.getfloat('purge_x', 266.5)
-        self.purge_y = config.getfloat('purge_y', 13.8)
-        self.purge_z = config.getfloat('purge_z', 1.0)
+        self.prep_approach_x = config.getfloat('prep_approach_x', 250.)
+        self.prep_approach_y = config.getfloat('prep_approach_y', 250.)
+        self.purge_x = config.getfloat('purge_x', 270.)
+        self.purge_y = config.getfloat('purge_y', 250.)
+        self.cooldown_x = config.getfloat('cooldown_x', 266.5)
+        self.cooldown_y = config.getfloat('cooldown_y', 13.8)
+        self.cooldown_wipe_z = config.getfloat('cooldown_wipe_z', 2.,
+                                               minval=1., maxval=5.)
+        self.cooldown_lift_z = config.getfloat('cooldown_lift_z', 10.,
+                                               above=self.cooldown_wipe_z)
+        self.cooldown_fan_speed = config.getfloat('cooldown_fan_speed', .6,
+                                                  minval=0., maxval=1.)
+        self.purge_z = config.getfloat('purge_z', 8.0, minval=5.)
         self.purge_length = config.getfloat('purge_length', 12., minval=0.)
         self.purge_speed = config.getfloat('purge_speed', 3., above=0.)
-        # Factory clearNozzlePrint positions the nozzle about 8 mm above the
-        # bed before paTestMgr. The repeated strokes measure extrusion, not
-        # adhesion, and must not be printed into the bed.
+        # Keep the nozzle high over the bucket during the flow test.
         self.flow_test_z = config.getfloat('flow_test_z', 8.,
                                            minval=5., maxval=15.)
+        # A shorter stroke needs a slower velocity/acceleration profile so
+        # the pressure transient lasts longer than PA smoothing.
+        self.flow_sweep_x = config.getfloat('flow_sweep_x', 5.,
+                                            minval=4., maxval=12.)
+        self.flow_test_accel = config.getfloat('flow_test_accel', 625.,
+                                               above=0., maxval=5000.)
+        self.flow_slow_speed = config.getfloat('flow_slow_speed', 4.5,
+                                               above=0.)
+        self.flow_fast_speed = config.getfloat('flow_fast_speed', 22.875,
+                                               above=self.flow_slow_speed)
+        self.flow_verdict_settle_ms = config.getint(
+            'flow_verdict_settle_ms', 50, minval=0, maxval=500)
         self.door_buttons = config.getlist('door_buttons', [])
         self.dock_buttons = config.getlist('dock_buttons',
             ['extruder_pos%d' % (i + 1) for i in range(4)])
@@ -151,6 +187,9 @@ class Creator5Toolchanger:
         self.flow_switch = Creator5FlowSwitch(
             self.printer, self.gcode,
             config.getboolean('flow_calibration_default', True))
+        self.purge_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'purge',
+            config.getboolean('purge_default', True))
         for name, handler in (
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),
@@ -464,7 +503,11 @@ class Creator5Toolchanger:
                               tool, x, y, self.extruder_json_path, backup))
 
     def _button(self, name, gcmd):
-        obj = self.printer.lookup_object('gcode_button ' + name, None)
+        obj = self._button_objects.get(name)
+        if obj is None:
+            obj = self.printer.lookup_object('gcode_button ' + name, None)
+            if obj is not None:
+                self._button_objects[name] = obj
         if obj is None:
             raise self._sensor_error(gcmd, 'Missing gcode_button %s' % name)
         return obj.get_status().get('state') == 'PRESSED'
@@ -475,6 +518,8 @@ class Creator5Toolchanger:
         return self.printer.command_error(message)
 
     def _sensor_state(self, gcmd=None):
+        # A safety read must also make the next UI poll reflect fresh pins.
+        self._ui_sensor_cache = None
         dock = [self._button(name, gcmd) for name in self.dock_buttons]
         grab = [self._button(name, gcmd) for name in self.grab_buttons]
         if any(dock[i] and grab[i] for i in range(4)):
@@ -591,6 +636,14 @@ class Creator5Toolchanger:
             self._move(z=self.safe_z,
                        feed=self.clearance_z_speed * 60.)
 
+    def _move_to_prep_bucket(self):
+        # Travel inboard before entering the rear-right preparation area.
+        self._raise_z()
+        self._move(x=self.prep_approach_x, feed=6000, machine=False)
+        self._move(y=self.prep_approach_y, feed=6000, machine=False)
+        self._move(x=self.purge_x, y=self.purge_y,
+                   feed=3000, machine=False)
+
     def _verify(self, gcmd, expected, parked=None):
         try:
             self._run('M400')
@@ -656,33 +709,44 @@ class Creator5Toolchanger:
         if not self._button(self.grab_buttons[tool], gcmd):
             raise gcmd.error('T%d grab sensor did not engage at mount' % tool)
         self._run('MOTOR_GRAB')
-        self._move(x=x - self.pullback,
+        slow_distance = min(self.pullback, self.pullback_slow_distance)
+        self._move(x=x - slow_distance,
                    feed=self.pullback_speed * 60.)
+        if self.pullback > slow_distance:
+            self._move(x=x - self.pullback, feed=clear_feed)
         self._run('MOTOR_GRAB2')
         self._pause_ms(self.pickup_latch_wait_ms)
         self._move(x=self.approach_x,
-                   feed=self.departure_speed * 60.)
+                   feed=self.pickup_departure_speed * 60.)
         self._verify(gcmd, tool)
         self._apply_offsets(tool)
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
 
-    def _with_motion(self, gcmd, operation):
+    def _with_motion(self, gcmd, operation, final_accel=None):
         old_accel = self.printer.lookup_object('toolhead').get_max_velocity()[1]
         gcode_move = self.printer.lookup_object('gcode_move')
         was_absolute = gcode_move.get_status().get('absolute_coordinates')
+        self._ui_sensor_cache = None
         self.busy = True
+        completed = False
         try:
             self._run('G90')
             self._run('SET_VELOCITY_LIMIT ACCEL=%.0f' % self.pickup_accel)
-            return operation()
+            result = operation()
+            completed = True
+            return result
         finally:
             try:
-                self._run('SET_VELOCITY_LIMIT ACCEL=%.4f' % old_accel)
+                restore_accel = (final_accel if completed and
+                                 final_accel is not None else old_accel)
+                self._run('SET_VELOCITY_LIMIT ACCEL=%.4f'
+                          % restore_accel)
                 if not was_absolute:
                     self._run('G91')
             finally:
                 self.busy = False
+                self._ui_sensor_cache = None
 
     @contextmanager
     def _calibration_transaction(self):
@@ -779,6 +843,9 @@ class Creator5Toolchanger:
             self._apply_offsets(tool)
             extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
             self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+            if self.post_select_accel is not None:
+                self._run('SET_VELOCITY_LIMIT ACCEL=%.0f'
+                          % self.post_select_accel)
             self.active = tool
             gcmd.respond_info('T%d is already attached' % tool)
             return
@@ -789,7 +856,8 @@ class Creator5Toolchanger:
             if attached is not None:
                 self._dock(gcmd, attached, raise_z=z_homed)
             self._pickup(gcmd, tool, raise_z=z_homed)
-        self._with_motion(gcmd, change)
+        self._with_motion(gcmd, change,
+                          final_accel=self.post_select_accel)
 
     def cmd_dock(self, gcmd):
         dock, grab, attached = self._preflight(gcmd, axes='')
@@ -1281,17 +1349,11 @@ class Creator5Toolchanger:
             self._raise_z()
             try:
                 self._run('G90')
-                # Enter the front-right preparation area from the inboard
-                # side. The old code extruded at X200/Y80, then moved to the
-                # bucket only after retracting; no purge was visible there.
-                self._move(x=250., feed=6000, machine=False)
-                self._move(y=self.purge_y, feed=6000, machine=False)
-                self._move(x=self.purge_x, feed=3000, machine=False)
+                self._move_to_prep_bucket()
                 self._move(z=self.purge_z, feed=600, machine=False)
                 self._run('M83')
                 self._run('G1 E%.3f F%.0f' % (length,
                                               self.purge_speed * 60.))
-                self._run('M400')
                 self._run('G1 E-5 F1200')
                 self._run('M400')
             finally:
@@ -1312,7 +1374,8 @@ class Creator5Toolchanger:
         extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
         eventtime = self.printer.get_reactor().monotonic()
         heater = self.printer.lookup_object(extruder)
-        if not heater.get_status(eventtime).get('can_extrude'):
+        heater_status = heater.get_status(eventtime)
+        if not heater_status.get('can_extrude'):
             raise gcmd.error('T%d is not hot enough for flow calibration'
                              % attached)
         pa = self.printer.lookup_object('pa_adjust', None)
@@ -1320,11 +1383,21 @@ class Creator5Toolchanger:
             raise gcmd.error('Flow calibration requires [pa_adjust] on eboard')
         gcmd.respond_info('Starting T%d flow calibration strokes'
                           % attached)
-        old_pa = heater.get_status(eventtime).get('pressure_advance', 0.)
+        old_pa = heater_status.get('pressure_advance', 0.)
         candidates = (.0100, .0200, .0150, .0350, .0250, .0300, .0400)
-        segments = ((60, 1.13573, 1080), (100, 2.27146, 10980),
-                    (120, 1.13573, 1080), (140, 1.13573, 1080),
-                    (180, 2.27146, 10980), (200, 1.13573, 1080))
+        minimum_candidate = min(candidates)
+        # The eboard classifies the *motor-current waveform*, not a bead on
+        # the plate.  Keep the touchscreen's 1.13573/2.27146 mm extrusion
+        # pulses and their approximate durations.  Only X travel is folded
+        # into the bucket: scaling E down with X makes the waveform too short
+        # and weak for the stock classifier to ever return 9.
+        slow_feed = self.flow_slow_speed * 60.
+        fast_feed = self.flow_fast_speed * 60.
+        segments = ((slow_feed, 1.13573), (fast_feed, 2.27146),
+                    (slow_feed, 1.13573), (slow_feed, 1.13573),
+                    (fast_feed, 2.27146), (slow_feed, 1.13573))
+        left = self.purge_x - self.flow_sweep_x / 2.
+        right = self.purge_x + self.flow_sweep_x / 2.
 
         def measure():
             self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
@@ -1335,30 +1408,35 @@ class Creator5Toolchanger:
                 self._run('G90')
                 self._run('M83')
                 self._run('G92 E0')
-                self._run('SET_VELOCITY_LIMIT ACCEL=5000')
-                self._raise_z()
+                self._run('SET_VELOCITY_LIMIT ACCEL=%.0f'
+                          % self.flow_test_accel)
+                self._move_to_prep_bucket()
+                self._move(z=self.flow_test_z, feed=1200, machine=False)
+                self._move(x=left, feed=3000, machine=False)
                 for repeat in range(5):
                     successful = []
-                    for index, advance in enumerate(candidates):
-                        # The factory repeats at these same XY positions for
-                        # every pass, at clearance height above the bed.
-                        self._move(x=40., y=50. + index * 5.,
-                                   feed=30000, machine=False)
-                        self._move(z=self.flow_test_z, feed=1200,
-                                   machine=False)
+                    for advance in candidates:
+                        self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
+                                  'ADVANCE=%.4f' % (extruder, advance))
                         pa.pa_action(11, 666)
                         try:
-                            self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
-                                      'ADVANCE=%.4f' % (extruder, advance))
-                            for x, amount, feed in segments:
-                                self._run('G1 X%d E%.5f F%d' %
+                            for index, (feed, amount) in enumerate(segments):
+                                x = right if index % 2 == 0 else left
+                                self._run('G1 X%.3f E%.5f F%.0f' %
                                           (x, amount, feed))
                         finally:
                             self._run('M400')
                             pa.pa_action(0, 666)
+                            # The eboard computes the verdict in a task
+                            # after PA_ACTION=0; do not query in that same
+                            # command turnaround.
+                            self._pause_ms(self.flow_verdict_settle_ms)
                         if pa.pa_get_value() == 9:
                             successful.append(advance)
-                        self._raise_z()
+                            # The remaining candidates cannot improve this
+                            # pass once the lowest PA has been accepted.
+                            if advance == minimum_candidate:
+                                break
                     if successful:
                         picks.append(min(successful))
                     if len(picks) >= 3:
@@ -1368,12 +1446,12 @@ class Creator5Toolchanger:
                     self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
                               'ADVANCE=%.5f' % (extruder, result))
                     calibrated = True
-                    gcmd.respond_info('T%d flow test: pressure advance %.5f'
-                                      % (attached, result))
+                    gcmd.respond_info('T%d bucket flow test: pressure advance '
+                                      '%.5f' % (attached, result))
                 else:
-                    gcmd.respond_info('T%d flow test had fewer than three '
-                                      'valid eboard readings; keeping prior '
-                                      'pressure advance' % attached)
+                    gcmd.respond_info('T%d bucket flow test: fewer than three '
+                                      'valid eboard readings; pressure '
+                                      'advance unchanged' % attached)
             finally:
                 try:
                     pa.pa_action(0, 666)
@@ -1393,14 +1471,30 @@ class Creator5Toolchanger:
         _, _, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool to cool before docking')
+        self.cmd_verify_nozzle_z(gcmd)
         extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
         target = max(0., hotend - 100.)
         reactor = self.printer.get_reactor()
         heater = self.printer.lookup_object(extruder)
-        # The stock clearNozzlePrint uses operation temperature minus 100 C:
-        # e.g. 220 C -> 120 C, with a 180-second temperature check.
-        self._run('M106 P1 S153')
+        # Leave the bucket through the inboard waypoint before moving to the
+        # front cooldown position; do not sweep across parked toolheads.
+        self._run('SAVE_GCODE_STATE NAME=C5_COOLDOWN_TRAVEL')
+        at_wiper = False
         try:
+            self._run('G90')
+            self._raise_z()
+            self._move(x=self.prep_approach_x,
+                       y=self.prep_approach_y, feed=6000, machine=False)
+            self._move(y=self.cooldown_y, feed=6000, machine=False)
+            self._move(x=self.cooldown_x, feed=3000, machine=False)
+            # Lower only at the wiper, never while crossing the bed or docks.
+            at_wiper = True
+            self._move(z=self.cooldown_wipe_z, feed=600, machine=False)
+            # fanM106 is the eboard-connected toolhead part-cooling fan.
+            self._run('SET_FAN_SPEED FAN=fanM106 SPEED=%.3f'
+                      % self.cooldown_fan_speed)
+            # Stock clearNozzlePrint cools to operation temperature minus
+            # 100 C (220 C -> 120 C), with a 180-second timeout.
             self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=%.1f'
                       % (extruder, target))
             deadline = reactor.monotonic() + 180.
@@ -1416,17 +1510,32 @@ class Creator5Toolchanger:
                     raise gcmd.error('T%d did not cool to %.1f C before '
                                      'docking' % (attached, target))
                 reactor.pause(min(deadline, now + 1.))
-            self._raise_z()
         finally:
-            self._run('M106 P1 S0')
+            try:
+                if at_wiper:
+                    self._move(z=self.cooldown_lift_z, feed=600,
+                               machine=False)
+            finally:
+                try:
+                    self._run('SET_FAN_SPEED FAN=fanM106 SPEED=0')
+                finally:
+                    self._run('RESTORE_GCODE_STATE NAME=C5_COOLDOWN_TRAVEL '
+                              'MOVE=0')
 
     def get_status(self, eventtime=None):
-        try:
-            active_tool = self.attached_tool_from_pins()
-            sensor_error = None
-        except Exception as exc:
-            active_tool = None
-            sensor_error = str(exc)
+        cached = self._ui_sensor_cache
+        if (eventtime is not None and cached is not None
+                and 0. <= eventtime - cached[0] < 1.):
+            active_tool, sensor_error = cached[1:]
+        else:
+            try:
+                active_tool = self.attached_tool_from_pins()
+                sensor_error = None
+            except Exception as exc:
+                active_tool = None
+                sensor_error = str(exc)
+            if eventtime is not None:
+                self._ui_sensor_cache = (eventtime, active_tool, sensor_error)
         return {'active_tool': active_tool, 'sensor_error': sensor_error,
                 'busy': self.busy,
                 'dock_positions': [list(p) for p in self.docks],
