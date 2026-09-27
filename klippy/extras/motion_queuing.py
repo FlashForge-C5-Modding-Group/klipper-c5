@@ -8,8 +8,10 @@ import chelper
 
 BGFLUSH_LOW_TIME = 0.200
 BGFLUSH_HIGH_TIME = 0.400
-BGFLUSH_SG_LOW_TIME = 0.450
-BGFLUSH_SG_HIGH_TIME = 0.700
+# The Creator 5 host can briefly stall while parsing dense print files. Keep
+# the same 0.250s generation batch but schedule it farther ahead of the MCUs.
+BGFLUSH_SG_LOW_TIME = 0.850
+BGFLUSH_SG_HIGH_TIME = 1.100
 BGFLUSH_EXTRA_TIME = 0.250
 
 MOVE_HISTORY_EXPIRE = 30.

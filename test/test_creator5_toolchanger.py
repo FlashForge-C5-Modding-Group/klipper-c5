@@ -16,6 +16,7 @@ SPEC.loader.exec_module(MODULE)
 class GCmd:
     def __init__(self, **params):
         self.params = params
+        self.messages = []
 
     def get_int(self, name, default=None, **kwargs):
         return self.params.get(name, default)
@@ -31,6 +32,7 @@ class GCmd:
 
     def respond_info(self, message):
         self.message = message
+        self.messages.append(message)
 
 
 class Creator5OffsetTests(unittest.TestCase):
@@ -725,7 +727,7 @@ class Creator5OffsetTests(unittest.TestCase):
     def test_purge_flow_envelope_stops_at_x279(self):
         board = self.board
         board.purge_x, board.purge_y = 276.5, 260.
-        board.flow_sweep_x = 5.
+        board.flow_sweep_x = 4.5
         board.purge_max_x = 279.
         board._validate_purge_envelope(RuntimeError)
         board.purge_x = 277.
@@ -734,7 +736,7 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_flow_strokes_stay_over_bucket_and_apply_pa(self):
         self.board.flow_test_z = 8.
-        self.board.flow_sweep_x = 5.
+        self.board.flow_sweep_x = 4.5
         self.board.flow_test_accel = 625.
         self.board.flow_slow_speed = 4.5
         self.board.flow_fast_speed = 22.875
@@ -759,23 +761,25 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._pause_ms.assert_has_calls([mock.call(50)] * 3)
         self.board._move.assert_any_call(x=276.5, y=260., feed=3000,
                                          machine=False)
-        self.board._move.assert_any_call(x=274., feed=3000,
+        self.board._move.assert_any_call(x=274.25, feed=3000,
                                          machine=False)
         self.board._run.assert_any_call('SET_VELOCITY_LIMIT ACCEL=625')
-        self.board._run.assert_any_call('G1 X279.000 E1.13573 F270')
-        self.board._run.assert_any_call('G1 X274.000 E2.27146 F1372')
+        self.board._run.assert_any_call('G1 X278.750 E1.13573 F270')
+        self.board._run.assert_any_call('G1 X274.250 E2.27146 F1372')
         self.assertFalse(any('X' in call.args[0]
-                             and not ('X274.000' in call.args[0]
-                                      or 'X279.000' in call.args[0])
+                             and not ('X274.250' in call.args[0]
+                                      or 'X278.750' in call.args[0])
                              for call in self.board._run.call_args_list
                              if call.args[0].startswith('G1 ')))
         self.board._run.assert_any_call(
             'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.01000')
         self.assertIn('pressure advance 0.01000', command.message)
+        self.assertTrue(any('T0 flow valid: PA 0.0100 (pass 1)' in msg
+                            for msg in command.messages))
 
     def test_flow_strokes_restore_pa_on_failed_measurement(self):
         self.board.flow_test_z = 8.
-        self.board.flow_sweep_x = 5.
+        self.board.flow_sweep_x = 4.5
         self.board.flow_test_accel = 625.
         self.board.flow_slow_speed = 4.5
         self.board.flow_fast_speed = 22.875

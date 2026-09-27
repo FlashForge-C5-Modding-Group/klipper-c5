@@ -195,6 +195,15 @@ class VirtualSDEOFTests(unittest.TestCase):
             'G92 E0', 'G1 X10', 'C5_PRINT_STOP'])
         self.assertEqual(sd.file_position, sd.file_size)
 
+    def test_slicer_z_offset_fast_path_keeps_exact_matching(self):
+        check = MODULE.creator5_slicer_z_offset
+        self.assertFalse(check('G1 X12 Y20 E0.4'))
+        self.assertFalse(check('  G92 E0 ; reset extruder'))
+        self.assertTrue(check('  g92 z0 ; slicer origin'))
+        self.assertTrue(check(' set_gcode_offset Z_ADJUST=-0.1'))
+        self.assertFalse(check('SET_GCODE_OFFSET X=1'))
+        self.assertFalse(check('; SET_GCODE_OFFSET Z=0'))
+
     def test_object_polygons_are_available_before_adaptive_start_once(self):
         define = ('EXCLUDE_OBJECT_DEFINE NAME=cube '
                   'POLYGON=[[10,10],[20,10],[20,20],[10,20]]')

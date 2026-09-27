@@ -195,7 +195,7 @@ class Creator5Toolchanger:
                                            minval=5., maxval=15.)
         # A shorter stroke needs a slower velocity/acceleration profile so
         # the pressure transient lasts longer than PA smoothing.
-        self.flow_sweep_x = config.getfloat('flow_sweep_x', 5.,
+        self.flow_sweep_x = config.getfloat('flow_sweep_x', 4.5,
                                             minval=4., maxval=12.)
         self._validate_purge_envelope(config.error)
         self.flow_test_accel = config.getfloat('flow_test_accel', 625.,
@@ -1511,6 +1511,9 @@ class Creator5Toolchanger:
                             self._pause_ms(self.flow_verdict_settle_ms)
                         if pa.pa_get_value() == 9:
                             successful.append(advance)
+                            gcmd.respond_info(
+                                'T%d flow valid: PA %.4f (pass %d)'
+                                % (attached, advance, repeat + 1))
                             # The remaining candidates cannot improve this
                             # pass once the lowest PA has been accepted.
                             if advance == minimum_candidate:

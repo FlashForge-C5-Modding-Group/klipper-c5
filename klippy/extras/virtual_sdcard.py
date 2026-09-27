@@ -67,7 +67,20 @@ def creator5_slicer_z_offset(line):
     # The calibrated Creator 5 nozzle Z comes from the toolchanger, not from
     # slicer start G-code.  Ignore only Z-bearing offset commands in print
     # files; host-side calibration and touchscreen commands still work.
-    command = line.split(';', 1)[0].strip()
+    command = line.lstrip()
+    if not command:
+        return False
+    # This runs for every line of a print. Most lines are G0/G1 moves, so
+    # avoid comment splitting and regular expressions on the motion hot path.
+    if command[0] in 'Gg':
+        if command[:3].upper() != 'G92':
+            return False
+    elif command[0] in 'Ss':
+        if command[:16].upper() != 'SET_GCODE_OFFSET':
+            return False
+    else:
+        return False
+    command = command.split(';', 1)[0].strip()
     if (re.match(r'^SET_GCODE_OFFSET\s+', command, re.I)
             and re.search(r'\bZ(?:_ADJUST)?\s*=', command, re.I)):
         return True
@@ -433,7 +446,7 @@ class VirtualSD:
             self.cmd_from_sd = True
             line = lines.pop()
             if sys.version_info.major >= 3:
-                line_length = len(line.encode())
+                line_length = len(line) if line.isascii() else len(line.encode())
             else:
                 line_length = len(line)
             next_file_position = (self.file_position + line_length
@@ -447,8 +460,10 @@ class VirtualSD:
                                     'print file: %s', line.strip())
                 else:
                     self.gcode.run_script(line)
-                    if re.match(r'^\s*C5_PRINT_STOP(?:\s|$)',
-                                line.split(';', 1)[0], re.I):
+                    stripped = line.lstrip()
+                    if (stripped[:1] in ('C', 'c')
+                            and re.match(r'^C5_PRINT_STOP(?:\s|$)',
+                                         stripped.split(';', 1)[0], re.I)):
                         self.creator5_stop_done = True
             except self.gcode.error as e:
                 error_message = str(e)

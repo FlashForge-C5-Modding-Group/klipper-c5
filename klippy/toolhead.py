@@ -192,7 +192,8 @@ class LookAheadQueue:
         # Check if enough moves have been queued to reach the target flush time.
         return self.junction_flush <= 0.
 
-BUFFER_TIME_HIGH = 1.0
+# Leave room for step generation to stay ahead through short host stalls.
+BUFFER_TIME_HIGH = 1.5
 BUFFER_TIME_START = 0.250
 PRIMING_CMD_TIME = 0.100
 
