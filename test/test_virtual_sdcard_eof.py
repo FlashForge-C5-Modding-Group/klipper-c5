@@ -27,6 +27,7 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.must_pause_work = sd.cmd_from_sd = False
         sd.work_timer = object()
         sd.reactor = mock.Mock(NOW=0., NEVER=999.)
+        sd.reactor.monotonic.return_value = 0.
         sd.gcode = mock.Mock()
         sd.gcode.error = RuntimeError
         sd.gcode.get_mutex.return_value.test.return_value = False
@@ -85,6 +86,16 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.work_handler(0.)
         sd.gcode.run_script.assert_not_called()
         sd.print_stats.note_complete.assert_called_once()
+
+    def test_dense_file_yields_before_next_read(self):
+        sd = self.make_sd('G1 X1\n' * 100)
+        clock = iter(i * 0.002 for i in range(1000))
+        sd.reactor.monotonic.side_effect = lambda: next(clock)
+        sd.work_handler(0.)
+        self.assertEqual(sd.gcode.run_script.call_count, 100)
+        # One yield is from reading the block; the rest must come while
+        # dispatching the lines in that same block.
+        self.assertGreater(sd.reactor.pause.call_count, 1)
 
     def test_automatic_start_runs_before_file_once(self):
         sd = self.make_sd('M140 S60\nM104 S220\nT2\nG1 X10\n')

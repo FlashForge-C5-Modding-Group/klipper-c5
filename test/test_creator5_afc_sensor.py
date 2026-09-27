@@ -28,6 +28,48 @@ def load_method(filename, class_name, method_name, symbols=None):
 
 
 class Creator5AfcSensorTest(unittest.TestCase):
+    def test_standalone_print_start_skips_blocking_metadata_timer(self):
+        reset = load_method('AFC.py', 'afc', '_reset_file_callback')
+        afc = types.SimpleNamespace(
+            enable_print_metadata=False, in_print_timer=None,
+            reactor=mock.Mock(), error=mock.Mock(), gcode=mock.Mock(),
+            print_data_metadata=mock.Mock(), save_vars=mock.Mock(),
+            number_of_toolchanges=9, current_toolchange=4,
+            print_tool_temperatures=[220])
+
+        reset(afc)
+
+        afc.reactor.register_timer.assert_not_called()
+        afc.print_data_metadata.reset.assert_called_once_with()
+        self.assertEqual(afc.number_of_toolchanges, 0)
+        self.assertEqual(afc.current_toolchange, -1)
+        self.assertEqual(afc.print_tool_temperatures, [])
+
+    def test_creator5_swap_does_not_wait_twice_before_return_travel(self):
+        state = types.SimpleNamespace(TOOL_DOCK='dock', TOOL_SWAP='swap',
+                                      TOOL_PICKUP='pickup', IDLE='idle')
+        swap = load_method('AFC_Toolchanger.py', 'AfcToolchanger',
+                           'tool_swap', {'State': state})
+        afc = mock.Mock()
+        afc.last_gcode_position = [0., 0., 0., 0.]
+        afc.gcode_move.base_position = [0., 0., 0., 0.]
+        afc.gcode_move.homing_position = [0., 0., 0., 0.]
+        afc.afcDeltaTime.delta_time = 1.
+        unit = mock.Mock(afc=afc)
+        unit.function.get_current_extruder_obj.return_value = None
+        extruder = mock.Mock(creator5_tool_index=0,
+                             custom_tool_swap='C5_TOOL_SELECT T=0',
+                             th_extruder_name='extruder')
+        lane = mock.Mock(extruder_obj=extruder)
+
+        swap(unit, lane)
+
+        afc.gcode.run_script_from_command.assert_called_once_with(
+            'C5_TOOL_SELECT T=0')
+        lane.activate_toolhead_extruder.assert_called_once_with()
+        afc.function._handle_activate_extruder.assert_not_called()
+        afc.toolhead.wait_moves.assert_not_called()
+
     def test_unused_td1_probe_is_disabled_without_moonraker_query(self):
         get_td1_present = load_method('AFC.py', 'afc', 'td1_present')
         afc = types.SimpleNamespace(enable_td1_detection=False,
@@ -134,7 +176,7 @@ class Creator5AfcSensorTest(unittest.TestCase):
         change_tool = load_method('AFC.py', 'afc', 'CHANGE_TOOL')
         change_tool(afc, lane)
         lane.tool_swap.assert_called_once_with()
-        afc.restore_pos.assert_called_once_with()
+        afc.restore_pos.assert_called_once_with(move_z_first=False)
         self.assertFalse(afc.in_toolchange)
 
         lane.tool_swap.reset_mock()

@@ -202,6 +202,13 @@ class GCodeDispatch:
     # Parse input into commands
     args_r = re.compile('([A-Z_]+|[A-Z*])')
     def _process_commands(self, commands, need_ack=True):
+        # Macro bodies execute as one script.  Yield between their commands
+        # when needed so serial and step-generation timers remain responsive.
+        # In particular, avoid clock reads for each single-line G1 from a
+        # print file; only multi-line scripts need their own time slicing.
+        reactor = (self.printer.get_reactor()
+                   if not need_ack and len(commands) > 1 else None)
+        next_yield = reactor.monotonic() + 0.010 if reactor is not None else None
         for line in commands:
             # Ignore comments and leading/trailing spaces
             line = origline = line.strip()
@@ -241,6 +248,9 @@ class GCodeDispatch:
                 if not need_ack:
                     raise
             gcmd.ack()
+            if next_yield is not None and reactor.monotonic() >= next_yield:
+                reactor.pause(reactor.NOW)
+                next_yield = reactor.monotonic() + 0.010
     def run_script_from_command(self, script):
         self._process_commands(script.split('\n'), need_ack=False)
     def run_script(self, script):

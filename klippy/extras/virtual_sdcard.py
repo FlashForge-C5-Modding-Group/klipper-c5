@@ -344,6 +344,9 @@ class VirtualSD:
         lines = []
         final_line = False
         error_message = None
+        # A file block can contain hundreds of short commands.  Do not hold
+        # the reactor until the next 8192-byte read on a slower host.
+        next_yield = self.reactor.monotonic() + 0.010
         if (self.auto_creator5_start and not self.creator5_start_done
                 and not self.file_position):
             try:
@@ -459,6 +462,9 @@ class VirtualSD:
                 break
             self.cmd_from_sd = False
             self.file_position = self.next_file_position
+            if self.reactor.monotonic() >= next_yield:
+                self.reactor.pause(self.reactor.NOW)
+                next_yield = self.reactor.monotonic() + 0.010
             # Do we need to skip around?
             if self.next_file_position != next_file_position:
                 try:

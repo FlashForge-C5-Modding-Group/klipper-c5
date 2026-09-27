@@ -30,6 +30,18 @@ class QueueLoggerRolloverTests(unittest.TestCase):
                 listener.stop()
                 listener.close()
 
+    def test_stale_rollover_clock_does_not_repeat_same_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            listener = MODULE.QueueListener(str(Path(directory) / 'printer.log'))
+            try:
+                listener.doRollover()
+                listener.rolloverAt = 0
+                record = logging.makeLogRecord({'msg': 'test'})
+                self.assertFalse(listener.shouldRollover(record))
+            finally:
+                listener.stop()
+                listener.close()
+
 
 if __name__ == '__main__':
     unittest.main()

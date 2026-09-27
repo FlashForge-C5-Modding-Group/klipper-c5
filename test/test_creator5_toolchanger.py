@@ -67,6 +67,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.post_select_accel = None
         self.board.flow_verdict_settle_ms = 50
         self.board.lower_bed_speed = 10.
+        self.board.offset_calibration_lift = 3.
+        self.board.offset_calibration_lift_speed = 10.
         self.board._g28_passthrough = False
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
@@ -285,14 +287,44 @@ class Creator5OffsetTests(unittest.TestCase):
         board._pause_ms = mock.Mock()
         board._verify = mock.Mock()
         board._apply_offsets = mock.Mock()
+        activation_move_counts = []
+        board._run.side_effect = lambda command: (
+            activation_move_counts.append(board._move.call_count)
+            if command.startswith('ACTIVATE_EXTRUDER') else None)
         board._pickup(GCmd(), 0)
         self.assertEqual(board._move.call_args_list[-3:], [
             mock.call(x=278., feed=4800.),
             mock.call(x=238., feed=36000.),
             mock.call(x=250., feed=36000.)])
         board._verify.assert_called_once_with(mock.ANY, 0)
+        self.assertEqual(activation_move_counts, [6])
+        board._apply_offsets.assert_called_once_with(0)
         self.assertEqual(board._run.call_args_list[-1],
                          mock.call('ACTIVATE_EXTRUDER EXTRUDER=extruder'))
+
+    def test_failed_pickup_verification_never_activates_or_departs(self):
+        board = self.board
+        board.approach_x, board.pre_dock_x = 250., 280.
+        board.pullback, board.pullback_slow_distance = 60., 20.
+        board.clear_travel_speed = 600.
+        board.pickup_predock_speed = board.pickup_latch_speed = 60.
+        board.pullback_speed = 80.
+        board.pickup_latch_wait_ms = 0
+        board.grab_buttons = ['grab0']
+        board._button = mock.Mock(return_value=True)
+        board._raise_z = mock.Mock()
+        board._move = mock.Mock()
+        board._run = mock.Mock()
+        board._pause_ms = mock.Mock()
+        board._verify = mock.Mock(side_effect=RuntimeError('sensor failed'))
+        board._apply_offsets = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, 'sensor failed'):
+            board._pickup(GCmd(), 0)
+
+        self.assertEqual(board._move.call_count, 6)
+        self.assertFalse(any('ACTIVATE_EXTRUDER' in call.args[0]
+                             for call in board._run.call_args_list))
 
     def test_select_sets_part_accel_only_after_success(self):
         board = self.board
@@ -531,6 +563,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._calibrate_tool_xy = lambda command, tool, height: (
             calls.append(('xy', tool, height)))
         self.board._apply_offsets = lambda tool: calls.append(('apply', tool))
+        self.board._lift_after_offset_calibration = (
+            lambda command: calls.append('lift'))
         self.board.cmd_offset_calibrate(GCmd(
             BUILDPLATE_REMOVED=1, T=1, Z=1, SAVE=0))
         self.assertEqual(calls[0],
@@ -539,6 +573,46 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(calls[2][0:2], ('xy', 1))
         self.assertAlmostEqual(calls[2][2], 1.83)
         self.assertEqual(calls[3], ('apply', 1))
+        self.assertEqual(calls[4], 'lift')
+
+    def test_offset_calibration_lift_uses_physical_z_and_waits(self):
+        toolhead = mock.Mock()
+        toolhead.get_status.return_value = {
+            'homed_axes': 'xyz', 'axis_maximum': mock.Mock(z=270.)}
+        toolhead.get_position.return_value = [10., 20., 10., 0.]
+        self.board.printer.lookup_object.return_value = toolhead
+        self.board._move = mock.Mock()
+        self.board._run = mock.Mock()
+
+        self.board._lift_after_offset_calibration(GCmd())
+
+        self.board._move.assert_called_once_with(z=13., feed=600.)
+        self.board._run.assert_called_once_with('M400')
+
+    def test_offset_calibration_lift_is_bounded_by_z_max(self):
+        toolhead = mock.Mock()
+        toolhead.get_status.return_value = {
+            'homed_axes': 'xyz', 'axis_maximum': mock.Mock(z=270.)}
+        toolhead.get_position.return_value = [10., 20., 269., 0.]
+        self.board.printer.lookup_object.return_value = toolhead
+        self.board._move = mock.Mock()
+        self.board._run = mock.Mock()
+
+        self.board._lift_after_offset_calibration(GCmd())
+
+        self.board._move.assert_called_once_with(z=270., feed=600.)
+        self.board._run.assert_called_once_with('M400')
+
+    def test_offset_calibration_lift_requires_homed_z(self):
+        toolhead = mock.Mock()
+        toolhead.get_status.return_value = {
+            'homed_axes': 'xy', 'axis_maximum': mock.Mock(z=270.)}
+        self.board.printer.lookup_object.return_value = toolhead
+        self.board._move = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, 'Home Z'):
+            self.board._lift_after_offset_calibration(GCmd())
+        self.board._move.assert_not_called()
 
     def test_xy_failure_restores_measurements_and_runtime_offsets(self):
         self.board.scan_height = None
@@ -570,7 +644,7 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_purge_selects_attached_hotend_for_shared_drive(self):
         self.board.purge_length = 12.
-        self.board.purge_x, self.board.purge_y, self.board.purge_z = 270., 250., 8.
+        self.board.purge_x, self.board.purge_y, self.board.purge_z = 276.5, 260., 8.
         self.board.prep_approach_x = self.board.prep_approach_y = 250.
         self.board.purge_speed = 3.
         self.board.flow_test_z = 8.
@@ -600,7 +674,7 @@ class Creator5OffsetTests(unittest.TestCase):
         low_y = next(i for i, move in enumerate(moves)
                      if move.get('y') == 250.)
         final_x = next(i for i, move in enumerate(moves)
-                       if move.get('x') == 270.)
+                       if move.get('x') == 276.5)
         self.assertLess(x250, low_y)
         self.assertLess(low_y, final_x)
         final_z = next(i for i, move in enumerate(moves)
@@ -616,6 +690,16 @@ class Creator5OffsetTests(unittest.TestCase):
             self.board.cmd_purge(GCmd())
         self.board._run.assert_not_called()
 
+    def test_purge_flow_envelope_stops_at_x279(self):
+        board = self.board
+        board.purge_x, board.purge_y = 276.5, 260.
+        board.flow_sweep_x = 5.
+        board.purge_max_x = 279.
+        board._validate_purge_envelope(RuntimeError)
+        board.purge_x = 277.
+        with self.assertRaisesRegex(RuntimeError, 'exceeds purge_max_x'):
+            board._validate_purge_envelope(RuntimeError)
+
     def test_flow_strokes_stay_over_bucket_and_apply_pa(self):
         self.board.flow_test_z = 8.
         self.board.flow_sweep_x = 5.
@@ -623,7 +707,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.flow_slow_speed = 4.5
         self.board.flow_fast_speed = 22.875
         self.board.prep_approach_x = self.board.prep_approach_y = 250.
-        self.board.purge_x, self.board.purge_y = 270., 250.
+        self.board.purge_x, self.board.purge_y = 276.5, 260.
         self.board._preflight = lambda command: ([], [], 0)
         self.board.cmd_verify_nozzle_z = mock.Mock()
         self.board._with_motion = lambda command, operation: operation()
@@ -641,16 +725,16 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.cmd_flow_strokes(command)
         self.assertEqual(pa.pa_get_value.call_count, 3)
         self.board._pause_ms.assert_has_calls([mock.call(50)] * 3)
-        self.board._move.assert_any_call(x=270., y=250., feed=3000,
+        self.board._move.assert_any_call(x=276.5, y=260., feed=3000,
                                          machine=False)
-        self.board._move.assert_any_call(x=267.5, feed=3000,
+        self.board._move.assert_any_call(x=274., feed=3000,
                                          machine=False)
         self.board._run.assert_any_call('SET_VELOCITY_LIMIT ACCEL=625')
-        self.board._run.assert_any_call('G1 X272.500 E1.13573 F270')
-        self.board._run.assert_any_call('G1 X267.500 E2.27146 F1372')
+        self.board._run.assert_any_call('G1 X279.000 E1.13573 F270')
+        self.board._run.assert_any_call('G1 X274.000 E2.27146 F1372')
         self.assertFalse(any('X' in call.args[0]
-                             and not ('X267.500' in call.args[0]
-                                      or 'X272.500' in call.args[0])
+                             and not ('X274.000' in call.args[0]
+                                      or 'X279.000' in call.args[0])
                              for call in self.board._run.call_args_list
                              if call.args[0].startswith('G1 ')))
         self.board._run.assert_any_call(

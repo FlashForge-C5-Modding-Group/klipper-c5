@@ -103,6 +103,10 @@ class Creator5Toolchanger:
             'plate_check_min_delta', .8, above=0.)
         self._stock_pin_approach_z = None
         self.safe_z = config.getfloat('safe_z', 10., above=0.)
+        self.offset_calibration_lift = config.getfloat(
+            'offset_calibration_lift', 3., above=0.)
+        self.offset_calibration_lift_speed = config.getfloat(
+            'offset_calibration_lift_speed', 10., above=0.)
         self.max_mount_correction = config.getfloat(
             'max_mount_correction', 2., above=0.)
         self.max_offset_correction = config.getfloat(
@@ -149,8 +153,11 @@ class Creator5Toolchanger:
             'position_calibration_accel', 1000., above=0.)
         self.prep_approach_x = config.getfloat('prep_approach_x', 250.)
         self.prep_approach_y = config.getfloat('prep_approach_y', 250.)
-        self.purge_x = config.getfloat('purge_x', 270.)
-        self.purge_y = config.getfloat('purge_y', 250.)
+        self.purge_x = config.getfloat('purge_x', 276.5)
+        self.purge_y = config.getfloat('purge_y', 250., maxval=260.)
+        # The bucket sweep must stop short of the usable X280 edge. This
+        # limit applies only to purge/flow, not to the docks beyond X280.
+        self.purge_max_x = config.getfloat('purge_max_x', 279., maxval=279.)
         self.cooldown_x = config.getfloat('cooldown_x', 266.5)
         self.cooldown_y = config.getfloat('cooldown_y', 13.8)
         self.cooldown_wipe_z = config.getfloat('cooldown_wipe_z', 2.,
@@ -169,6 +176,7 @@ class Creator5Toolchanger:
         # the pressure transient lasts longer than PA smoothing.
         self.flow_sweep_x = config.getfloat('flow_sweep_x', 5.,
                                             minval=4., maxval=12.)
+        self._validate_purge_envelope(config.error)
         self.flow_test_accel = config.getfloat('flow_test_accel', 625.,
                                                above=0., maxval=5000.)
         self.flow_slow_speed = config.getfloat('flow_slow_speed', 4.5,
@@ -657,6 +665,25 @@ class Creator5Toolchanger:
             self._move(z=self.safe_z,
                        feed=self.clearance_z_speed * 60.)
 
+    def _lift_after_offset_calibration(self, gcmd):
+        # Leave the levelboard target vertically before AFC docks or swaps
+        # the measured tool. Use physical Z so nozzle offsets cannot alter it.
+        toolhead = self.printer.lookup_object('toolhead')
+        status = toolhead.get_status(self.printer.get_reactor().monotonic())
+        if 'z' not in status.get('homed_axes', ''):
+            raise gcmd.error('Home Z before offset calibration tool lift')
+        current_z = toolhead.get_position()[2]
+        z_max = status['axis_maximum'].z
+        if not math.isfinite(current_z) or not math.isfinite(z_max):
+            raise gcmd.error('Cannot determine offset calibration Z clearance')
+        if current_z > z_max + .001:
+            raise gcmd.error('Current Z position exceeds the travel limit')
+        target = min(current_z + self.offset_calibration_lift, z_max)
+        if target > current_z + .001:
+            self._move(z=target,
+                       feed=self.offset_calibration_lift_speed * 60.)
+            self._run('M400')
+
     def _move_to_prep_bucket(self):
         # Travel inboard before entering the rear-right preparation area.
         self._raise_z()
@@ -664,6 +691,13 @@ class Creator5Toolchanger:
         self._move(y=self.prep_approach_y, feed=6000, machine=False)
         self._move(x=self.purge_x, y=self.purge_y,
                    feed=3000, machine=False)
+
+    def _validate_purge_envelope(self, error):
+        if (not all(math.isfinite(value) for value in (
+                self.purge_x, self.purge_y, self.flow_sweep_x,
+                self.purge_max_x))
+                or self.purge_x + self.flow_sweep_x / 2. > self.purge_max_x):
+            raise error('Purge/flow X path exceeds purge_max_x')
 
     def _verify(self, gcmd, expected, parked=None):
         try:
@@ -737,12 +771,13 @@ class Creator5Toolchanger:
             self._move(x=x - self.pullback, feed=clear_feed)
         self._run('MOTOR_GRAB2')
         self._pause_ms(self.pickup_latch_wait_ms)
-        self._move(x=self.approach_x,
-                   feed=self.pickup_departure_speed * 60.)
+        # Verify the physical sensors at the clear pullback point before
+        # activation. The final departure can flow into AFC's return move.
         self._verify(gcmd, tool)
-        self._apply_offsets(tool)
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+        self._move(x=self.approach_x,
+                   feed=self.pickup_departure_speed * 60.)
 
     def _with_motion(self, gcmd, operation, final_accel=None):
         old_accel = self.printer.lookup_object('toolhead').get_max_velocity()[1]
@@ -1147,6 +1182,7 @@ class Creator5Toolchanger:
                 actual_scan_height = scan_height
             self._calibrate_tool_xy(gcmd, tool, actual_scan_height)
             self._apply_offsets(tool)
+            self._lift_after_offset_calibration(gcmd)
         with self._calibration_transaction():
             self._with_motion(gcmd, calibrate)
         if gcmd.get_int('SAVE', 0, minval=0, maxval=1):

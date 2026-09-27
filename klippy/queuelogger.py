@@ -29,6 +29,7 @@ class QueueListener(logging.handlers.TimedRotatingFileHandler):
         self.bg_thread = threading.Thread(target=self._bg_thread)
         self.bg_thread.start()
         self.rollover_info = {}
+        self._last_rollover_date = None
     def _bg_thread(self):
         while 1:
             record = self.bg_queue.get(True)
@@ -45,8 +46,22 @@ class QueueListener(logging.handlers.TimedRotatingFileHandler):
         self.rollover_info[name] = info
     def clear_rollover_info(self):
         self.rollover_info.clear()
+    def shouldRollover(self, record):
+        # A clock correction or stale rolloverAt can otherwise rotate once
+        # per record, repeatedly writing the entire printer config to disk.
+        today = time.localtime()[:3]
+        if self._last_rollover_date == today:
+            return False
+        return logging.handlers.TimedRotatingFileHandler.shouldRollover(
+            self, record)
     def doRollover(self):
         logging.handlers.TimedRotatingFileHandler.doRollover(self)
+        now = int(time.time())
+        self._last_rollover_date = time.localtime(now)[:3]
+        if self.rolloverAt <= now:
+            self.rolloverAt = self.computeRollover(now)
+            if self.rolloverAt <= now:
+                self.rolloverAt = now + self.interval
         lines = [self.rollover_info[name]
                  for name in sorted(self.rollover_info)]
         lines.append(

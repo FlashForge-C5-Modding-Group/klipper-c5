@@ -9,6 +9,9 @@ import logging
 from types import FunctionType, MethodType
 
 THRESHOLD = 0.05
+LATENCY_LOG_INTERVAL = 5.
+LATENCY_CALLBACK_LIMIT = 8
+_last_latency_log = float('-inf')
 
 def get_function_owner(cb):
     if type(cb) in (FunctionType, MethodType):
@@ -20,10 +23,20 @@ def get_function_owner(cb):
     return repr(cb)
 
 def _analyze_callback(eventtime, prev_eventtime, cbs):
+    global _last_latency_log
+    # The notifier runs in the motion reactor. On slow hosts, formatting and
+    # logging every callback can itself delay the next step-generation flush.
+    if eventtime - _last_latency_log < LATENCY_LOG_INTERVAL:
+        return
+    _last_latency_log = eventtime
     duration = eventtime - prev_eventtime
-    pretty_cbs = [get_function_owner(cb) for cb in cbs]
-    logging.warning("Reactor %.3f busy for %.3f with:\n- %s" % (
-        eventtime, duration, ',\n- '.join(pretty_cbs)))
+    pretty_cbs = [get_function_owner(cb)
+                  for cb in cbs[:LATENCY_CALLBACK_LIMIT]]
+    omitted = len(cbs) - len(pretty_cbs)
+    if omitted:
+        pretty_cbs.append('... %d more callbacks' % omitted)
+    logging.warning("Reactor %.3f busy for %.3f with %d callbacks: %s",
+                    eventtime, duration, len(cbs), ', '.join(pretty_cbs))
 
 class GarbageCollection:
     def __init__(self, config):

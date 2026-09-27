@@ -13,6 +13,7 @@ class GCodeNumericPrefixTests(unittest.TestCase):
         dispatch = gcode.GCodeDispatch.__new__(gcode.GCodeDispatch)
         dispatch.printer = mock.Mock()
         dispatch.printer.config_error = ValueError
+        dispatch.printer.get_reactor.return_value.monotonic.return_value = 0.
         dispatch.ready_gcode_handlers = {}
         dispatch.base_gcode_handlers = {}
         dispatch.gcode_handlers = dispatch.ready_gcode_handlers
@@ -39,8 +40,21 @@ class GCodeNumericPrefixTests(unittest.TestCase):
                 (cmd.get_command(), cmd.get('X'))))
         self.dispatch.run_script_from_command('G1 X10')
         self.assertEqual(self.calls, [('G1', '10')])
+        self.dispatch.printer.get_reactor.assert_not_called()
         with self.assertRaisesRegex(ValueError, 'invalid name'):
             self.dispatch.register_command('C5PREPARE', lambda cmd: None)
+
+    def test_long_macro_yields_between_commands(self):
+        reactor = self.dispatch.printer.get_reactor.return_value
+        clock = iter([0., .006, .012, .012, .018, .024, .024])
+        reactor.monotonic.side_effect = lambda: next(clock)
+        self.dispatch.register_command(
+            'G1', lambda cmd: self.calls.append(cmd.get('X')))
+        self.dispatch.run_script_from_command(
+            'G1 X1\nG1 X2\nG1 X3\nG1 X4')
+        self.assertEqual(self.calls, ['1', '2', '3', '4'])
+        self.assertEqual(reactor.pause.call_count, 2)
+        reactor.pause.assert_called_with(reactor.NOW)
 
 
 if __name__ == '__main__':

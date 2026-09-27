@@ -157,6 +157,11 @@ class afc:
         self.moonraker_port         = config.get("moonraker_port", 7125)             # Port to connect to when interacting with moonraker. Used when there are multiple moonraker/klipper instances on a single host
         self.moonraker_host         = config.get("moonraker_host", "http://localhost")
         self.moonraker_connect_to   = config.get("moonraker_timeout", 30)
+        # The delayed metadata query uses blocking HTTP in the reactor. It is
+        # optional for standalone toolchangers that do not use AFC's slicer
+        # tool-change counts or per-lane temperature selection.
+        self.enable_print_metadata = config.getboolean(
+            "enable_print_metadata", True)
         self.unit_order_list        = config.get('unit_order_list','')
         self.VarFile                = config.get('VarFile','../printer_data/config/AFC/AFC.var')# Path to the variables file for AFC configuration.
         self.cfgloc                 = self._remove_after_last(self.VarFile,"/")
@@ -626,7 +631,9 @@ class afc:
 
         AFC errors are also reset as well as pause states are cleared in klipper's pause_resume module
         """
-        self.in_print_timer = self.reactor.register_timer( self.in_print_reactor_timer, self.reactor.monotonic() + 5 )
+        if self.enable_print_metadata:
+            self.in_print_timer = self.reactor.register_timer(
+                self.in_print_reactor_timer, self.reactor.monotonic() + 5)
         self.error.reset_failure()
         self.gcode.run_script_from_command("CLEAR_PAUSE")
         self.number_of_toolchanges = 0
@@ -2400,7 +2407,10 @@ class afc:
             try:
                 cur_lane.tool_swap()
                 if restore_pos and saved_here:
-                    self.restore_pos()
+                    # Creator 5 has already raised Z for clear tool travel.
+                    # Keep that clearance for the XY return, then descend at
+                    # the saved print position instead of lowering first.
+                    self.restore_pos(move_z_first=False)
             finally:
                 self.in_toolchange = was_changing
             return
