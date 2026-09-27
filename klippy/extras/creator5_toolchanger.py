@@ -32,19 +32,40 @@ class Creator5MiscSwitch:
     This is a setting, never a real filament sensor or a runout source.
     """
     def __init__(self, printer, gcode, name, enabled):
+        self.printer = printer
+        self.gcode = gcode
         self.name = name
+        self.saved_key = 'c5_' + name
         self.enabled = bool(enabled)
         printer.add_object('filament_switch_sensor ' + name, self)
+        printer.register_event_handler('klippy:ready', self._handle_ready)
         gcode.register_mux_command('SET_FILAMENT_SENSOR', 'SENSOR',
                                    name, self.cmd_set)
         gcode.register_mux_command('QUERY_FILAMENT_SENSOR', 'SENSOR',
                                    name, self.cmd_query)
 
+    def _handle_ready(self):
+        saved = self.printer.lookup_object('save_variables', None)
+        if saved is not None:
+            value = saved.allVariables.get(self.saved_key)
+            if value in (0, 1):
+                self.enabled = bool(value)
+
+    def set_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self.enabled:
+            return
+        if self.printer.lookup_object('save_variables', None) is not None:
+            self.gcode.run_script_from_command(
+                'SAVE_VARIABLE VARIABLE=%s VALUE=%d'
+                % (self.saved_key, int(enabled)))
+        self.enabled = enabled
+
     def get_status(self, eventtime):
         return {'enabled': self.enabled, 'filament_detected': self.enabled}
 
     def cmd_set(self, gcmd):
-        self.enabled = bool(gcmd.get_int('ENABLE', 1, minval=0, maxval=1))
+        self.set_enabled(gcmd.get_int('ENABLE', 1, minval=0, maxval=1))
         gcmd.respond_info('Creator 5 %s %s' % (
             self.name, 'enabled' if self.enabled else 'disabled'))
 
@@ -245,11 +266,11 @@ class Creator5Toolchanger:
         self.gcode.register_command('G28', self.cmd_G28)
 
     def cmd_flow_on(self, gcmd):
-        self.flow_switch.enabled = True
+        self.flow_switch.set_enabled(True)
         gcmd.respond_info('Creator 5 flow calibration enabled')
 
     def cmd_flow_off(self, gcmd):
-        self.flow_switch.enabled = False
+        self.flow_switch.set_enabled(False)
         gcmd.respond_info('Creator 5 flow calibration disabled')
 
     def cmd_lower_bed(self, gcmd):

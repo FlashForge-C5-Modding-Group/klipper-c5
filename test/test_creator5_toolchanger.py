@@ -112,6 +112,38 @@ class Creator5OffsetTests(unittest.TestCase):
         switch.cmd_set(GCmd(ENABLE=1))
         self.assertTrue(switch.get_status(0.)['enabled'])
 
+    def test_misc_switch_restores_and_saves_mainsail_changes(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        printer.lookup_object.return_value = mock.Mock(
+            allVariables={'c5_purge': 0})
+        switch = MODULE.Creator5MiscSwitch(printer, gcode, 'purge', True)
+        switch._handle_ready()
+        self.assertFalse(switch.enabled)
+        switch.cmd_set(GCmd(ENABLE=1))
+        self.assertTrue(switch.enabled)
+        gcode.run_script_from_command.assert_called_once_with(
+            'SAVE_VARIABLE VARIABLE=c5_purge VALUE=1')
+        switch.cmd_set(GCmd(ENABLE=1))
+        gcode.run_script_from_command.assert_called_once()
+
+    def test_misc_switch_does_not_change_when_save_fails(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        printer.lookup_object.return_value = mock.Mock(allVariables={})
+        gcode.run_script_from_command.side_effect = RuntimeError('disk full')
+        switch = MODULE.Creator5MiscSwitch(
+            printer, gcode, 'lower_bed_on_end', False)
+        with self.assertRaisesRegex(RuntimeError, 'disk full'):
+            switch.cmd_set(GCmd(ENABLE=1))
+        self.assertFalse(switch.enabled)
+
+    def test_flow_macro_commands_use_persistent_switch(self):
+        self.board.flow_switch = mock.Mock()
+        self.board.cmd_flow_on(GCmd())
+        self.board.cmd_flow_off(GCmd())
+        self.assertEqual(
+            self.board.flow_switch.set_enabled.call_args_list,
+            [mock.call(True), mock.call(False)])
+
     def test_lower_bed_uses_machine_z_limit(self):
         toolhead = mock.Mock()
         toolhead.get_status.return_value = {

@@ -583,7 +583,11 @@ class ToolHeadCommandHelper:
                "max_accel: %.6f\n"
                "minimum_cruise_ratio: %.6f\n"
                "square_corner_velocity: %.6f" % (mv, ma, mcr, scv))
-        self.printer.set_rollover_info("toolhead", "toolhead: %s" % (msg,))
+        # Slicers may change acceleration on nearly every move.  Preserve the
+        # latest values for rollover diagnostics without writing four log
+        # lines per change on the printer's slow MIPS host.
+        self.printer.set_rollover_info("toolhead", "toolhead: %s" % (msg,),
+                                       log=False)
         if (max_velocity is None and max_accel is None
             and square_corner_velocity is None and min_cruise_ratio is None):
             gcmd.respond_info(msg, log=False)
