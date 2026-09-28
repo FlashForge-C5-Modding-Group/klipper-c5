@@ -279,7 +279,7 @@ class Creator5Toolchanger:
         status = toolhead.get_status(self.printer.get_reactor().monotonic())
         if 'z' not in status.get('homed_axes', ''):
             raise gcmd.error('Home Z before lowering the bed')
-        z_max = status['axis_maximum'].z
+        z_max = 256
         current_z = toolhead.get_position()[2]
         if not math.isfinite(z_max) or not math.isfinite(current_z):
             raise gcmd.error('Cannot determine the physical Z travel limit')
