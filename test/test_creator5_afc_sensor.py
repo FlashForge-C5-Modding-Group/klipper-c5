@@ -28,6 +28,76 @@ def load_method(filename, class_name, method_name, symbols=None):
 
 
 class Creator5AfcSensorTest(unittest.TestCase):
+    def test_infinite_spool_changes_to_selected_loaded_head(self):
+        runout = load_method('AFC_lane.py', 'AFCLane',
+                             '_perform_creator5_infinite_runout')
+        source = mock.Mock(name='source', map='T0')
+        source.name = 'extruder'
+        source.runout_lane = 'extruder2'
+        source.extruder_obj.toolhead_extruder.get_heater.return_value.target_temp = 220
+        source.extruder_obj.toolhead_extruder.get_heater.return_value.min_extrude_temp = 170
+        target = mock.Mock(name='target')
+        target.name = 'extruder2'
+        target.extruder_obj.creator5_tool_index = 2
+        target.extruder_obj.tool_start_state = True
+        target.extruder_obj.on_shuttle.return_value = True
+        source.afc.lanes = {'extruder2': target}
+        source.afc.error_state = False
+
+        runout(source)
+
+        source.afc.CHANGE_TOOL.assert_called_once_with(
+            target, restore_pos=False)
+        source.printer.lookup_object.return_value.set_temperature.assert_called_once_with(
+            target.extruder_obj.toolhead_extruder.get_heater.return_value,
+            220, wait=True)
+        source.gcode.run_script_from_command.assert_called_once_with(
+            'SET_MAP LANE=extruder2 MAP=T0')
+        target.set_tool_loaded.assert_called_once_with(
+            normal_toolchange=True)
+        source.afc.restore_pos.assert_called_once_with(
+            move_z_first=False)
+        source.afc.error.pause_resume.send_resume_command.assert_called_once()
+
+    def test_infinite_spool_does_not_change_to_empty_head(self):
+        runout = load_method('AFC_lane.py', 'AFCLane',
+                             '_perform_creator5_infinite_runout')
+        source = mock.Mock(name='source')
+        source.runout_lane = 'extruder2'
+        target = mock.Mock(name='target')
+        target.extruder_obj.creator5_tool_index = 2
+        target.extruder_obj.tool_start_state = False
+        source.afc.lanes = {'extruder2': target}
+
+        runout(source)
+
+        source.afc.CHANGE_TOOL.assert_not_called()
+        source.afc.error.pause_resume.send_resume_command.assert_not_called()
+        source.afc.error.AFC_error.assert_called_once()
+
+    def test_infinite_spool_keeps_print_paused_on_swap_failure(self):
+        runout = load_method('AFC_lane.py', 'AFCLane',
+                             '_perform_creator5_infinite_runout')
+        source = mock.Mock(name='source', map='T1')
+        source.name = 'extruder1'
+        source.runout_lane = 'extruder3'
+        source.extruder_obj.toolhead_extruder.get_heater.return_value.target_temp = 230
+        source.extruder_obj.toolhead_extruder.get_heater.return_value.min_extrude_temp = 170
+        target = mock.Mock(name='target')
+        target.name = 'extruder3'
+        target.extruder_obj.creator5_tool_index = 3
+        target.extruder_obj.tool_start_state = True
+        source.afc.lanes = {'extruder3': target}
+        source.afc.CHANGE_TOOL.side_effect = RuntimeError('grab failed')
+
+        runout(source)
+
+        source.afc.error.AFC_error.assert_called_once()
+        source.afc.error.pause_resume.send_resume_command.assert_not_called()
+        source.gcode.run_script_from_command.assert_not_called()
+        source.afc.restore_pos.assert_not_called()
+
+
     def test_standalone_print_start_skips_blocking_metadata_timer(self):
         reset = load_method('AFC.py', 'afc', '_reset_file_callback')
         afc = types.SimpleNamespace(

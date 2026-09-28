@@ -991,6 +991,10 @@ class AFCLane:
             - Swaps mapping between current lane and runout lane so correct lane is loaded with T(n) macro
             - Once changeover is successful print is automatically resumed
         """
+        if self.extruder_obj.creator5_tool_index is not None:
+            self._perform_creator5_infinite_runout()
+            return
+
         self.status = AFCLaneState.NONE
         self.unit_obj.lane_not_ready(self)
         self.logger.info("Infinite Spool triggered for {}".format(self.name))
@@ -1035,6 +1039,56 @@ class AFCLane:
             self.afc.error.pause_resume.send_resume_command()
             # Set LED to not ready
             self.unit_obj.lane_not_ready(self)
+
+    def _perform_creator5_infinite_runout(self):
+        """Switch complete heads on runout, without AFC filament feed moves."""
+        replacement = self.afc.lanes.get(self.runout_lane)
+        if (replacement is None or replacement is self
+                or replacement.extruder_obj.creator5_tool_index is None):
+            self.afc.error.AFC_error(
+                "Invalid Creator 5 infinite-spool replacement for %s: %s"
+                % (self.name, self.runout_lane))
+            return
+        # A mapped tool is not necessarily loaded. Trust the replacement's
+        # physical filament switch before moving a head or resuming a print.
+        if not replacement.extruder_obj.tool_start_state:
+            self.afc.error.AFC_error(
+                "Infinite-spool replacement %s has no filament; print paused"
+                % (replacement.name,))
+            return
+
+        source_map = self.map
+        self.afc.save_pos()
+        self.afc.error.pause_resume.send_pause_command()
+        try:
+            source_heater = self.extruder_obj.toolhead_extruder.get_heater()
+            target_temp = source_heater.target_temp
+            if target_temp <= source_heater.min_extrude_temp:
+                raise RuntimeError("source hotend has no printable target temperature")
+            target_heater = replacement.extruder_obj.toolhead_extruder.get_heater()
+            self.printer.lookup_object('heaters').set_temperature(
+                target_heater, target_temp, wait=True)
+            self.afc.CHANGE_TOOL(replacement, restore_pos=False)
+            if self.afc.error_state or not replacement.extruder_obj.on_shuttle():
+                raise RuntimeError("replacement tool did not attach")
+            if not replacement.extruder_obj.tool_start_state:
+                raise RuntimeError("replacement tool has no filament")
+            self.gcode.run_script_from_command(
+                'SET_MAP LANE={} MAP={}'.format(replacement.name, source_map))
+            self.set_tool_unloaded()
+            self.set_unloaded()
+            replacement.set_tool_loaded(normal_toolchange=True)
+            replacement.set_loaded()
+            self.afc.save_vars()
+            self.afc.restore_pos(move_z_first=False)
+        except Exception as exc:
+            self.afc.error.AFC_error(
+                "Creator 5 infinite-spool change failed; print remains paused: %s"
+                % (exc,))
+            return
+        self.logger.info("Infinite Spool switched %s to %s"
+                         % (self.name, replacement.name))
+        self.afc.error.pause_resume.send_resume_command()
 
     def _handle_auto_spool_switch(self):
         """
