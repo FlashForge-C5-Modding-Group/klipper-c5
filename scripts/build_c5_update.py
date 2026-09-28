@@ -79,6 +79,11 @@ CONTROL_MEMBER_PROFILES = (
      "./levelBoard_fail.img", "./levelBoard.hex", "./mainBoardGD.hex",
      "./mcu_fail.img", "./mcu.img", "./md5sum.list", "./run.sh",
      "./Update", "./VDS_V1.0.1_0.hex"),
+    ("./eBoard_fail.img", "./eBoard.hex", "./heaterBoard_fail.img",
+     "./heaterBoard.hex", "./IAPCommand", "./ISPCommand",
+     "./ISPCommand-bak", "./levelBoard_fail.img", "./levelBoard.hex",
+     "./mainBoardGD.hex", "./mcu_fail.img", "./mcu.img",
+     "./md5sum.list", "./run.sh", "./Update", "./VDS_V1.0.1_0.hex"),
 )
 
 class ToolError(Exception):
