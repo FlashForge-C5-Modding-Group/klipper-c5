@@ -117,6 +117,20 @@ class Creator5Toolchanger:
         self.tool_fixture_shift_x = config.getfloat('tool_fixture_shift_x',
                                                     -12.5)
         self.scan_span = config.getfloat('scan_span', 7., above=0.)
+        # Each edge has an independent reach; all default to the stock 7 mm.
+        self.scan_spans = {
+            ('X', 1): config.getfloat('scan_x_plus', self.scan_span,
+                                     above=0., maxval=10.),
+            ('Y', 1): config.getfloat('scan_y_plus', self.scan_span,
+                                     above=0., maxval=10.),
+            ('X', -1): config.getfloat('scan_x_minus', self.scan_span,
+                                      above=0., maxval=10.),
+            ('Y', -1): config.getfloat('scan_y_minus', self.scan_span,
+                                      above=0., maxval=10.),
+        }
+        # Consume the retired setting so older printer configs still load;
+        # it no longer changes negative-Y reach.
+        config.getfloat('negative_y_scan_span', None)
         self.scan_height = config.getfloat('scan_height', None)
         self.reference_scan_height = config.getfloat('reference_scan_height',
                                                      None)
@@ -711,7 +725,10 @@ class Creator5Toolchanger:
             raise gcmd.error('Cannot determine offset calibration Z clearance')
         if current_z > z_max + .001:
             raise gcmd.error('Current Z position exceeds the travel limit')
-        target = min(current_z + self.offset_calibration_lift, z_max)
+        # A short relative lift is not enough when the fixture scan finishes
+        # near Z=2. Clear the nozzle to the dock-safe height before returning.
+        target = min(max(current_z + self.offset_calibration_lift,
+                         self.safe_z), z_max)
         if target > current_z + .001:
             self._move(z=target,
                        feed=self.offset_calibration_lift_speed * 60.)
@@ -848,8 +865,15 @@ class Creator5Toolchanger:
         except Exception:
             self.measurements = measurements
             self.station_x, self.station_y, self.station_z = station
-            self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f Z=%.4f MOVE=0'
-                      % origin)
+            if origin[2] >= .5:
+                self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f Z=%.4f MOVE=0'
+                          % origin)
+            else:
+                # A tool may have been picked up after this snapshot. Never
+                # restore its old zero/near-zero nozzle Z and hide the actual
+                # calibration failure behind the nozzle safety guard.
+                self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f MOVE=0'
+                          % origin[:2])
             raise
 
     def cmd_home_for_print(self, gcmd):
@@ -1067,10 +1091,18 @@ class Creator5Toolchanger:
             self._move(x=cx, y=cy, feed=1200)
             self._move(z=z, feed=600)
             center = cx if axis == 'X' else cy
-            target = center + self.scan_span * direction
-            result = self._estop(axis, target, gcmd)
+            span = self.scan_spans[(axis, direction)]
+            target = center + span * direction
+            try:
+                result = self._estop(axis, target, gcmd)
+            except Exception as exc:
+                raise gcmd.error(
+                    'Levelboard %s%s probe failed: center=%.3f '
+                    'target=%.3f Z=%.3f: %s' %
+                    (axis, '+' if direction > 0 else '-', center,
+                     target, z, exc)) from exc
             distance = (result - center) * direction
-            if not .25 <= distance <= self.scan_span:
+            if not .25 <= distance <= span:
                 raise gcmd.error(
                     'Levelboard %s edge outside scan range: center=%.3f '
                     'target=%.3f contact=%.3f' %
@@ -1293,14 +1325,18 @@ class Creator5Toolchanger:
             raise gcmd.error('Set scan_height or provide SCAN_Z before scanning')
         def calibrate():
             self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
-            if include_z:
-                z = self._calibrate_tool_z(gcmd, tool)
-                actual_scan_height = z + 0.6 if scan_height is None else scan_height
-            else:
-                actual_scan_height = scan_height
-            self._calibrate_tool_xy(gcmd, tool, actual_scan_height)
-            self._apply_offsets(tool)
-            self._lift_after_offset_calibration(gcmd)
+            try:
+                if include_z:
+                    z = self._calibrate_tool_z(gcmd, tool)
+                    actual_scan_height = (z + 0.6 if scan_height is None
+                                          else scan_height)
+                else:
+                    actual_scan_height = scan_height
+                self._calibrate_tool_xy(gcmd, tool, actual_scan_height)
+                self._apply_offsets(tool)
+            finally:
+                # Also clear a failed edge scan before reporting its error.
+                self._lift_after_offset_calibration(gcmd)
         with self._calibration_transaction():
             single = not self._offset_batch_active
             if single:

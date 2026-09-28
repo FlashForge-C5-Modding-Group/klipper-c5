@@ -72,6 +72,10 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.lower_bed_speed = 10.
         self.board.offset_calibration_lift = 3.
         self.board.offset_calibration_lift_speed = 10.
+        self.board.safe_z = 10.
+        self.board.scan_spans = {
+            ('X', 1): 7., ('Y', 1): 7.,
+            ('X', -1): 7., ('Y', -1): 7.}
         self.board._g28_passthrough = False
         self.board._offset_batch_active = False
         self.board.clog_switch = mock.Mock(enabled=True)
@@ -751,6 +755,22 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(self.board._move.call_args_list[2],
                          mock.call(x=29., y=216., feed=1200))
 
+    def test_levelboard_scan_reaches_are_independent(self):
+        self.board.scan_spans = {
+            ('X', 1): 6., ('Y', 1): 7.,
+            ('X', -1): 8., ('Y', -1): 9.}
+        self.board._raise_z = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._estop = mock.Mock(side_effect=[32., 219., 26., 210.])
+
+        self.assertEqual(self.board._scan_xy(GCmd(), 29., 216., 2.),
+                         (29., 214.5))
+        self.assertEqual(self.board._estop.call_args_list, [
+            mock.call('X', 35., mock.ANY),
+            mock.call('Y', 223., mock.ANY),
+            mock.call('X', 21., mock.ANY),
+            mock.call('Y', 207., mock.ANY)])
+
     def test_single_offset_docks_checks_plate_references_then_selects(self):
         self.board.scan_height = None
         self.board._preflight = mock.Mock(side_effect=[
@@ -868,6 +888,21 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._move.assert_called_once_with(z=13., feed=600.)
         self.board._run.assert_called_once_with('M400')
 
+    def test_offset_calibration_lift_clears_fixture_to_safe_z(self):
+        toolhead = mock.Mock()
+        toolhead.get_status.return_value = {
+            'homed_axes': 'xyz', 'axis_maximum': mock.Mock(z=270.)}
+        toolhead.get_position.return_value = [29., 214., 2., 0.]
+        self.board.safe_z = 10.
+        self.board.printer.lookup_object.return_value = toolhead
+        self.board._move = mock.Mock()
+        self.board._run = mock.Mock()
+
+        self.board._lift_after_offset_calibration(GCmd())
+
+        self.board._move.assert_called_once_with(z=10., feed=600.)
+        self.board._run.assert_called_once_with('M400')
+
     def test_offset_calibration_lift_is_bounded_by_z_max(self):
         toolhead = mock.Mock()
         toolhead.get_status.return_value = {
@@ -906,14 +941,16 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._calibrate_tool_z = probe_z
         self.board._calibrate_tool_xy = mock.Mock(
             side_effect=RuntimeError('XY probe failed'))
+        self.board._lift_after_offset_calibration = mock.Mock()
         self.board.configfile = mock.Mock()
         with self.assertRaisesRegex(RuntimeError, 'XY probe failed'):
             self.board.cmd_offset_calibrate(GCmd(
                 BUILDPLATE_REMOVED=1, T=1, Z=1, SAVE=1))
         self.assertEqual(self.board.measurements, original)
+        self.board._lift_after_offset_calibration.assert_called_once()
         self.board.configfile.set.assert_not_called()
         self.board._run.assert_called_with(
-            'SET_GCODE_OFFSET X=0.1000 Y=0.2000 Z=0.3000 MOVE=0')
+            'SET_GCODE_OFFSET X=0.1000 Y=0.2000 MOVE=0')
 
     def test_manual_mount_save_survives_json_reload(self):
         self.board.max_mount_correction = 2.
