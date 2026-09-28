@@ -52,6 +52,17 @@ CANONICAL_TEMPLATE_PROFILES = (
             "6fd03bd00a9ef297188d491b4352deef0721a24b8f1f21373db7363f969e3f0d",
         "space_reclaim": True,
     },
+    {
+        "plaintext":
+            "89e7b26e92d27034a07bb15a9323a2879bc29d5a7d8603984151d28243f8f1f6",
+        "control":
+            "0c62cd01e90ba66860bb2a492a4d94ff7fc8e853087ef67db8196e70192207fb",
+        "installer":
+            "615dc69a86e0f01a6e32688d4bd8615098e236d51cd7c5afdcd99d3113d3f8a8",
+        "control_script":
+            "80e0d5de367aad641b61e105a7242483a484d830d052839bcc48e86d87e9cbb6",
+        "space_reclaim": True,
+    },
 )
 CANONICAL_IAP_SHA256 = (
     "c258bf965a92dad33b15bff616ef3ac72e958618b9cbb059f0a9cd4602c51f68")
