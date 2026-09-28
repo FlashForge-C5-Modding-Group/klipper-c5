@@ -1077,8 +1077,8 @@ class AFCLane:
                 'SET_MAP LANE={} MAP={}'.format(replacement.name, source_map))
             self.set_tool_unloaded()
             self.set_unloaded()
-            replacement.set_tool_loaded(normal_toolchange=True)
             replacement.set_loaded()
+            replacement.set_tool_loaded(normal_toolchange=True)
             self.afc.save_vars()
             self.afc.restore_pos(move_z_first=False)
         except Exception as exc:

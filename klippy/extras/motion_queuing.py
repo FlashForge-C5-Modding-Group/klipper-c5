@@ -8,10 +8,12 @@ import chelper
 
 BGFLUSH_LOW_TIME = 0.200
 BGFLUSH_HIGH_TIME = 0.400
-# The Creator 5 host can briefly stall while parsing dense print files. Keep
-# the same 0.250s generation batch but schedule it farther ahead of the MCUs.
-BGFLUSH_SG_LOW_TIME = 0.850
-BGFLUSH_SG_HIGH_TIME = 1.100
+# The Creator 5's two-core MIPS host can spend over 0.2s in a single dense
+# step-generation flush. Split the former 0.250s batches in half so the
+# reactor can service serial traffic between them. Keep generation ahead of
+# the MCU, without changing the velocity or acceleration of any moves.
+BGFLUSH_SG_LOW_TIME = 1.125
+BGFLUSH_SG_HIGH_TIME = 1.250
 BGFLUSH_EXTRA_TIME = 0.250
 
 MOVE_HISTORY_EXPIRE = 30.
@@ -201,8 +203,12 @@ class PrinterMotionQueuing:
                 want_sg_time = est_print_time + BGFLUSH_SG_HIGH_TIME
                 batch_time = BGFLUSH_SG_HIGH_TIME - BGFLUSH_SG_LOW_TIME
                 next_batch_time = self.last_step_gen_time + batch_time
-                if next_batch_time > est_print_time:
-                    # Improve run-to-run reproducibility by batching from last
+                if next_batch_time > est_print_time - 0.500:
+                    # Also split modest catch-up work after a late reactor
+                    # wakeup. One long catch-up flush delays serial service
+                    # again and can turn a recoverable stall into a TTC.
+                    # A large gap (such as the first flush after idle) still
+                    # fast-forwards in one call instead of looping for ages.
                     if next_batch_time > want_sg_time + 0.005:
                         # Delay flushing until next wakeup
                         next_batch_time = self.last_step_gen_time
