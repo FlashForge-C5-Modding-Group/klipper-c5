@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+from klippy.extras import filament_motion_sensor
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / 'klippy' / 'extras' / 'creator5_toolchanger.py'
@@ -72,9 +73,155 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.offset_calibration_lift = 3.
         self.board.offset_calibration_lift_speed = 10.
         self.board._g28_passthrough = False
+        self.board._offset_batch_active = False
+        self.board.clog_switch = mock.Mock(enabled=True)
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (.1, .2, .3, 0.)}
+
+    def test_wheel_clog_pauses_even_with_infinite_spool_replacement(self):
+        afc = mock.Mock(current='extruder1', in_toolchange=False,
+                        error_state=False)
+        afc.function.is_printing.return_value = True
+        lane = mock.Mock(runout_lane='extruder3')
+        lane.name = 'extruder1'
+        lane.extruder_obj.creator5_tool_index = 1
+        lane.extruder_obj.tool_start_state = True
+        lane._is_normal_printing_state.return_value = True
+        lane.extruder_obj.is_standalone.return_value = True
+        afc.lanes = {'extruder1': lane}
+        self.board.printer.lookup_object.return_value = afc
+        self.board.attached_tool_from_pins = mock.Mock(return_value=1)
+
+        self.board.cmd_wheel_runout(GCmd(TOOL=1))
+
+        lane._perform_infinite_runout.assert_not_called()
+        self.assertIn('clog detected',
+                      afc.error.AFC_error.call_args.args[0])
+
+    def test_wheel_runout_pauses_without_selected_replacement(self):
+        afc = mock.Mock(current='extruder1', in_toolchange=False,
+                        error_state=False)
+        afc.function.is_printing.return_value = True
+        lane = mock.Mock(runout_lane=None)
+        lane.name = 'extruder1'
+        lane.extruder_obj.creator5_tool_index = 1
+        lane.extruder_obj.tool_start_state = True
+        lane._is_normal_printing_state.return_value = True
+        afc.lanes = {'extruder1': lane}
+        self.board.printer.lookup_object.return_value = afc
+        self.board.attached_tool_from_pins = mock.Mock(return_value=1)
+
+        self.board.cmd_wheel_runout(GCmd(TOOL=1))
+
+        afc.error.AFC_error.assert_called_once()
+        lane._perform_infinite_runout.assert_not_called()
+
+    def test_inactive_wheel_cannot_interrupt_current_tool(self):
+        afc = mock.Mock(current='extruder1', in_toolchange=False,
+                        error_state=False)
+        afc.function.is_printing.return_value = True
+        lane = mock.Mock(runout_lane='extruder3')
+        lane.name = 'extruder2'
+        afc.lanes = {'extruder2': lane}
+        self.board.printer.lookup_object.return_value = afc
+        self.board.attached_tool_from_pins = mock.Mock(return_value=1)
+
+        self.board.cmd_wheel_runout(GCmd(TOOL=2))
+
+        lane._perform_infinite_runout.assert_not_called()
+        afc.error.AFC_error.assert_not_called()
+
+    def test_wheel_failure_with_absent_filament_defers_to_afc_runout(self):
+        afc = mock.Mock(current='extruder1', in_toolchange=False,
+                        error_state=False)
+        afc.function.is_printing.return_value = True
+        lane = mock.Mock(runout_lane='extruder3')
+        lane.name = 'extruder1'
+        lane.extruder_obj.creator5_tool_index = 1
+        lane.extruder_obj.tool_start_state = False
+        lane._is_normal_printing_state.return_value = True
+        afc.lanes = {'extruder1': lane}
+        self.board.printer.lookup_object.return_value = afc
+        self.board.attached_tool_from_pins = mock.Mock(return_value=1)
+
+        self.board.cmd_wheel_runout(GCmd(TOOL=1))
+
+        afc.error.AFC_error.assert_not_called()
+        lane._perform_infinite_runout.assert_not_called()
+
+    def test_clog_detection_off_ignores_wheel_failure(self):
+        self.board.clog_switch.enabled = False
+        self.board.printer.lookup_object = mock.Mock()
+
+        self.board.cmd_wheel_runout(GCmd(TOOL=1))
+
+        self.board.printer.lookup_object.assert_not_called()
+
+    def test_clog_arms_only_selected_wheel_and_resets_threshold(self):
+        sensors = [mock.Mock() for _ in range(4)]
+        for sensor in sensors:
+            sensor.runout_helper.sensor_enabled = True
+        self.board.printer.lookup_object.side_effect = (
+            lambda name: sensors[int(name[-1])])
+
+        self.board._sync_clog_sensors(2)
+
+        self.assertEqual([sensor.runout_helper.sensor_enabled
+                          for sensor in sensors], [False, False, True, False])
+        sensors[2]._update_filament_runout_pos.assert_called_once_with()
+        self.assertTrue(sensors[2].runout_helper.filament_present)
+        self.board.clog_switch.enabled = False
+        self.board._sync_clog_sensors(2)
+        self.assertFalse(any(sensor.runout_helper.sensor_enabled
+                             for sensor in sensors))
+
+    def test_clog_misc_switch_persists_and_resyncs_sensors(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        printer.lookup_object.return_value = mock.Mock(
+            allVariables={'c5_clog_detection': 1})
+        on_change = mock.Mock()
+        switch = MODULE.Creator5MiscSwitch(
+            printer, gcode, 'clog_detection', False, on_change)
+        switch._handle_ready()
+        self.assertTrue(switch.enabled)
+        on_change.assert_called_once_with()
+        switch.cmd_set(GCmd(ENABLE=0))
+        self.assertFalse(switch.enabled)
+        self.assertEqual(on_change.call_count, 2)
+        gcode.run_script_from_command.assert_called_once_with(
+            'SAVE_VARIABLE VARIABLE=c5_clog_detection VALUE=0')
+
+    def test_reset_filament_sensor_does_not_emit_insert_event(self):
+        sensor = filament_motion_sensor.EncoderSensor.__new__(
+            filament_motion_sensor.EncoderSensor)
+        sensor.extruder = mock.Mock()
+        sensor._update_filament_runout_pos = mock.Mock()
+        sensor.runout_helper = mock.Mock(filament_present=False)
+
+        sensor.cmd_RESET_FILAMENT_SENSOR(GCmd())
+
+        sensor._update_filament_runout_pos.assert_called_once_with()
+        self.assertTrue(sensor.runout_helper.filament_present)
+        sensor.runout_helper.note_filament_present.assert_not_called()
+
+    def test_wheel_runout_pauses_if_mount_state_is_invalid(self):
+        afc = mock.Mock(current='extruder1', in_toolchange=False,
+                        error_state=False)
+        afc.function.is_printing.return_value = True
+        lane = mock.Mock(runout_lane='extruder3')
+        lane.name = 'extruder1'
+        lane.extruder_obj.creator5_tool_index = 1
+        lane._is_normal_printing_state.return_value = True
+        afc.lanes = {'extruder1': lane}
+        self.board.printer.lookup_object.return_value = afc
+        self.board.attached_tool_from_pins = mock.Mock(
+            side_effect=RuntimeError('grab switch conflict'))
+
+        self.board.cmd_wheel_runout(GCmd(TOOL=1))
+
+        afc.error.AFC_error.assert_called_once()
+        lane._perform_infinite_runout.assert_not_called()
 
     def test_flow_calibration_misc_switch_controls_live_state(self):
         printer, gcode = mock.Mock(), mock.Mock()
@@ -586,8 +733,106 @@ class Creator5OffsetTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Remove the build plate'):
             self.board.cmd_offset_calibrate(GCmd(T=0))
 
+    def test_levelboard_xy_scan_starts_at_center_and_probes_outward(self):
+        self.board.scan_span = 7.
+        self.board._raise_z = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._estop = mock.Mock(side_effect=[32., 219., 26., 213.])
+
+        self.assertEqual(self.board._scan_xy(GCmd(), 29., 216., 2.),
+                         (29., 216.))
+        self.assertEqual(self.board._estop.call_args_list, [
+            mock.call('X', 36., mock.ANY),
+            mock.call('Y', 223., mock.ANY),
+            mock.call('X', 22., mock.ANY),
+            mock.call('Y', 209., mock.ANY)])
+        self.assertEqual(self.board._move.call_args_list[0],
+                         mock.call(x=29., y=216., feed=1200))
+        self.assertEqual(self.board._move.call_args_list[2],
+                         mock.call(x=29., y=216., feed=1200))
+
+    def test_single_offset_docks_checks_plate_references_then_selects(self):
+        self.board.scan_height = None
+        self.board._preflight = mock.Mock(side_effect=[
+            ([], [], 1), ([], [], 1)])
+        steps = []
+        self.board._dock_for_offset_reference = (
+            lambda gcmd, attached: steps.append(('dock', attached)))
+        self.board._calibrate_offset_reference = (
+            lambda gcmd, levelboard=True:
+                steps.append(('plate-and-reference', levelboard)))
+        def run(command):
+            steps.append(command)
+        self.board._run = run
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._calibrate_tool_z = lambda gcmd, tool: (
+            steps.append(('z', tool)) or 1.3)
+        self.board._calibrate_tool_xy = lambda gcmd, tool, height: (
+            steps.append(('xy', tool, height)))
+        self.board._apply_offsets = lambda tool: steps.append(('apply', tool))
+        self.board._lift_after_offset_calibration = (
+            lambda gcmd: steps.append('lift'))
+        self.board.printer.lookup_object.side_effect = None
+        self.board.printer.lookup_object.return_value = mock.Mock(
+            get_status=mock.Mock(return_value={
+                'homing_origin': (.1, .2, .3, 0.), 'state': 'standby'}))
+
+        self.board.cmd_offset_calibrate(GCmd(
+            BUILDPLATE_REMOVED=1, T=1, Z=1, SAVE=0))
+
+        self.assertEqual(steps[:3], [
+            ('dock', 1), ('plate-and-reference', 1),
+            'AFC_SELECT_TOOL TOOL=extruder1'])
+        self.assertEqual(steps[4:6], [('z', 1), ('xy', 1, 1.9)])
+        self.assertIsNone(self.board._stock_pin_approach_z)
+
+    def test_single_offset_plate_check_failure_prevents_pickup_and_fixture(self):
+        self.board.scan_height = None
+        self.board._preflight = mock.Mock(return_value=([], [], None))
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._check_plate_removed = mock.Mock(
+            side_effect=RuntimeError('Build plate may still be installed'))
+        self.board._probe_fixture_z = mock.Mock()
+        self.board._run = mock.Mock()
+        self.board.printer.lookup_object.return_value.get_status.return_value = {
+            'homing_origin': (.1, .2, .3, 0.), 'state': 'standby'}
+
+        with self.assertRaisesRegex(RuntimeError, 'Build plate may'):
+            self.board.cmd_offset_calibrate(GCmd(
+                BUILDPLATE_REMOVED=1, T=0, Z=1, SAVE=0))
+
+        self.board._check_plate_removed.assert_called_once()
+        self.board._probe_fixture_z.assert_not_called()
+        self.assertFalse(any('AFC_SELECT_TOOL' in call.args[0]
+                             for call in self.board._run.call_args_list))
+
+    def test_single_reference_uses_stock_pin_before_levelboard(self):
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._check_plate_removed = mock.Mock(return_value=1.25)
+        self.board._run = mock.Mock()
+
+        self.board._calibrate_offset_reference(GCmd())
+
+        self.board._check_plate_removed.assert_called_once()
+        self.assertEqual(self.board._stock_pin_approach_z, -3.75)
+        self.board._run.assert_called_once_with(
+            'C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
+            'BUILDPLATE_REMOVED=1')
+
+    def test_single_reference_can_skip_levelboard_but_not_plate_check(self):
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._check_plate_removed = mock.Mock(return_value=1.25)
+        self.board._run = mock.Mock()
+
+        self.board._calibrate_offset_reference(GCmd(), levelboard=0)
+
+        self.board._check_plate_removed.assert_called_once()
+        self.board._run.assert_not_called()
+        self.assertEqual(self.board._stock_pin_approach_z, -3.75)
+
     def test_automatic_z_precedes_xy_and_sets_scan_height(self):
         calls = []
+        self.board._offset_batch_active = True
         self.board.scan_height = None
         self.board._preflight = lambda command: ([], [], 1)
         self.board._with_motion = lambda command, operation: operation()
@@ -649,6 +894,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._move.assert_not_called()
 
     def test_xy_failure_restores_measurements_and_runtime_offsets(self):
+        self.board._offset_batch_active = True
         self.board.scan_height = None
         self.board._preflight = lambda command: ([], [], 1)
         self.board._with_motion = lambda command, operation: operation()
@@ -1101,13 +1347,23 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertFalse(any('AFC_SELECT_TOOL' in c.args[0]
                              for c in self.board._run.call_args_list))
 
-    def test_stock_pin_never_probes_with_head_attached(self):
-        self.board._preflight = mock.Mock(return_value=([], [], 2))
-        self.board._probe_stock_pin = mock.Mock()
-        with self.assertRaisesRegex(RuntimeError, 'Dock the mounted head'):
-            self.board.cmd_calibrate_all_offsets(GCmd(BUILDPLATE_REMOVED=1,
-                                                       SAVE=0))
-        self.board._probe_stock_pin.assert_not_called()
+    def test_all_offsets_docks_attached_head_before_stock_pin_check(self):
+        self.board._preflight = mock.Mock(side_effect=[
+            ([], [], 2), ([], [], None)])
+        self.board._raise_z = mock.Mock()
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._run = mock.Mock()
+        self.board._check_plate_removed = mock.Mock(return_value=0.)
+        self.board.cmd_calibrate_all_offsets(GCmd(BUILDPLATE_REMOVED=1,
+                                                   SAVE=0))
+        self.board._run.assert_any_call('C5_TOOL_DOCK')
+        self.board._raise_z.assert_called_once_with()
+        self.board._check_plate_removed.assert_called_once()
+        self.assertLess(self.board._run.call_args_list.index(
+            mock.call('C5_TOOL_DOCK')),
+            self.board._run.call_args_list.index(
+                mock.call('C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
+                          'BUILDPLATE_REMOVED=1')))
 
     def test_stock_pin_approach_never_exceeds_configured_probe_floor(self):
         self.board.safe_z = 10.

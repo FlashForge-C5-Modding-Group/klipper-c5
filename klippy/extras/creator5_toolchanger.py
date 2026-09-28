@@ -31,12 +31,13 @@ class Creator5MiscSwitch:
 
     This is a setting, never a real filament sensor or a runout source.
     """
-    def __init__(self, printer, gcode, name, enabled):
+    def __init__(self, printer, gcode, name, enabled, on_change=None):
         self.printer = printer
         self.gcode = gcode
         self.name = name
         self.saved_key = 'c5_' + name
         self.enabled = bool(enabled)
+        self.on_change = on_change
         printer.add_object('filament_switch_sensor ' + name, self)
         printer.register_event_handler('klippy:ready', self._handle_ready)
         gcode.register_mux_command('SET_FILAMENT_SENSOR', 'SENSOR',
@@ -50,6 +51,8 @@ class Creator5MiscSwitch:
             value = saved.allVariables.get(self.saved_key)
             if value in (0, 1):
                 self.enabled = bool(value)
+        if self.on_change is not None:
+            self.on_change()
 
     def set_enabled(self, enabled):
         enabled = bool(enabled)
@@ -60,6 +63,8 @@ class Creator5MiscSwitch:
                 'SAVE_VARIABLE VARIABLE=%s VALUE=%d'
                 % (self.saved_key, int(enabled)))
         self.enabled = enabled
+        if self.on_change is not None:
+            self.on_change()
 
     def get_status(self, eventtime):
         return {'enabled': self.enabled, 'filament_detected': self.enabled}
@@ -123,6 +128,7 @@ class Creator5Toolchanger:
         self.plate_check_min_delta = config.getfloat(
             'plate_check_min_delta', .8, above=0.)
         self._stock_pin_approach_z = None
+        self._offset_batch_active = False
         self.safe_z = config.getfloat('safe_z', 10., above=0.)
         self.offset_calibration_lift = config.getfloat(
             'offset_calibration_lift', 3., above=0.)
@@ -221,6 +227,10 @@ class Creator5Toolchanger:
         self.purge_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge',
             config.getboolean('purge_default', True))
+        self.clog_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'clog_detection',
+            config.getboolean('clog_detection_default', False),
+            self._sync_clog_sensors)
         self.lower_bed_on_end_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'lower_bed_on_end',
             config.getboolean('lower_bed_on_end_default', False))
@@ -228,6 +238,8 @@ class Creator5Toolchanger:
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),
             ('C5_TOOL_DOCK', self.cmd_dock),
+            ('C5_WHEEL_RUNOUT', self.cmd_wheel_runout),
+            ('C5_WHEEL_CLOG', self.cmd_wheel_runout),
             ('C5_TOOL_PURGE', self.cmd_purge),
             ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
@@ -908,6 +920,63 @@ class Creator5Toolchanger:
             ''.join('1' if v else '0' for v in dock),
             ''.join('1' if v else '0' for v in grab)))
 
+    def cmd_wheel_runout(self, gcmd):
+        """The stock fm_exN wheel failure is a clog, not spool runout."""
+        if not self.clog_switch.enabled:
+            return
+        tool = gcmd.get_int('TOOL', minval=0, maxval=3)
+        afc = self.printer.lookup_object('AFC')
+        if (not afc.function.is_printing() or afc.in_toolchange
+                or afc.error_state):
+            return
+        name = 'extruder' if tool == 0 else 'extruder%d' % tool
+        lane = afc.lanes.get(name)
+        if lane is None or afc.current is None:
+            afc.error.AFC_error('T%d wheel failure: AFC active lane is unknown'
+                                % tool)
+            return
+        if afc.current != lane.name:
+            # A docked tool is not the printing tool. Its encoder must not
+            # interrupt the active head or cause an unrelated tool swap.
+            return
+        try:
+            attached = self.attached_tool_from_pins()
+        except Exception as exc:
+            afc.error.AFC_error('T%d wheel failure: mount sensors invalid: %s'
+                                % (tool, exc))
+            return
+        if (attached != tool or lane.extruder_obj.creator5_tool_index != tool
+                or not lane._is_normal_printing_state()):
+            afc.error.AFC_error(
+                'T%d wheel failure: active tool state is inconsistent; '
+                'print paused' % tool)
+            return
+        if not lane.extruder_obj.tool_start_state:
+            # The separate presence switch owns runout and infinite spool.
+            # Its callback may be racing this encoder event.
+            return
+        afc.error.AFC_error(
+            'E0163: Paused. T%d clog detected: filament is present but the '
+            'wheel stopped moving. Clear the filament path before resuming.'
+            % tool)
+
+    def _sync_clog_sensors(self, tool=None):
+        # firmwareExe disables all four wheels, then resets and enables only
+        # the selected wheel. Do this directly without its three-second wait.
+        if tool is None:
+            tool = self.active
+        for index in range(4):
+            sensor = self.printer.lookup_object(
+                'filament_motion_sensor fm_ex%d' % index)
+            sensor.runout_helper.sensor_enabled = False
+        if not self.clog_switch.enabled or tool is None:
+            return
+        sensor = self.printer.lookup_object(
+            'filament_motion_sensor fm_ex%d' % tool)
+        sensor._update_filament_runout_pos()
+        sensor.runout_helper.filament_present = True
+        sensor.runout_helper.sensor_enabled = True
+
     def cmd_select(self, gcmd):
         tool = gcmd.get_int('T', minval=0, maxval=3)
         # The touchscreen may have saved a new per-tool Z value since Klippy
@@ -924,6 +993,7 @@ class Creator5Toolchanger:
                 self._run('SET_VELOCITY_LIMIT ACCEL=%.0f'
                           % self.post_select_accel)
             self.active = tool
+            self._sync_clog_sensors(tool)
             gcmd.respond_info('T%d is already attached' % tool)
             return
         dock, attached, z_homed = self._prepare_tool_motion(gcmd)
@@ -935,6 +1005,7 @@ class Creator5Toolchanger:
             self._pickup(gcmd, tool, raise_z=z_homed)
         self._with_motion(gcmd, change,
                           final_accel=self.post_select_accel)
+        self._sync_clog_sensors(tool)
 
     def cmd_dock(self, gcmd):
         dock, grab, attached = self._preflight(gcmd, axes='')
@@ -942,6 +1013,7 @@ class Creator5Toolchanger:
             dock, attached, z_homed = self._prepare_tool_motion(gcmd)
             self._with_motion(gcmd, lambda: self._dock(
                 gcmd, attached, raise_z=z_homed))
+            self._sync_clog_sensors()
 
     def cmd_mount_coords(self, gcmd):
         for i, (x, y) in enumerate(self.docks):
@@ -989,16 +1061,20 @@ class Creator5Toolchanger:
         for axis, direction in (('X', 1), ('Y', 1),
                                 ('X', -1), ('Y', -1)):
             self._raise_z()
-            start_x = cx + (self.scan_span * direction if axis == 'X' else 0.)
-            start_y = cy + (self.scan_span * direction if axis == 'Y' else 0.)
-            self._move(x=start_x, y=start_y, feed=1200)
+            # Stock calibrationPoint() starts at the cylinder center and
+            # probes outward by 7 mm in each direction. Starting at an edge
+            # can miss the target and produced off-fixture travel here.
+            self._move(x=cx, y=cy, feed=1200)
             self._move(z=z, feed=600)
-            start = start_x if axis == 'X' else start_y
-            result = self._estop(axis, start - 2. * self.scan_span * direction,
-                                 gcmd)
             center = cx if axis == 'X' else cy
-            if abs(result - center) > self.scan_span:
-                raise gcmd.error('Levelboard %s edge outside scan range' % axis)
+            target = center + self.scan_span * direction
+            result = self._estop(axis, target, gcmd)
+            distance = (result - center) * direction
+            if not .25 <= distance <= self.scan_span:
+                raise gcmd.error(
+                    'Levelboard %s edge outside scan range: center=%.3f '
+                    'target=%.3f contact=%.3f' %
+                    (axis, center, target, result))
             points.append(result)
         self._raise_z()
         if (abs(points[0] - points[2]) < 0.25
@@ -1136,13 +1212,38 @@ class Creator5Toolchanger:
             self.configfile.set(self.section, 'station_z',
                                 '%.4f' % self.station_z)
 
+    def _dock_for_offset_reference(self, gcmd, attached):
+        if attached is None:
+            return
+        # The stock probe needs a bare carriage. Clear the attached nozzle
+        # to safe_z (10 mm in the Creator 5 config) before either dock path.
+        self._raise_z()
+        # Keep AFC's logical tool state aligned when it owns the attached
+        # head. A recovered head with no AFC selection can dock directly.
+        afc = self.printer.lookup_object('AFC', None)
+        name = 'extruder' if attached == 0 else 'extruder%d' % attached
+        self._run('AFC_UNSELECT_TOOL' if afc is not None and
+                  afc.current == name else 'C5_TOOL_DOCK')
+        _, _, still_attached = self._preflight(gcmd)
+        if still_attached is not None:
+            raise gcmd.error('Dock T%d before loadcell reference' % attached)
+
+    def _calibrate_offset_reference(self, gcmd, levelboard=True):
+        # This ordinary stock probe check also verifies that the plate was
+        # removed. It must precede any levelboard contact, for a single head
+        # just as it does for a full four-head calibration.
+        pin_z = self._with_motion(gcmd,
+                                  lambda: self._check_plate_removed(gcmd))
+        self._stock_pin_approach_z = pin_z - 5.
+        if levelboard:
+            self._run('C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
+                      'BUILDPLATE_REMOVED=1')
+
     def cmd_calibrate_all_offsets(self, gcmd):
         if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
             raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
         save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
         _, _, attached = self._preflight(gcmd)
-        if attached is not None:
-            raise gcmd.error('Dock the mounted head before the stock pin check')
         stats = self.printer.lookup_object('print_stats', None)
         if stats is not None and stats.get_status(
                 self.printer.get_reactor().monotonic()).get('state') in (
@@ -1153,13 +1254,10 @@ class Creator5Toolchanger:
         # authoritative set loaded at startup, and a later failure must leave
         # neither a partial runtime set nor partial pending config values.
         with self._calibration_transaction():
-            # Stock firmware uses the ordinary eboard probe first. Its Z
-            # reference bounds the following levelboard contact approach.
-            pin_z = self._with_motion(gcmd, lambda: self._check_plate_removed(gcmd))
-            self._stock_pin_approach_z = pin_z - 5.
+            self._dock_for_offset_reference(gcmd, attached)
             try:
-                self._run('C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
-                          'BUILDPLATE_REMOVED=1')
+                self._calibrate_offset_reference(gcmd)
+                self._offset_batch_active = True
                 for tool in range(4):
                     heater = 'extruder' if tool == 0 else 'extruder%d' % tool
                     self._run('AFC_SELECT_TOOL TOOL=%s' % heater)
@@ -1169,6 +1267,7 @@ class Creator5Toolchanger:
                 if save:
                     self.cmd_save_offsets_json(gcmd)
             finally:
+                self._offset_batch_active = False
                 self._stock_pin_approach_z = None
 
     def cmd_check_load_tool(self, gcmd):
@@ -1186,14 +1285,12 @@ class Creator5Toolchanger:
             raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
         tool = gcmd.get_int('T', minval=0, maxval=3)
         include_z = gcmd.get_int('Z', 0, minval=0, maxval=1)
+        levelboard = gcmd.get_int('LEVELBOARD', 1, minval=0, maxval=1)
         scan_height = gcmd.get_float('SCAN_Z', self.scan_height)
         if scan_height is not None and not math.isfinite(scan_height):
             raise gcmd.error('SCAN_Z must be finite')
         if scan_height is None and not include_z:
             raise gcmd.error('Set scan_height or provide SCAN_Z before scanning')
-        dock, grab, attached = self._preflight(gcmd)
-        if attached != tool:
-            raise gcmd.error('Attach T%d before offset calibration' % tool)
         def calibrate():
             self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
             if include_z:
@@ -1205,7 +1302,27 @@ class Creator5Toolchanger:
             self._apply_offsets(tool)
             self._lift_after_offset_calibration(gcmd)
         with self._calibration_transaction():
-            self._with_motion(gcmd, calibrate)
+            single = not self._offset_batch_active
+            if single:
+                _, _, attached = self._preflight(gcmd)
+                stats = self.printer.lookup_object('print_stats', None)
+                if stats is not None and stats.get_status(
+                        self.printer.get_reactor().monotonic()).get('state') in (
+                            'printing', 'paused'):
+                    raise gcmd.error('Finish or cancel the print before calibration')
+                self._dock_for_offset_reference(gcmd, attached)
+            try:
+                if single:
+                    self._calibrate_offset_reference(gcmd, levelboard=levelboard)
+                    heater = 'extruder' if tool == 0 else 'extruder%d' % tool
+                    self._run('AFC_SELECT_TOOL TOOL=%s' % heater)
+                _, _, attached = self._preflight(gcmd)
+                if attached != tool:
+                    raise gcmd.error('Attach T%d before offset calibration' % tool)
+                self._with_motion(gcmd, calibrate)
+            finally:
+                if single:
+                    self._stock_pin_approach_z = None
         if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
             axes = 'xyz' if include_z else 'xy'
             for axis, value in zip(axes, self.measurements[tool]):

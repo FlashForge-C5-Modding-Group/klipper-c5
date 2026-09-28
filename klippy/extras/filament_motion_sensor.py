@@ -36,6 +36,17 @@ class EncoderSensor:
                 self._handle_not_printing)
         self.printer.register_event_handler('idle_timeout:idle',
                 self._handle_not_printing)
+        gcode = self.printer.lookup_object('gcode')
+        gcode.register_mux_command('RESET_FILAMENT_SENSOR', 'SENSOR',
+                config.get_name().split()[-1], self.cmd_RESET_FILAMENT_SENSOR)
+    def cmd_RESET_FILAMENT_SENSOR(self, gcmd):
+        # Match the stock touchscreen's reset before monitoring a newly
+        # selected tool.  Do not inherit the previous tool's extrusion count.
+        if self.extruder is None:
+            raise gcmd.error('Filament motion sensor is not ready')
+        self._update_filament_runout_pos()
+        # Reset silently: a tool change is not a physical insert event.
+        self.runout_helper.filament_present = True
     def _update_filament_runout_pos(self, eventtime=None):
         if eventtime is None:
             eventtime = self.reactor.monotonic()
@@ -61,6 +72,8 @@ class EncoderSensor:
         print_time = self.estimated_print_time(eventtime)
         return self.extruder.find_past_position(print_time)
     def _extruder_pos_update_event(self, eventtime):
+        if not self.runout_helper.sensor_enabled:
+            return eventtime + CHECK_RUNOUT_TIMEOUT
         extruder_pos = self._get_extruder_pos(eventtime)
         # Check for filament runout
         self.runout_helper.note_filament_present(eventtime,
