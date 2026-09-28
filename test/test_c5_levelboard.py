@@ -13,12 +13,13 @@ COMMON = ["gcc", "-std=gnu11", "-O0", "-Wall", "-Wextra", "-Werror"]
 
 
 class C5LevelBoardSafetyTest(unittest.TestCase):
-    def compile_and_run(self, source, name, include_dirs):
+    def compile_and_run(self, source, name, include_dirs, extra_flags=()):
         with tempfile.TemporaryDirectory() as temp:
             executable = pathlib.Path(temp) / name
             command = COMMON[:]
             for include_dir in include_dirs:
                 command.extend(["-I", include_dir])
+            command.extend(extra_flags)
             command.extend([source, "-o", str(executable)])
             compile_result = subprocess.run(
                 command, cwd=ROOT, text=True, capture_output=True)
@@ -43,6 +44,12 @@ class C5LevelBoardSafetyTest(unittest.TestCase):
         self.compile_and_run(
             "test/n32g430_register_model.c", "n32g430_register_model",
             ["test", "test/c5_levelboard_stubs", "src", "src/stm32"])
+
+    def test_virtual_endstop_does_not_pull_up_boot0(self):
+        self.compile_and_run(
+            "test/c5_virtual_endstop.c", "c5_levelboard_virtual_endstop",
+            ["test/c5_virtual_endstop_stubs", "src"],
+            ["-DTEST_LEVELBOARD=1"])
 
 
 if __name__ == "__main__":

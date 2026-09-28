@@ -99,6 +99,12 @@ endstop_oversample_event(struct timer *t)
 static struct gpio_in
 c5_endstop_setup(uint32_t pin, int32_t pull_up)
 {
+#if CONFIG_C5_LEVELBOARD
+    // PD0 is only a virtual eddy endstop. It is also BOOT0, so configuring
+    // the requested input pull-up would select the ROM bootloader on reset.
+    if (pin == GPIO('D', 0))
+        return (struct gpio_in) { .regs=GPIOD, .bit=GPIO2BIT(pin) };
+#endif
 #if CONFIG_C5_EBOARD
     if (pin == GPIO('G', 0))
         return (struct gpio_in) { .regs=GPIOG, .bit=GPIO2BIT(pin) };

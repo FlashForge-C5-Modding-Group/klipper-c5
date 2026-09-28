@@ -29,7 +29,7 @@ static const uint16_t digital_pin_masks[] = {
 int
 gpio_regs_to_pin(GPIO_TypeDef *regs, uint32_t bit)
 {
-    int i;
+    uint32_t i;
     for (i=0; i<ARRAY_SIZE(digital_regs); i++)
         if (digital_regs[i] == regs)
             return GPIO('A' + i, ffs(bit)-1);

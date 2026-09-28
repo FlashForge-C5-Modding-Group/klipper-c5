@@ -4,14 +4,19 @@
 #include <stdio.h>
 #include <string.h>
 
-#define CONFIG_C5_EBOARD 1
+#ifndef TEST_LEVELBOARD
+#define TEST_LEVELBOARD 0
+#endif
+
+#define CONFIG_C5_EBOARD (!TEST_LEVELBOARD)
 #define CONFIG_C5_HEATERBOARD 0
-#define CONFIG_C5_LEVELBOARD 0
-#define CONFIG_MACH_N32G430 0
-#define CONFIG_MACH_N32G45x 1
+#define CONFIG_C5_LEVELBOARD TEST_LEVELBOARD
+#define CONFIG_MACH_N32G430 TEST_LEVELBOARD
+#define CONFIG_MACH_N32G45x (!TEST_LEVELBOARD)
 
 #define __BASECMD_H
 #define __C5_EBOARD_H
+#define __C5_LEVELBOARD_H
 #define __COMMAND_H
 #define __SCHED_H
 #define __STM32_GPIO_H
@@ -108,6 +113,9 @@ struct trsync *trsync_oid_lookup(uint8_t oid);
 void trsync_do_trigger(struct trsync *ts, uint8_t reason);
 uint8_t c5_eboard_eddy_state(void);
 void c5_eboard_arm(void);
+uint8_t c5_levelboard_eddy_state(void);
+void c5_levelboard_cancel(void);
+void c5_levelboard_recover(void);
 void gpio_clock_enable(GPIO_TypeDef *regs);
 void gpio_peripheral(uint32_t pin, uint32_t mode, int pull_up);
 irqstatus_t irq_save(void);
@@ -121,7 +129,15 @@ struct gpio_in gpio_in_setup(uint32_t pin, int32_t pull_up);
 void gpio_in_reset(struct gpio_in gpio, int32_t pull_up);
 uint8_t gpio_in_read(struct gpio_in gpio);
 
+#if TEST_LEVELBOARD
+#include "../src/stm32/n32g430f8s7_gpio.c"
+#define VIRTUAL_PIN GPIO('D', 0)
+#define VIRTUAL_REGS GPIOD
+#else
 #include "../src/stm32/n32g455_gpio.c"
+#define VIRTUAL_PIN GPIO('G', 0)
+#define VIRTUAL_REGS GPIOG
+#endif
 #include "../src/stm32/gpio.c"
 #include "../src/c5_endstop.c"
 
@@ -174,6 +190,14 @@ c5_eboard_eddy_state(void)
 }
 
 void c5_eboard_arm(void) { }
+uint8_t
+c5_levelboard_eddy_state(void)
+{
+    getter_count++;
+    return 0;
+}
+void c5_levelboard_cancel(void) { }
+void c5_levelboard_recover(void) { }
 void gpio_clock_enable(GPIO_TypeDef *regs) { (void)regs; }
 
 void
@@ -194,6 +218,7 @@ input_setup_rejected(uint32_t pin)
     return 0;
 }
 
+#if !TEST_LEVELBOARD
 static int
 output_setup_rejected(uint32_t pin)
 {
@@ -202,6 +227,7 @@ output_setup_rejected(uint32_t pin)
     (void)gpio_out_setup(pin, 0);
     return 0;
 }
+#endif
 
 static int
 expect(int condition, const char *message)
@@ -216,33 +242,38 @@ int
 main(void)
 {
     int failures = 0;
-    uint32_t args[] = { 1, GPIO('G', 0), 1 };
+    uint32_t args[] = { 1, VIRTUAL_PIN, 1 };
 
     if (setjmp(shutdown_jump)) {
-        fprintf(stderr, "config_endstop rejected virtual PG0\n");
+        fprintf(stderr, "config_endstop rejected virtual pin\n");
         return 1;
     }
     command_config_endstop(args);
     struct endstop *endstop = (struct endstop *)oid_storage.bytes;
-    failures += expect(endstop->pin.regs == GPIOG,
-                       "PG0 virtual handle has wrong register identity");
-    failures += expect(endstop->pin.bit == GPIO2BIT(GPIO('G', 0)),
-                       "PG0 virtual handle has wrong bit identity");
+    failures += expect(endstop->pin.regs == VIRTUAL_REGS,
+                       "virtual handle has wrong register identity");
+    failures += expect(endstop->pin.bit == GPIO2BIT(VIRTUAL_PIN),
+                       "virtual handle has wrong bit identity");
     failures += expect(physical_config_count == 0,
-                       "PG0 endstop configured physical GPIO hardware");
+                       "virtual endstop configured physical GPIO hardware");
 
-    GPIOG->IDR = GPIO2BIT(GPIO('G', 0));
+    VIRTUAL_REGS->IDR = GPIO2BIT(VIRTUAL_PIN);
     failures += expect(c5_endstop_read(endstop->pin) == 0,
-                       "PG0 did not use fail-safe eBoard getter");
+                       "virtual pin did not use fail-safe eddy getter");
     failures += expect(getter_count == 1,
-                       "PG0 did not call eBoard getter exactly once");
+                       "virtual pin did not call eddy getter exactly once");
 
+#if TEST_LEVELBOARD
+    failures += expect(input_setup_rejected(GPIO('D', 1)),
+                       "generic input setup accepted unbonded PD1");
+#else
     failures += expect(input_setup_rejected(GPIO('G', 0)),
                        "generic input setup accepted PG0");
     failures += expect(output_setup_rejected(GPIO('G', 0)),
                        "generic output setup accepted PG0");
     failures += expect(input_setup_rejected(GPIO('G', 1)),
                        "generic input setup accepted unbonded PG1");
+#endif
     failures += expect(input_setup_rejected(GPIO('C', 0)),
                        "generic input setup accepted unbonded PC0");
 
