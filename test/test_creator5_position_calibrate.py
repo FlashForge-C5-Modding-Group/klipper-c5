@@ -53,6 +53,9 @@ class PositionCalibrationTest(unittest.TestCase):
                 'hd_home X': x_home, 'hd_home Y': y_home}.get(name, default))
         self.board.max_mount_correction = 2.
         self.board.sensor_settle_ms = 0
+        self.board.pickup_latch_wait_ms = 0
+        self.board.pullback_slow_distance = 20.
+        self.board.pullback_speed = 80.
         self.board.dock_buttons = ['dock%d' % i for i in range(4)]
         self.board.grab_buttons = ['grab%d' % i for i in range(4)]
         sensor = {'dock0': True, 'grab0': True}
@@ -62,7 +65,7 @@ class PositionCalibrationTest(unittest.TestCase):
 
         def move(**kwargs):
             commands.append(kwargs)
-            if kwargs.get('x') == 290.:
+            if kwargs.get('x') == 275.:
                 sensor['dock0'] = False
 
         self.board._move = move

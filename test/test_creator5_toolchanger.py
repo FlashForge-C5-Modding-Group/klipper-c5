@@ -1454,6 +1454,33 @@ class Creator5OffsetTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Active hotend'):
             self.board.cmd_check_load_tool(GCmd(T=1))
 
+    def test_status_reports_conflict_instead_of_erroring(self):
+        self.board.dock_buttons = ['dock%d' % i for i in range(4)]
+        self.board.grab_buttons = ['grab%d' % i for i in range(4)]
+        # T1 shows both sensors active at once - exactly the case the old
+        # implementation refused to report anything for.
+        sensor = {'dock1': True, 'grab1': True}
+        self.board._button = lambda name, gcmd: sensor.get(name, False)
+        gcmd = GCmd()
+
+        self.board.cmd_status(gcmd)
+
+        self.assertEqual(gcmd.messages,
+                         ['attached=conflict(T1) dock=0100 grab=0100'])
+
+    def test_status_reports_attached_tool_normally(self):
+        self.board.dock_buttons = ['dock%d' % i for i in range(4)]
+        self.board.grab_buttons = ['grab%d' % i for i in range(4)]
+        sensor = {'dock0': True, 'dock2': True, 'dock3': True, 'grab1': True}
+        self.board._button = lambda name, gcmd: sensor.get(name, False)
+        gcmd = GCmd()
+
+        self.board.cmd_status(gcmd)
+
+        self.assertEqual(gcmd.messages,
+                         ['attached=T1 dock=1011 grab=0100'])
+        self.assertEqual(self.board.active, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -940,10 +940,27 @@ class Creator5Toolchanger:
         return new_dock, current, False
 
     def cmd_status(self, gcmd):
-        dock, grab, attached = self._sensor_state(gcmd)
-        self.active = attached
+        # A status query must report raw sensor bits even when they look
+        # contradictory - that is the one case a diagnostic command exists
+        # for. _sensor_state raises on conflicts, which is right for a
+        # motion safety gate but wrong here: it left this command unable to
+        # show anything precisely when there was something to show.
+        dock = [self._button(name, gcmd) for name in self.dock_buttons]
+        grab = [self._button(name, gcmd) for name in self.grab_buttons]
+        conflicts = [i for i in range(4) if dock[i] and grab[i]]
+        attached = [i for i in range(4) if grab[i] and not dock[i]]
+        if conflicts:
+            label = 'conflict(%s)' % ','.join('T%d' % i for i in conflicts)
+        elif len(attached) > 1:
+            label = 'multiple(%s)' % ','.join('T%d' % i for i in attached)
+        elif attached:
+            label = 'T%d' % attached[0]
+            self.active = attached[0]
+        else:
+            label = 'none'
+            self.active = None
         gcmd.respond_info('attached=%s dock=%s grab=%s' % (
-            'none' if attached is None else 'T%d' % attached,
+            label,
             ''.join('1' if v else '0' for v in dock),
             ''.join('1' if v else '0' for v in grab)))
 
@@ -1441,7 +1458,16 @@ class Creator5Toolchanger:
         self._run('SET_STEPPER_ENABLE STEPPER=stepper_y ENABLE=1')
         self._run('SET_KINEMATIC_POSITION X=%.3f Y=%.3f SET_HOMED=xy' % (
             HOLDER_REFERENCE_X, y_reference))
-        self._move(x=HOLDER_REFERENCE_X - 5., feed=2400)
+        # Contact alone does not latch the tool. Grab it the same way
+        # _pickup does, or the carriage pulls away while the tool stays
+        # behind on the dock. 5mm was not enough clearance to reliably
+        # release the dock sensor; reuse _pickup's own tuned slow-pullback
+        # distance/speed instead of a smaller ad hoc value.
+        self._run('MOTOR_GRAB')
+        self._move(x=HOLDER_REFERENCE_X - self.pullback_slow_distance,
+                  feed=self.pullback_speed * 60.)
+        self._run('MOTOR_GRAB2')
+        self._pause_ms(self.pickup_latch_wait_ms)
         self._run('M400')
         self._pause_ms(self.sensor_settle_ms)
         if (self._button(self.dock_buttons[tool], gcmd)
