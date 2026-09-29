@@ -366,9 +366,22 @@ c5_levelboard_calibration_event(struct timer *timer)
     return SF_RESCHEDULE;
 }
 
+// Arming the calibration timer needs a clock reading, so it must not happen
+// in an init function: init functions run before timer_init() has started
+// the clock unless link order happens to place them after it.  Arm it from
+// the task instead, which runs only once every init function has completed.
+static uint8_t calibration_unarmed;
+
 void
 c5_levelboard_task(void)
 {
+    if (calibration_unarmed) {
+        calibration_unarmed = 0;
+        levelboard.calibration_timer.waketime = (timer_read_time()
+                                                 + timer_from_us(
+                                                     C5_CALIBRATION_US));
+        sched_add_timer(&levelboard.calibration_timer);
+    }
     if (sched_check_wake(&calibration_wake))
         c5_process_calibration();
     if (sched_check_wake(&classifier_wake)) {
@@ -387,10 +400,7 @@ c5_levelboard_init(void)
     levelboard.effective_threshold = 25;
     c5_full_reset();
     levelboard.calibration_timer.func = c5_levelboard_calibration_event;
-    levelboard.calibration_timer.waketime = (timer_read_time()
-                                             + timer_from_us(
-                                                 C5_CALIBRATION_US));
-    sched_add_timer(&levelboard.calibration_timer);
+    calibration_unarmed = 1;
 }
 DECL_INIT(c5_levelboard_init);
 

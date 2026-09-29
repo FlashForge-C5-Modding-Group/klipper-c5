@@ -10,26 +10,19 @@
 #define CONFIG_MACH_N32G430 1
 #define DECL_INIT(func)
 #define noinline __attribute__((noinline))
-#define __noreturn __attribute__((noreturn))
 
 void n32g430_model_poll(volatile uint32_t *reg, uint32_t mask,
                         uint32_t expected);
-void n32g430_model_reset_requested(void);
 void n32g430_model_dma_channel_write(volatile uint32_t *reg, uint32_t value);
 #define N32G430_WAIT_POLL(reg, mask, expected) \
     n32g430_model_poll((reg), (mask), (expected))
-#define N32G430_RESET_REQUESTED() n32g430_model_reset_requested()
 #define N32G430_DMA_CHANNEL_WRITE(reg, value) \
     n32g430_model_dma_channel_write(&DMA1_Channel1->reg, (value))
 
-void model_disable_irq(void);
 void model_dsb(void);
 void model_isb(void);
-void model_nop(void);
-#define __disable_irq() model_disable_irq()
 #define __DSB() model_dsb()
 #define __ISB() model_isb()
-#define __NOP() model_nop()
 
 typedef unsigned int irqstatus_t;
 typedef int IRQn_Type;
@@ -40,6 +33,9 @@ typedef struct {
 } RCC_TypeDef;
 typedef struct { volatile uint32_t ACR; } FLASH_TypeDef;
 typedef struct { volatile uint32_t VTOR, AIRCR; } SCB_Type;
+typedef struct { volatile uint32_t DEMCR; } CoreDebug_Type;
+typedef struct { volatile uint32_t CTRL, CYCCNT; } DWT_Type;
+#define CoreDebug_DEMCR_TRCENA_Msk (1u << 24)
 typedef struct {
     volatile uint32_t MODER, OTYPER, OSPEEDR, PUPDR, IDR, ODR;
     volatile uint32_t BSRR, LCKR, AFR[2], BRR, DSCR;
@@ -52,19 +48,28 @@ typedef struct { volatile uint32_t ISR, IFCR; } DMA_TypeDef;
 typedef struct {
     volatile uint32_t CCR, CNDTR, CPAR, CMAR, CHSEL;
 } DMA_Channel_TypeDef;
+typedef struct {
+    volatile uint32_t SR, DR, BRR, CR1, CR2, CR3, GTPR;
+} USART_TypeDef;
 
 extern RCC_TypeDef model_rcc;
 extern FLASH_TypeDef model_flash;
 extern SCB_Type model_scb;
+extern CoreDebug_Type model_core_debug;
+extern DWT_Type model_dwt;
 extern GPIO_TypeDef model_gpio_ports[4];
 extern TIM_TypeDef model_tim1, model_tim8;
 extern DMA_TypeDef model_dma1;
-extern DMA_Channel_TypeDef model_dma1_channel1;
+#define DMA1_CHANNEL_COUNT 6
+extern DMA_Channel_TypeDef model_dma1_channels[DMA1_CHANNEL_COUNT];
+extern USART_TypeDef model_usart1;
 extern uint32_t VectorTable[];
 
 #define RCC (&model_rcc)
 #define FLASH (&model_flash)
 #define SCB (&model_scb)
+#define CoreDebug (&model_core_debug)
+#define DWT (&model_dwt)
 #define GPIOA (&model_gpio_ports[0])
 #define GPIOB (&model_gpio_ports[1])
 #define GPIOC (&model_gpio_ports[2])
@@ -72,7 +77,9 @@ extern uint32_t VectorTable[];
 #define TIM1 (&model_tim1)
 #define TIM8 (&model_tim8)
 #define DMA1 (&model_dma1)
-#define DMA1_Channel1 (&model_dma1_channel1)
+#define DMA1_Channel1 (&model_dma1_channels[0])
+#define DMA1_Channel(n) (DMA1_Channel1 + (n))
+#define USART1 (&model_usart1)
 
 #define IWDG_BASE 0x40003000u
 #define TIM1_BASE 0x40012c00u
@@ -122,11 +129,6 @@ extern uint32_t VectorTable[];
 #define FLASH_ACR_PRFTEN (1u << 4)
 #define FLASH_ACR_ICRST (1u << 6)
 #define FLASH_ACR_ICEN (1u << 7)
-
-#define SCB_AIRCR_VECTKEY_Pos 16
-#define SCB_AIRCR_VECTKEY_Msk (0xffffu << SCB_AIRCR_VECTKEY_Pos)
-#define SCB_AIRCR_PRIGROUP_Msk (7u << 8)
-#define SCB_AIRCR_SYSRESETREQ_Msk (1u << 2)
 
 #define GPIO(PORT, NUM) (((PORT) - 'A') * 16 + (NUM))
 #define GPIO2BIT(PIN) (1u << ((PIN) % 16))
