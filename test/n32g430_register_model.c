@@ -1,4 +1,3 @@
-#include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,13 +19,14 @@ DMA_TypeDef model_dma1;
 DMA_Channel_TypeDef model_dma1_channel1;
 uint32_t VectorTable[1];
 
-static jmp_buf reset_jump;
 static int stalled_wait;
 static int wait_index;
+static uint32_t wait_polls;
 static volatile uint32_t *last_wait_reg;
 static uint32_t last_wait_mask, last_wait_expected;
-static int reset_requested;
 static int scheduler_reached;
+static unsigned hse_starts;
+static int hse_sequence_error;
 static uint16_t captured_delta;
 static unsigned capture_count;
 static void (*installed_irq)(void);
@@ -49,32 +49,51 @@ fail(const char *name, uint32_t actual, uint32_t expected)
     return 1;
 }
 
+// Record a new wait whenever the arguments change or the previous wait
+// used its complete polling budget (a timed-out attempt being retried).
+static int
+model_new_wait(volatile uint32_t *reg, uint32_t mask, uint32_t expected)
+{
+    if (reg == last_wait_reg && mask == last_wait_mask
+        && expected == last_wait_expected
+        && wait_polls < N32G430_CLOCK_TIMEOUT) {
+        wait_polls++;
+        return 0;
+    }
+    int restarted = (last_wait_reg == &model_rcc.CR
+                     && last_wait_mask == RCC_CR_HSERDY
+                     && last_wait_expected == 0);
+    wait_index++;
+    wait_polls = 1;
+    last_wait_reg = reg;
+    last_wait_mask = mask;
+    last_wait_expected = expected;
+    return restarted ? 2 : 1;
+}
+
 void
 n32g430_model_poll(volatile uint32_t *reg, uint32_t mask,
                     uint32_t expected)
 {
-    if (reg != last_wait_reg || mask != last_wait_mask
-        || expected != last_wait_expected) {
-        wait_index++;
-        last_wait_reg = reg;
-        last_wait_mask = mask;
-        last_wait_expected = expected;
+    int new_wait = model_new_wait(reg, mask, expected);
+    if (new_wait && reg == &model_rcc.CR && mask == RCC_CR_HSERDY) {
+        uint32_t cr = model_rcc.CR;
+        if (expected == 0) {
+            // The HSE may only stop once nothing is clocked from it.
+            if ((cr & (RCC_CR_HSEON | RCC_CR_PLLON))
+                || (model_rcc.CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_HSI)
+                hse_sequence_error = 1;
+        } else {
+            // Every start must follow a completed stop, in crystal mode.
+            hse_starts++;
+            if (new_wait != 2 || !(cr & RCC_CR_HSEON)
+                || (cr & RCC_CR_HSEBYP))
+                hse_sequence_error = 1;
+        }
     }
     if (wait_index == stalled_wait)
         return;
     *reg = (*reg & ~mask) | expected;
-}
-
-void
-n32g430_model_reset_requested(void)
-{
-    uint32_t aircr = model_scb.AIRCR;
-    reset_requested = ((aircr & SCB_AIRCR_VECTKEY_Msk)
-                       == (0x5fau << SCB_AIRCR_VECTKEY_Pos)
-                       && (aircr & SCB_AIRCR_SYSRESETREQ_Msk)
-                       && (aircr & SCB_AIRCR_PRIGROUP_Msk)
-                          == SEEDED_PRIGROUP);
-    longjmp(reset_jump, 1);
 }
 
 void
@@ -94,10 +113,8 @@ n32g430_model_dma_channel_write(volatile uint32_t *reg, uint32_t value)
     *reg = value;
 }
 
-void model_disable_irq(void) { }
 void model_dsb(void) { }
 void model_isb(void) { }
-void model_nop(void) { }
 irqstatus_t irq_save(void) { return 0; }
 void irq_restore(irqstatus_t flag) { (void)flag; }
 void gpio_peripheral(uint32_t gpio, uint32_t mode, int pullup)
@@ -125,7 +142,9 @@ static void
 reset_model(int stall)
 {
     memset(&model_rcc, 0, sizeof(model_rcc));
-    model_rcc.CR = RCC_CR_PLLON | RCC_CR_PLLRDY;
+    // Boot-stage handoff: SYSCLK from the PLL, driven by a running HSE.
+    model_rcc.CR = RCC_CR_HSEON | RCC_CR_HSERDY | RCC_CR_PLLON
+                   | RCC_CR_PLLRDY;
     model_rcc.CFGR = RCC_CFGR_SW_PLL | RCC_CFGR_SWS_PLL;
     memset(&model_flash, 0, sizeof(model_flash));
     memset(&model_scb, 0, sizeof(model_scb));
@@ -137,10 +156,12 @@ reset_model(int stall)
     memset(&model_dma1_channel1, 0, sizeof(model_dma1_channel1));
     stalled_wait = stall;
     wait_index = 0;
+    wait_polls = 0;
     last_wait_reg = NULL;
     last_wait_mask = 0;
     last_wait_expected = 0;
-    reset_requested = 0;
+    hse_starts = 0;
+    hse_sequence_error = 0;
     scheduler_reached = 0;
     dma_write_count = 0;
     unsafe_dma_write = 0;
@@ -173,19 +194,23 @@ decode_pclock(uint32_t shift)
     return decode_hclk() / (2u << (prescaler - 4u));
 }
 
+// HSI ready, HSI selected, PLL stopped, HSE stopped, HSE ready, PLL ready
+// and PLL selected.
+#define CLOCK_WAITS 7
+
 static int
-run_normal_clock_path(void)
+check_clock_result(int expected_waits, unsigned expected_hse_starts)
 {
     int failures = 0;
-    reset_model(0);
-    if (setjmp(reset_jump)) {
-        fprintf(stderr, "normal clock path unexpectedly reset\n");
-        return 1;
-    }
-    armcm_main();
-    failures += fail("normal wait count", wait_index, 6);
-    failures += fail("normal scheduler reached", scheduler_reached, 1);
-    failures += fail("normal reset absent", reset_requested, 0);
+    failures += fail("wait count", wait_index, expected_waits);
+    failures += fail("scheduler reached", scheduler_reached, 1);
+    failures += fail("no reset requested", model_scb.AIRCR, SEEDED_PRIGROUP);
+    failures += fail("HSE starts", hse_starts, expected_hse_starts);
+    failures += fail("HSE stop/start order", hse_sequence_error, 0);
+    failures += fail("HSE running in crystal mode",
+                     model_rcc.CR & (RCC_CR_HSEON | RCC_CR_HSERDY
+                                     | RCC_CR_HSEBYP),
+                     RCC_CR_HSEON | RCC_CR_HSERDY);
     failures += fail("HCLK", decode_hclk(), 128000000u);
     failures += fail("PCLK1", decode_pclock(8), 32000000u);
     failures += fail("PCLK2", decode_pclock(11), 64000000u);
@@ -204,38 +229,38 @@ run_normal_clock_path(void)
                      model_rcc.CFGR2 & RCC_CFGR2_TIM1_8_SEL, 0);
     failures += fail("flash latency and cache", model_flash.ACR,
                      FLASH_ACR_LATENCY_3 | FLASH_ACR_ICEN);
+    return failures;
+}
+
+static int
+run_normal_clock_path(void)
+{
+    reset_model(0);
+    armcm_main();
+    int failures = check_clock_result(CLOCK_WAITS, 1);
     failures += fail("USART1 reported PCLK2",
                      get_pclock_frequency(USART1_BASE), 64000000u);
     failures += fail("TIM1 reported timer clock",
                      get_pclock_frequency(TIM1_BASE), 128000000u);
     failures += fail("IWDG has no false pclock",
                      get_pclock_frequency(IWDG_BASE), 0);
+    if (failures)
+        fprintf(stderr, "normal clock path failed\n");
     return failures;
 }
 
+// A clock wait that times out must not reset the chip: the resident boot
+// stage would then wait for a host wake-up that is never sent again.  The
+// whole switch is retried, restarting the HSE each time.
 static int
-run_clock_timeout(int stall)
+run_clock_retry(int stall)
 {
-    int failures = 0;
     reset_model(stall);
-    if (!setjmp(reset_jump)) {
-        armcm_main();
-        fprintf(stderr, "clock wait %d returned instead of resetting\n", stall);
-        return 1;
-    }
-    failures += fail("timeout reset requested", reset_requested, 1);
-    failures += fail("timeout scheduler blocked", scheduler_reached, 0);
-    failures += fail("timeout stopped at requested wait", wait_index,
-                     (uint32_t)stall);
-    failures += fail("timeout SYSRESETREQ",
-                     model_scb.AIRCR & SCB_AIRCR_SYSRESETREQ_Msk,
-                     SCB_AIRCR_SYSRESETREQ_Msk);
-    failures += fail("timeout reset key",
-                     model_scb.AIRCR & SCB_AIRCR_VECTKEY_Msk,
-                     0x5fau << SCB_AIRCR_VECTKEY_Pos);
-    failures += fail("timeout preserves PRIGROUP",
-                     model_scb.AIRCR & SCB_AIRCR_PRIGROUP_Msk,
-                     SEEDED_PRIGROUP);
+    armcm_main();
+    int failures = check_clock_result(stall + CLOCK_WAITS,
+                                      stall >= 5 ? 2 : 1);
+    if (failures)
+        fprintf(stderr, "clock retry after stalled wait %d failed\n", stall);
     return failures;
 }
 
@@ -330,8 +355,8 @@ int
 main(void)
 {
     int failures = run_normal_clock_path();
-    for (int stall = 1; stall <= 6; stall++)
-        failures += run_clock_timeout(stall);
+    for (int stall = 1; stall <= CLOCK_WAITS; stall++)
+        failures += run_clock_retry(stall);
     failures += run_warm_dma_path();
     return failures ? 1 : 0;
 }
