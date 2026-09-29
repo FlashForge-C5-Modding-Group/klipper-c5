@@ -11,6 +11,8 @@ class Creator5Beeper:
         self.gcode = self.printer.lookup_object('gcode')
         self.command = config.get('command', 'cmd_pwm')
         self.channel = config.get('channel', 'pc12')
+        self._configured = False
+        self._config_error = None
         aio = self.printer.load_object(config, 'aio_executor')
         self.executor = aio.allocate_executor('creator5_beeper')
         self.gcode.register_command('C5_BUZZER', self.cmd_C5_BUZZER,
@@ -21,6 +23,7 @@ class Creator5Beeper:
             result = self.executor.submit(
                                     subprocess.run,
                                     [self.command] + list(args),
+                                    stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE,
                                     check=False, timeout=3)
@@ -48,19 +51,37 @@ class Creator5Beeper:
                               % (exc,))
 
     def _play_tone(self, duration_ms, frequency, level):
-        # The factory application configures a 50 MHz base and prescale 6.
-        # set_wc takes period/high counts at that base, not a frequency in Hz.
+        # The factory application configures the channel once, then changes
+        # its waveform for each note. The kernel refuses to reconfigure a PWM
+        # channel that is already working (EPERM), including across Klippy
+        # restarts, so release any inherited channel before configuring it.
+        if self._config_error is not None:
+            # A prior config attempt on this channel left the driver in a
+            # state where retrying disable/config hangs instead of failing
+            # fast (observed on hardware: note 2 of a tune freezes Klippy
+            # after note 1 got a fast EPERM). Only ever try once per session.
+            raise self._config_error
+        if not self._configured:
+            try:
+                self._run('disable', self.channel)
+                self._run('config', self.channel, 'freq=50000000',
+                          'max_level=300', 'active_level=1',
+                          'accuracy_priority=freq')
+                self._run('set_level', self.channel, '100')
+                self._run('set_prescale', self.channel, '6')
+            except self.printer.command_error as exc:
+                self._config_error = exc
+                raise
+            self._configured = True
+        # cmd_pwm set_wc takes high and low counts, not period and high.
         period = max(2, int(round(50000000. / frequency)))
         # LEVEL is a duty-based intensity percentage: 100 preserves the
         # factory 50% duty tone; 0 is silent. Perceived volume is not linear.
         high = period * level // 200
-        self._run('config', self.channel, 'freq=50000000', 'max_level=300',
-                  'active_level=1', 'accuracy_priority=freq')
+        low = period - high
         try:
-            self._run('set_level', self.channel, '100')
-            self._run('set_prescale', self.channel, '6')
             # Program the intended waveform before enabling the channel.
-            self._run('set_wc', self.channel, str(period), str(high))
+            self._run('set_wc', self.channel, str(high), str(low))
             self._run('enable_channels', self.channel)
             self.reactor.pause(self.reactor.monotonic() + duration_ms / 1000.)
         finally:

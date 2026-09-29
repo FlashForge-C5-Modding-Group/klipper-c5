@@ -31,6 +31,8 @@ class Creator5BeeperTest(unittest.TestCase):
         self.beeper = MODULE.Creator5Beeper.__new__(MODULE.Creator5Beeper)
         self.beeper.command = 'cmd_pwm'
         self.beeper.channel = 'pc12'
+        self.beeper._configured = False
+        self.beeper._config_error = None
         self.beeper.printer = mock.Mock(command_error=RuntimeError)
         self.beeper.executor = mock.Mock()
         self.beeper.executor.submit.side_effect = (
@@ -43,10 +45,11 @@ class Creator5BeeperTest(unittest.TestCase):
         run.return_value = mock.Mock(returncode=0, stderr=b'')
         self.beeper.cmd_C5_BUZZER(GCmd())
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertEqual(commands[0], [
+        self.assertEqual(commands[0], ['cmd_pwm', 'disable', 'pc12'])
+        self.assertEqual(commands[1], [
             'cmd_pwm', 'config', 'pc12', 'freq=50000000',
             'max_level=300', 'active_level=1', 'accuracy_priority=freq'])
-        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '20000', '10000'],
+        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '10000', '10000'],
                       commands)
         self.assertEqual(commands[-2:], [
             ['cmd_pwm', 'set_wc', 'pc12', '1', '0'],
@@ -59,9 +62,22 @@ class Creator5BeeperTest(unittest.TestCase):
         self.beeper.cmd_C5_BUZZER(GCmd(DURATION=250, FREQUENCY=1000,
                                        LEVEL=75))
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '50000', '18750'],
+        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '18750', '31250'],
                       commands)
         self.beeper.reactor.pause.assert_called_once_with(10.25)
+
+    @mock.patch.object(MODULE.subprocess, 'run')
+    def test_reuses_configuration_for_later_notes(self, run):
+        run.return_value = mock.Mock(returncode=0, stderr=b'')
+        self.beeper.cmd_C5_BUZZER(GCmd(DURATION=100))
+        self.beeper.cmd_C5_BUZZER(GCmd(DURATION=100, FREQUENCY=1000))
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(sum(cmd[1] == 'config' for cmd in commands), 1)
+        self.assertEqual(sum(cmd[1] == 'disable' for cmd in commands), 1)
+        self.assertEqual(sum(cmd[1] == 'enable_channels' for cmd in commands),
+                         2)
+        self.assertEqual(sum(cmd[1] == 'disable_channels' for cmd in commands),
+                         2)
 
     @mock.patch.object(MODULE.subprocess, 'run')
     def test_enable_failure_still_disables_output(self, run):
@@ -97,6 +113,23 @@ class Creator5BeeperTest(unittest.TestCase):
         gcmd = GCmd(OPTIONAL=1)
         self.beeper.cmd_C5_BUZZER(gcmd)
         self.assertIn('tune skipped', gcmd.messages[0])
+
+    @mock.patch.object(MODULE.subprocess, 'run')
+    def test_config_failure_is_not_retried_for_later_notes(self, run):
+        # On hardware, retrying disable/config after a failed attempt hangs
+        # instead of failing fast, so a broken channel must only be touched
+        # once per session (e.g. across a multi-note startup tune).
+        run.return_value = mock.Mock(returncode=1, stderr=b'not permitted')
+        first = GCmd(OPTIONAL=1)
+        second = GCmd(OPTIONAL=1)
+        self.beeper.cmd_C5_BUZZER(first)
+        self.beeper.cmd_C5_BUZZER(second)
+        self.assertEqual(run.call_args_list, [
+            mock.call(['cmd_pwm', 'disable', 'pc12'], stdin=mock.ANY,
+                      stdout=mock.ANY, stderr=mock.ANY, check=False,
+                      timeout=3)])
+        self.assertIn('tune skipped', first.messages[0])
+        self.assertIn('tune skipped', second.messages[0])
 
 
 if __name__ == '__main__':
