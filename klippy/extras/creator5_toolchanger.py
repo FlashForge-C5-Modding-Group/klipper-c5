@@ -248,6 +248,9 @@ class Creator5Toolchanger:
         self.lower_bed_on_end_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'lower_bed_on_end',
             config.getboolean('lower_bed_on_end_default', False))
+        self.quiet_mode_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'quiet_mode',
+            config.getboolean('quiet_mode_default', False))
         for name, handler in (
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),
