@@ -453,9 +453,27 @@ c5_eboard_pa_receive(volatile uint8_t *frame, uint16_t remaining)
         frame[i] = 0;
 }
 
+// Arming the calibration timer needs a clock reading, so it must not happen
+// in an init function: init functions run before timer_init() has started
+// the clock unless link order happens to place them after it.  Arm it from
+// the task instead, which runs only once every init function has completed.
+static uint8_t calibration_unarmed;
+
+static void
+c5_schedule_calibration(void)
+{
+    eboard.calibration_timer.waketime = (timer_read_time()
+                                         + timer_from_us(C5_CALIBRATION_US));
+    sched_add_timer(&eboard.calibration_timer);
+}
+
 void
 c5_eboard_task(void)
 {
+    if (calibration_unarmed) {
+        calibration_unarmed = 0;
+        c5_schedule_calibration();
+    }
     irqstatus_t flag = irq_save();
     uint8_t ready = pa.state == C5_PA_READY;
     if (ready)
@@ -468,21 +486,13 @@ c5_eboard_task(void)
 }
 DECL_TASK(c5_eboard_task);
 
-static void
-c5_schedule_calibration(void)
-{
-    eboard.calibration_timer.waketime = (timer_read_time()
-                                         + timer_from_us(C5_CALIBRATION_US));
-    sched_add_timer(&eboard.calibration_timer);
-}
-
 void
 c5_eboard_init(void)
 {
     eboard.capture_timeout_ticks = timer_from_us(C5_CAPTURE_TIMEOUT_US);
     eboard.calibration_timer.func = c5_calibration_event;
     c5_invalidate_stream(1);
-    c5_schedule_calibration();
+    calibration_unarmed = 1;
 }
 
 void
