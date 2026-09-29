@@ -45,6 +45,9 @@ typedef struct { volatile uint32_t ISR, IFCR; } DMA_TypeDef;
 typedef struct {
     volatile uint32_t CCR, CNDTR, CPAR, CMAR, CHSEL;
 } DMA_Channel_TypeDef;
+typedef struct {
+    volatile uint32_t SR, DR, BRR, CR1, CR2, CR3, GTPR;
+} USART_TypeDef;
 
 extern RCC_TypeDef model_rcc;
 extern FLASH_TypeDef model_flash;
@@ -52,7 +55,9 @@ extern SCB_Type model_scb;
 extern GPIO_TypeDef model_gpio_ports[4];
 extern TIM_TypeDef model_tim1, model_tim8;
 extern DMA_TypeDef model_dma1;
-extern DMA_Channel_TypeDef model_dma1_channel1;
+#define DMA1_CHANNEL_COUNT 6
+extern DMA_Channel_TypeDef model_dma1_channels[DMA1_CHANNEL_COUNT];
+extern USART_TypeDef model_usart1;
 extern uint32_t VectorTable[];
 
 #define RCC (&model_rcc)
@@ -65,7 +70,9 @@ extern uint32_t VectorTable[];
 #define TIM1 (&model_tim1)
 #define TIM8 (&model_tim8)
 #define DMA1 (&model_dma1)
-#define DMA1_Channel1 (&model_dma1_channel1)
+#define DMA1_Channel1 (&model_dma1_channels[0])
+#define DMA1_Channel(n) (DMA1_Channel1 + (n))
+#define USART1 (&model_usart1)
 
 #define IWDG_BASE 0x40003000u
 #define TIM1_BASE 0x40012c00u

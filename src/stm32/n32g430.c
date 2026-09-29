@@ -175,10 +175,36 @@ clock_setup(void)
         ;
 }
 
+// The resident boot stage jumps to the application with its USART1 DMA
+// channels still enabled and pointed at application RAM, so quiesce every
+// channel before any application state depends on memory or the serial port.
+// Gating a peripheral clock does not clear its registers: the boot stage
+// leaves the DMA clock off, and its channel setup becomes live again as soon
+// as the application turns that clock back on.  So enable both clocks here
+// rather than skipping a peripheral that looks inactive.
+static void
+handoff_quiesce(void)
+{
+    RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
+    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+    RCC->AHBENR;
+    // The serial port stops first; it is what still requests transfers.
+    USART1->CR1 = 0;
+    USART1->CR3 = 0;
+    for (int ch = 0; ch < DMA1_CHANNEL_COUNT; ch++) {
+        DMA_Channel_TypeDef *regs = DMA1_Channel(ch);
+        regs->CCR &= ~DMA_CCR_EN;
+        regs->CCR = 0;
+        regs->CNDTR = 0;
+        DMA1->IFCR = DMA_IFCR_CHANNEL1_ALL << (4 * ch);
+    }
+}
+
 // Main entry point - called from armcm_boot.c:ResetHandler().
 void
 armcm_main(void)
 {
+    handoff_quiesce();
     clock_setup();
 
     SCB->VTOR = (uint32_t)(uintptr_t)VectorTable;
