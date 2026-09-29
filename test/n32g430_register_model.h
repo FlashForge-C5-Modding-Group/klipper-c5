@@ -10,26 +10,19 @@
 #define CONFIG_MACH_N32G430 1
 #define DECL_INIT(func)
 #define noinline __attribute__((noinline))
-#define __noreturn __attribute__((noreturn))
 
 void n32g430_model_poll(volatile uint32_t *reg, uint32_t mask,
                         uint32_t expected);
-void n32g430_model_reset_requested(void);
 void n32g430_model_dma_channel_write(volatile uint32_t *reg, uint32_t value);
 #define N32G430_WAIT_POLL(reg, mask, expected) \
     n32g430_model_poll((reg), (mask), (expected))
-#define N32G430_RESET_REQUESTED() n32g430_model_reset_requested()
 #define N32G430_DMA_CHANNEL_WRITE(reg, value) \
     n32g430_model_dma_channel_write(&DMA1_Channel1->reg, (value))
 
-void model_disable_irq(void);
 void model_dsb(void);
 void model_isb(void);
-void model_nop(void);
-#define __disable_irq() model_disable_irq()
 #define __DSB() model_dsb()
 #define __ISB() model_isb()
-#define __NOP() model_nop()
 
 typedef unsigned int irqstatus_t;
 typedef int IRQn_Type;
@@ -122,11 +115,6 @@ extern uint32_t VectorTable[];
 #define FLASH_ACR_PRFTEN (1u << 4)
 #define FLASH_ACR_ICRST (1u << 6)
 #define FLASH_ACR_ICEN (1u << 7)
-
-#define SCB_AIRCR_VECTKEY_Pos 16
-#define SCB_AIRCR_VECTKEY_Msk (0xffffu << SCB_AIRCR_VECTKEY_Pos)
-#define SCB_AIRCR_PRIGROUP_Msk (7u << 8)
-#define SCB_AIRCR_SYSRESETREQ_Msk (1u << 2)
 
 #define GPIO(PORT, NUM) (((PORT) - 'A') * 16 + (NUM))
 #define GPIO2BIT(PIN) (1u << ((PIN) % 16))

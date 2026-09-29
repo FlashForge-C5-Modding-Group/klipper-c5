@@ -23,9 +23,6 @@
 #ifndef N32G430_WAIT_POLL
 #define N32G430_WAIT_POLL(reg, mask, expected) do { } while (0)
 #endif
-#ifndef N32G430_RESET_REQUESTED
-#define N32G430_RESET_REQUESTED() do { } while (0)
-#endif
 
 // Return the enable and reset controls for the peripherals supported here.
 struct cline
@@ -100,55 +97,53 @@ gpio_clock_enable(GPIO_TypeDef *regs)
     RCC->AHBENR;
 }
 
-void noinline __noreturn
-n32g430_clock_fail(void)
-{
-    __disable_irq();
-    __DSB();
-    SCB->AIRCR = ((0x5fau << SCB_AIRCR_VECTKEY_Pos)
-                  | (SCB->AIRCR & SCB_AIRCR_PRIGROUP_Msk)
-                  | SCB_AIRCR_SYSRESETREQ_Msk);
-    __DSB();
-    N32G430_RESET_REQUESTED();
-    for (;;)
-        __NOP();
-}
-
-void noinline
-n32g430_wait_mask_or_reset(volatile uint32_t *reg, uint32_t mask,
-                           uint32_t expected)
+// Wait for a clock status field; report whether it settled in time.
+static int noinline
+n32g430_wait_mask(volatile uint32_t *reg, uint32_t mask, uint32_t expected)
 {
     for (uint32_t timeout = N32G430_CLOCK_TIMEOUT; timeout; timeout--) {
         N32G430_WAIT_POLL(reg, mask, expected);
         if ((*reg & mask) == expected)
-            return;
+            return 1;
     }
-    n32g430_clock_fail();
+    return 0;
 }
 
-static void
-clock_setup(void)
+// Make one complete switch to the 128MHz HSE/PLL clock.  Every attempt
+// starts from the HSI with the PLL and HSE stopped, so a failed attempt
+// can simply be repeated.
+static int
+clock_try_setup(void)
 {
     // Revert to the HSI regardless of the clock state the boot stage
     // leaves behind; the PLL can not be disabled while it drives SYSCLK.
     RCC->CR |= RCC_CR_HSION;
-    n32g430_wait_mask_or_reset(&RCC->CR, RCC_CR_HSIRDY, RCC_CR_HSIRDY);
+    if (!n32g430_wait_mask(&RCC->CR, RCC_CR_HSIRDY, RCC_CR_HSIRDY))
+        return 0;
     RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW_Msk) | RCC_CFGR_SW_HSI;
-    n32g430_wait_mask_or_reset(&RCC->CFGR, RCC_CFGR_SWS_Msk,
-                               RCC_CFGR_SWS_HSI);
+    if (!n32g430_wait_mask(&RCC->CFGR, RCC_CFGR_SWS_Msk, RCC_CFGR_SWS_HSI))
+        return 0;
 
     // Clock-tree fields may only change while the PLL is disabled.
     RCC->CR &= ~RCC_CR_PLLON;
-    n32g430_wait_mask_or_reset(&RCC->CR, RCC_CR_PLLRDY, 0);
+    if (!n32g430_wait_mask(&RCC->CR, RCC_CR_PLLRDY, 0))
+        return 0;
 
     // Establish the public 128MHz flash timing before raising SYSCLK.
     uint32_t acr = FLASH->ACR;
     acr &= ~(FLASH_ACR_LATENCY_Msk | FLASH_ACR_PRFTEN | FLASH_ACR_ICRST);
     FLASH->ACR = acr | FLASH_ACR_LATENCY_3 | FLASH_ACR_ICEN;
 
-    // Use the crystal/resonator HSE path and wait until it is stable.
-    RCC->CR = (RCC->CR & ~RCC_CR_HSEBYP) | RCC_CR_HSEON;
-    n32g430_wait_mask_or_reset(&RCC->CR, RCC_CR_HSERDY, RCC_CR_HSERDY);
+    // Stop and restart the crystal/resonator HSE, as the stock application
+    // does.  The boot stage leaves the HSE enabled even when it did not
+    // start, and the bypass bit may only change while the HSE is off.
+    RCC->CR &= ~RCC_CR_HSEON;
+    if (!n32g430_wait_mask(&RCC->CR, RCC_CR_HSERDY, 0))
+        return 0;
+    RCC->CR &= ~RCC_CR_HSEBYP;
+    RCC->CR |= RCC_CR_HSEON;
+    if (!n32g430_wait_mask(&RCC->CR, RCC_CR_HSERDY, RCC_CR_HSERDY))
+        return 0;
 
     // HSE / 2 * 32 gives 128MHz HCLK; APB1 and APB2 are 32/64MHz.
     uint32_t cfgr = RCC->CFGR;
@@ -163,11 +158,21 @@ clock_setup(void)
     RCC->CFGR2 &= ~RCC_CFGR2_TIM1_8_SEL;
 
     RCC->CR |= RCC_CR_PLLON;
-    n32g430_wait_mask_or_reset(&RCC->CR, RCC_CR_PLLRDY, RCC_CR_PLLRDY);
+    if (!n32g430_wait_mask(&RCC->CR, RCC_CR_PLLRDY, RCC_CR_PLLRDY))
+        return 0;
 
     RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW_Msk) | RCC_CFGR_SW_PLL;
-    n32g430_wait_mask_or_reset(&RCC->CFGR, RCC_CFGR_SWS_Msk,
-                               RCC_CFGR_SWS_PLL);
+    return n32g430_wait_mask(&RCC->CFGR, RCC_CFGR_SWS_Msk, RCC_CFGR_SWS_PLL);
+}
+
+static void
+clock_setup(void)
+{
+    // Never reset on a clock failure.  After a reset the resident boot
+    // stage waits for a host wake-up that is sent only once per restart,
+    // so the board would stay unreachable until power is cycled.
+    while (!clock_try_setup())
+        ;
 }
 
 // Main entry point - called from armcm_boot.c:ResetHandler().
