@@ -16,7 +16,8 @@ SCB_Type model_scb;
 GPIO_TypeDef model_gpio_ports[4];
 TIM_TypeDef model_tim1, model_tim8;
 DMA_TypeDef model_dma1;
-DMA_Channel_TypeDef model_dma1_channel1;
+DMA_Channel_TypeDef model_dma1_channels[DMA1_CHANNEL_COUNT];
+USART_TypeDef model_usart1;
 uint32_t VectorTable[1];
 
 static int stalled_wait;
@@ -100,9 +101,9 @@ void
 n32g430_model_dma_channel_write(volatile uint32_t *reg, uint32_t value)
 {
     // While active, the only legal channel write is an exact EN clear.
-    uint32_t control = model_dma1_channel1.CCR;
+    uint32_t control = model_dma1_channels[0].CCR;
     if ((control & DMA_CCR_EN)
-        && (reg != &model_dma1_channel1.CCR
+        && (reg != &model_dma1_channels[0].CCR
             || value != (control & ~DMA_CCR_EN)))
         unsafe_dma_write = 1;
     if (dma_write_count < sizeof(dma_write_regs) / sizeof(dma_write_regs[0])) {
@@ -153,7 +154,23 @@ reset_model(int stall)
     memset(&model_tim1, 0, sizeof(model_tim1));
     memset(&model_tim8, 0, sizeof(model_tim8));
     memset(&model_dma1, 0, sizeof(model_dma1));
-    memset(&model_dma1_channel1, 0, sizeof(model_dma1_channel1));
+    memset(model_dma1_channels, 0, sizeof(model_dma1_channels));
+    memset(&model_usart1, 0, sizeof(model_usart1));
+    // Boot-stage handoff: its USART1 DMA channels are still configured and
+    // still pointed at what is now application RAM, while both peripheral
+    // clocks are gated off.  Gating does not clear the registers, so the
+    // channels become live again the moment the application ungates DMA.
+    model_rcc.AHBENR = 0;
+    model_rcc.APB2ENR = 0;
+    model_usart1.CR1 = 0x202cu;
+    model_usart1.CR3 = 0x00c0u;
+    model_dma1_channels[3].CCR = 0x3092u;
+    model_dma1_channels[3].CPAR = USART1_BASE + 4u;
+    model_dma1_channels[3].CMAR = 0x20001ddfu;
+    model_dma1_channels[4].CCR = 0x3081u;
+    model_dma1_channels[4].CNDTR = 0x40bu;
+    model_dma1_channels[4].CPAR = USART1_BASE + 4u;
+    model_dma1_channels[4].CMAR = 0x20000040u;
     stalled_wait = stall;
     wait_index = 0;
     wait_polls = 0;
@@ -232,12 +249,30 @@ check_clock_result(int expected_waits, unsigned expected_hse_starts)
     return failures;
 }
 
+// Every leftover channel must be stopped before the application can rely on
+// its RAM or its serial port.
+static int
+check_handoff_quiesce(void)
+{
+    int failures = 0;
+    failures += fail("boot USART receiver stopped", model_usart1.CR1, 0);
+    failures += fail("boot USART DMA requests stopped", model_usart1.CR3, 0);
+    for (int ch = 1; ch < DMA1_CHANNEL_COUNT; ch++) {
+        failures += fail("leftover channel control",
+                         model_dma1_channels[ch].CCR, 0);
+        failures += fail("leftover channel count",
+                         model_dma1_channels[ch].CNDTR, 0);
+    }
+    return failures;
+}
+
 static int
 run_normal_clock_path(void)
 {
     reset_model(0);
     armcm_main();
     int failures = check_clock_result(CLOCK_WAITS, 1);
+    failures += check_handoff_quiesce();
     failures += fail("USART1 reported PCLK2",
                      get_pclock_frequency(USART1_BASE), 64000000u);
     failures += fail("TIM1 reported timer clock",
@@ -273,11 +308,11 @@ run_warm_dma_path(void)
     model_rcc.AHBRSTR = reset_sentinel;
     model_dma1.ISR = 0x0fu;
     model_dma1.IFCR = 0xa5u;
-    model_dma1_channel1.CCR = 0xffffu;
-    model_dma1_channel1.CNDTR = 0x1234u;
-    model_dma1_channel1.CPAR = 0x11111111u;
-    model_dma1_channel1.CMAR = 0x22222222u;
-    model_dma1_channel1.CHSEL = 0x3fu;
+    model_dma1_channels[0].CCR = 0xffffu;
+    model_dma1_channels[0].CNDTR = 0x1234u;
+    model_dma1_channels[0].CPAR = 0x11111111u;
+    model_dma1_channels[0].CMAR = 0x22222222u;
+    model_dma1_channels[0].CHSEL = 0x3fu;
     installed_irq = NULL;
     installed_irqn = -1;
     installed_priority = UINT32_MAX;
@@ -287,11 +322,11 @@ run_warm_dma_path(void)
 
     c5_levelboard_acquisition_init();
     volatile uint32_t *expected_regs[] = {
-        &model_dma1_channel1.CCR, &model_dma1_channel1.CCR,
-        &model_dma1_channel1.CPAR, &model_dma1_channel1.CMAR,
-        &model_dma1_channel1.CNDTR, &model_dma1_channel1.CHSEL,
-        &model_dma1_channel1.CCR, &model_dma1_channel1.CCR,
-        &model_dma1_channel1.CCR,
+        &model_dma1_channels[0].CCR, &model_dma1_channels[0].CCR,
+        &model_dma1_channels[0].CPAR, &model_dma1_channels[0].CMAR,
+        &model_dma1_channels[0].CNDTR, &model_dma1_channels[0].CHSEL,
+        &model_dma1_channels[0].CCR, &model_dma1_channels[0].CCR,
+        &model_dma1_channels[0].CCR,
     };
     uint32_t expected_values[] = {
         0xfffeu, 0, (uint32_t)(uintptr_t)&model_tim1.CNT,
@@ -317,20 +352,20 @@ run_warm_dma_path(void)
     failures += fail("reserved AHBRSTR untouched", model_rcc.AHBRSTR,
                      reset_sentinel);
     failures += fail("all channel 1 flags cleared", model_dma1.IFCR, 0x0fu);
-    failures += fail("DMA CPAR", model_dma1_channel1.CPAR,
+    failures += fail("DMA CPAR", model_dma1_channels[0].CPAR,
                      (uint32_t)(uintptr_t)&model_tim1.CNT);
-    failures += fail("DMA CMAR", model_dma1_channel1.CMAR,
+    failures += fail("DMA CMAR", model_dma1_channels[0].CMAR,
                      (uint32_t)(uintptr_t)&dma_snapshot);
-    failures += fail("DMA count", model_dma1_channel1.CNDTR, 1);
-    failures += fail("DMA request", model_dma1_channel1.CHSEL, 0x32u);
-    failures += fail("DMA final control", model_dma1_channel1.CCR, 0x2523u);
+    failures += fail("DMA count", model_dma1_channels[0].CNDTR, 1);
+    failures += fail("DMA request", model_dma1_channels[0].CHSEL, 0x32u);
+    failures += fail("DMA final control", model_dma1_channels[0].CCR, 0x2523u);
     failures += fail("DMA IRQ number", (uint32_t)installed_irqn,
                      DMA1_Channel1_IRQn);
     failures += fail("DMA IRQ priority", installed_priority, 0);
     failures += fail("DMA IRQ handler installed",
                      installed_irq == DMA1_Channel1_IRQHandler, 1);
 
-    model_dma1_channel1.CCR = 0x2523u;
+    model_dma1_channels[0].CCR = 0x2523u;
     model_dma1.IFCR = 0;
     model_dma1.ISR = DMA_ISR_TCIF1;
     dma_snapshot = 5;
@@ -338,7 +373,7 @@ run_warm_dma_path(void)
     failures += fail("IRQ clears TC only", model_dma1.IFCR,
                      DMA_IFCR_CTCIF1);
     failures += fail("IRQ first modulo delta", captured_delta, 5);
-    failures += fail("IRQ leaves DMA enabled", model_dma1_channel1.CCR,
+    failures += fail("IRQ leaves DMA enabled", model_dma1_channels[0].CCR,
                      0x2523u);
 
     model_dma1.IFCR = 0;

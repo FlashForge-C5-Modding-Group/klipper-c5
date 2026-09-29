@@ -118,6 +118,8 @@ typedef struct {
 #define USART1                 ((USART_TypeDef *)USART1_BASE)
 #define DMA1                   ((DMA_TypeDef *)DMA1_BASE)
 #define DMA1_Channel1          ((DMA_Channel_TypeDef *)(DMA1_BASE + 0x08UL))
+#define DMA1_CHANNEL_COUNT     6
+#define DMA1_Channel(n)        (DMA1_Channel1 + (n))
 #define RCC                    ((RCC_TypeDef *)RCC_BASE)
 #define FLASH                  ((FLASH_TypeDef *)FLASH_R_BASE)
 #define GPIOA                  ((GPIO_TypeDef *)GPIOA_BASE)
