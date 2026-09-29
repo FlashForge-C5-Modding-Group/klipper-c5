@@ -13,6 +13,8 @@ _Static_assert(N32G430_CLOCK_TIMEOUT > N32G430_HSI_CLOCK_FREQ / 10u,
 RCC_TypeDef model_rcc;
 FLASH_TypeDef model_flash;
 SCB_Type model_scb;
+CoreDebug_Type model_core_debug;
+DWT_Type model_dwt;
 GPIO_TypeDef model_gpio_ports[4];
 TIM_TypeDef model_tim1, model_tim8;
 DMA_TypeDef model_dma1;
@@ -39,6 +41,8 @@ static volatile uint32_t *dma_write_regs[12];
 static uint32_t dma_write_values[12];
 
 #define SEEDED_PRIGROUP (5u << 8)
+// Past 0x80000000, which is what breaks sched.c's timer list invariant.
+#define SEEDED_CYCCNT 0x9abcdef0u
 
 static int
 fail(const char *name, uint32_t actual, uint32_t expected)
@@ -150,6 +154,10 @@ reset_model(int stall)
     memset(&model_flash, 0, sizeof(model_flash));
     memset(&model_scb, 0, sizeof(model_scb));
     model_scb.AIRCR = SEEDED_PRIGROUP;
+    // The debug power domain is not reset by SYSRESETREQ: the cycle counter
+    // keeps running through the reset and through the boot stage's wait.
+    model_core_debug.DEMCR = CoreDebug_DEMCR_TRCENA_Msk;
+    model_dwt.CYCCNT = SEEDED_CYCCNT;
     memset(model_gpio_ports, 0, sizeof(model_gpio_ports));
     memset(&model_tim1, 0, sizeof(model_tim1));
     memset(&model_tim8, 0, sizeof(model_tim8));
@@ -263,6 +271,12 @@ check_handoff_quiesce(void)
         failures += fail("leftover channel count",
                          model_dma1_channels[ch].CNDTR, 0);
     }
+    // An inherited count past 0x80000000 makes the first timer added by an
+    // init function insert past sched.c's sentinel.
+    failures += fail("inherited cycle count cleared", model_dwt.CYCCNT, 0);
+    failures += fail("cycle counter enabled", model_core_debug.DEMCR
+                     & CoreDebug_DEMCR_TRCENA_Msk,
+                     CoreDebug_DEMCR_TRCENA_Msk);
     return failures;
 }
 
