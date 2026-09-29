@@ -200,11 +200,27 @@ handoff_quiesce(void)
     }
 }
 
+// The DWT cycle counter is Klipper's clock, and it lives in the debug power
+// domain: a SYSRESETREQ system reset does not clear it, so it keeps counting
+// through the reset and through however long the boot stage waits for its
+// host wake-up.  timer_init() zeroes it, but init functions that run earlier
+// read it first, and sched.c's timer list assumes every waketime is less
+// than half the counter range ahead of the sentinel.  An inherited count
+// past 0x80000000 therefore walks insert_timer() off the end of the list.
+// Start every instance from zero, as a power-on reset would.
+static void
+cycle_counter_reset(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+}
+
 // Main entry point - called from armcm_boot.c:ResetHandler().
 void
 armcm_main(void)
 {
     handoff_quiesce();
+    cycle_counter_reset();
     clock_setup();
 
     SCB->VTOR = (uint32_t)(uintptr_t)VectorTable;

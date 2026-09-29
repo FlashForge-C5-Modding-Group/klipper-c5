@@ -33,6 +33,9 @@ typedef struct {
 } RCC_TypeDef;
 typedef struct { volatile uint32_t ACR; } FLASH_TypeDef;
 typedef struct { volatile uint32_t VTOR, AIRCR; } SCB_Type;
+typedef struct { volatile uint32_t DEMCR; } CoreDebug_Type;
+typedef struct { volatile uint32_t CTRL, CYCCNT; } DWT_Type;
+#define CoreDebug_DEMCR_TRCENA_Msk (1u << 24)
 typedef struct {
     volatile uint32_t MODER, OTYPER, OSPEEDR, PUPDR, IDR, ODR;
     volatile uint32_t BSRR, LCKR, AFR[2], BRR, DSCR;
@@ -52,6 +55,8 @@ typedef struct {
 extern RCC_TypeDef model_rcc;
 extern FLASH_TypeDef model_flash;
 extern SCB_Type model_scb;
+extern CoreDebug_Type model_core_debug;
+extern DWT_Type model_dwt;
 extern GPIO_TypeDef model_gpio_ports[4];
 extern TIM_TypeDef model_tim1, model_tim8;
 extern DMA_TypeDef model_dma1;
@@ -63,6 +68,8 @@ extern uint32_t VectorTable[];
 #define RCC (&model_rcc)
 #define FLASH (&model_flash)
 #define SCB (&model_scb)
+#define CoreDebug (&model_core_debug)
+#define DWT (&model_dwt)
 #define GPIOA (&model_gpio_ports[0])
 #define GPIOB (&model_gpio_ports[1])
 #define GPIOC (&model_gpio_ports[2])
