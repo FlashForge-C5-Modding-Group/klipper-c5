@@ -332,7 +332,8 @@ class Creator5OffsetTests(unittest.TestCase):
         heaters.lookup_heater.return_value = heater
         self.board.printer.lookup_object.return_value = heaters
         self.board.door_buttons = ['topDoor', 'frontDoor']
-        self.board._button = lambda name, gcmd: name == 'topDoor'
+        # PRESSED means closed; topDoor reads not-pressed here, i.e. open.
+        self.board._button = lambda name, gcmd: name != 'topDoor'
         heater.get_status.return_value = {'target': 0., 'power': 0.}
         self.board._check_chamber_doors(GCmd(), 'Door %s is open')
         heater.get_status.return_value = {'target': 40., 'power': 0.}

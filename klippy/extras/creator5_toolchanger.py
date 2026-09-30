@@ -659,7 +659,10 @@ class Creator5Toolchanger:
             return
         if self._chamber_heater_active(gcmd):
             for name in self.door_buttons:
-                if self._button(name, gcmd):
+                # The door switches read PRESSED while closed (the door
+                # pushes the switch shut) and released once opened, so an
+                # open door is the *not* pressed case.
+                if not self._button(name, gcmd):
                     raise gcmd.error(message % name)
 
     def _preflight(self, gcmd, axes='xyz'):
