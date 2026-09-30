@@ -59,6 +59,21 @@ class Creator5AfcSensorTest(unittest.TestCase):
             move_z_first=False)
         source.afc.error.pause_resume.send_resume_command.assert_called_once()
 
+    def test_eject_tells_operator_to_use_the_cutter(self):
+        load_unload_sequence = load_method('AFC_extruder.py', 'AFCExtruder',
+                                           'load_unload_sequence')
+        source = mock.Mock(name='source')
+        source.creator5_tool_index = 2
+        source.load_active = False
+
+        load_unload_sequence(source, -100)
+
+        source.gcode.respond_info.assert_called_once_with(
+            "T2: use the cutter to remove the filament; it does not "
+            "retract automatically.")
+        source.logger.info.assert_not_called()
+        self.assertFalse(source.load_active)
+
     def test_infinite_spool_does_not_change_to_empty_head(self):
         runout = load_method('AFC_lane.py', 'AFCLane',
                              '_perform_creator5_infinite_runout')
@@ -234,6 +249,63 @@ class Creator5AfcSensorTest(unittest.TestCase):
         lane.set_tool_unloaded.assert_called_once_with()
         lane.set_unloaded.assert_called_once_with()
         extruder.load_unload_sequence.assert_not_called()
+
+    def test_filament_present_while_parked_does_not_mark_loaded(self):
+        lane = mock.Mock(_afc_prep_done=True, custom_load_cmd=None)
+        afc = mock.Mock()
+        afc.function.is_printing.return_value = False
+        extruder = types.SimpleNamespace(
+            tc_unit_name='Tools', is_standalone=lambda: True,
+            tc_lane=lane, tool_start_state=False, afc=afc,
+            on_shuttle=lambda: False, printer=mock.Mock(state_message='Ready'),
+            auto_load_on_tool_start=False, load_active=False,
+            tool_stn=100, load_unload_sequence=mock.Mock(),
+            logger=mock.Mock())
+
+        callback = load_method('AFC_extruder.py', 'AFCExtruder',
+                               'tool_start_callback')
+        callback(extruder, 0., True)
+
+        lane.set_tool_loaded.assert_not_called()
+        lane.set_loaded.assert_not_called()
+        self.assertTrue(extruder.tool_start_state)
+
+    def test_on_shuttle_marks_loaded_once_mounted_with_filament_already_present(self):
+        on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
+                                 'on_shuttle')
+        toolchanger = mock.Mock()
+        toolchanger.attached_tool_from_pins.return_value = 1
+        lane = mock.Mock(tool_loaded=False)
+        source = types.SimpleNamespace(
+            creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
+            creator5_mount_error='stale',
+            printer=mock.Mock(
+                lookup_object=mock.Mock(return_value=toolchanger)))
+
+        result = on_shuttle(source)
+
+        self.assertTrue(result)
+        lane.set_tool_loaded.assert_called_once_with()
+        lane.set_loaded.assert_called_once_with()
+        self.assertIsNone(source.creator5_mount_error)
+
+    def test_on_shuttle_clears_loaded_once_docked(self):
+        on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
+                                 'on_shuttle')
+        toolchanger = mock.Mock()
+        toolchanger.attached_tool_from_pins.return_value = None
+        lane = mock.Mock(tool_loaded=True)
+        source = types.SimpleNamespace(
+            creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
+            creator5_mount_error=None,
+            printer=mock.Mock(
+                lookup_object=mock.Mock(return_value=toolchanger)))
+
+        result = on_shuttle(source)
+
+        self.assertFalse(result)
+        lane.set_tool_unloaded.assert_called_once_with()
+        lane.set_unloaded.assert_called_once_with()
 
     def test_t_command_swaps_head_without_filament_change(self):
         lane = mock.Mock(extruder_obj=types.SimpleNamespace(

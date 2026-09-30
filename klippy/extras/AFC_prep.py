@@ -140,7 +140,6 @@ class afcPrep:
                   units["system"]["extruders"][extruder_obj.name]['lane_loaded']:
                     extruder_obj.lane_loaded = units["system"]["extruders"][extruder_obj.name]['lane_loaded']
 
-        self.afc.print_version(console_only=True)
         if self.afc.snapmaker_printer:
             self.logger.info("Snapmaker Printer Detected")
 

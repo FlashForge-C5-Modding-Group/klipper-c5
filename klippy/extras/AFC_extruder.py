@@ -582,9 +582,17 @@ class AFCExtruder:
                             if not self.auto_load_on_tool_start:
                                 # Physical tool swaps must only select the
                                 # tool. Filament presence updates AFC state
-                                # without commanding any extrusion.
-                                self.tc_lane.set_tool_loaded()
-                                self.tc_lane.set_loaded()
+                                # without commanding any extrusion. Only mark
+                                # the lane loaded while this tool is actually
+                                # mounted - a parked tool that merely has
+                                # filament fed into it is not "in use", and
+                                # Mainsail/grumpyscreen both display
+                                # lane_loaded as if it were. on_shuttle()
+                                # re-syncs this once the tool is later
+                                # mounted or docked.
+                                if self.on_shuttle():
+                                    self.tc_lane.set_tool_loaded()
+                                    self.tc_lane.set_loaded()
                             # A custom load command drives the entire load;
                             # otherwise standalone AFC advances to the nozzle.
                             elif (not self.load_active
@@ -659,6 +667,15 @@ class AFCExtruder:
                          that distance is saved and used in move_extruder function once extruder is
                          up to temperature
         """
+        if distance < 0:
+            # This toolchanger has no motorized retract-through-hotend path
+            # and no hub cutter (tool_cut: False in AFC.cfg). Ejecting a
+            # standalone tool's filament is a manual cut, not a move.
+            self.gcode.respond_info(
+                "T%d: use the cutter to remove the filament; it does not "
+                "retract automatically." % self.creator5_tool_index)
+            return
+
         info_str = "Loading" if distance > 0 else "Unloading"
         self.logger.info(f"{info_str} {self.name}")
         self.load_active = True
@@ -916,7 +933,21 @@ class AFCExtruder:
                 self.creator5_mount_error = str(exc)
                 return False
             self.creator5_mount_error = None
-            return attached == self.creator5_tool_index
+            mounted = attached == self.creator5_tool_index
+            # Re-sync lane_loaded on mount transitions. Filament inserted
+            # while this tool was parked never marked it loaded (see
+            # tool_start_callback); once it is actually mounted with
+            # filament present, catch up here instead of waiting for the
+            # sensor to toggle again. Docking must clear it back so a
+            # merely-fed, parked tool goes back to showing as not loaded.
+            if self.tc_lane is not None:
+                if mounted and self.tool_start_state and not self.tc_lane.tool_loaded:
+                    self.tc_lane.set_tool_loaded()
+                    self.tc_lane.set_loaded()
+                elif not mounted and self.tc_lane.tool_loaded:
+                    self.tc_lane.set_tool_unloaded()
+                    self.tc_lane.set_unloaded()
+            return mounted
 
         # Return true if both are not set as this would be for single toolhead
         # setups
