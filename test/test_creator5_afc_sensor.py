@@ -289,7 +289,11 @@ class Creator5AfcSensorTest(unittest.TestCase):
         lane.set_loaded.assert_called_once_with()
         self.assertIsNone(source.creator5_mount_error)
 
-    def test_on_shuttle_clears_loaded_once_docked(self):
+    def test_on_shuttle_keeps_loaded_once_docked(self):
+        # This is a standalone toolchanger: each tool keeps its own filament
+        # loaded while parked, so docking must not forget lane_loaded. Only
+        # an actual filament-sensor runout (tool_start_callback) should clear
+        # it.
         on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
                                  'on_shuttle')
         toolchanger = mock.Mock()
@@ -304,8 +308,8 @@ class Creator5AfcSensorTest(unittest.TestCase):
         result = on_shuttle(source)
 
         self.assertFalse(result)
-        lane.set_tool_unloaded.assert_called_once_with()
-        lane.set_unloaded.assert_called_once_with()
+        lane.set_tool_unloaded.assert_not_called()
+        lane.set_unloaded.assert_not_called()
 
     def test_t_command_swaps_head_without_filament_change(self):
         lane = mock.Mock(extruder_obj=types.SimpleNamespace(

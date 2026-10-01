@@ -938,15 +938,11 @@ class AFCExtruder:
             # while this tool was parked never marked it loaded (see
             # tool_start_callback); once it is actually mounted with
             # filament present, catch up here instead of waiting for the
-            # sensor to toggle again. Docking must clear it back so a
-            # merely-fed, parked tool goes back to showing as not loaded.
+            # sensor to toggle again. 
             if self.tc_lane is not None:
                 if mounted and self.tool_start_state and not self.tc_lane.tool_loaded:
                     self.tc_lane.set_tool_loaded()
                     self.tc_lane.set_loaded()
-                elif not mounted and self.tc_lane.tool_loaded:
-                    self.tc_lane.set_tool_unloaded()
-                    self.tc_lane.set_unloaded()
             return mounted
 
         # Return true if both are not set as this would be for single toolhead
