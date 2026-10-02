@@ -162,6 +162,8 @@ class afc:
         # tool-change counts or per-lane temperature selection.
         self.enable_print_metadata = config.getboolean(
             "enable_print_metadata", True)
+        self.print_metadata_delay = config.getfloat(
+            "print_metadata_delay", 5., above=0.)
         self.unit_order_list        = config.get('unit_order_list','')
         self.VarFile                = config.get('VarFile','../printer_data/config/AFC/AFC.var')# Path to the variables file for AFC configuration.
         self.cfgloc                 = self._remove_after_last(self.VarFile,"/")
@@ -621,7 +623,8 @@ class afc:
         """
         if self.enable_print_metadata:
             self.in_print_timer = self.reactor.register_timer(
-                self.in_print_reactor_timer, self.reactor.monotonic() + 5)
+                self.in_print_reactor_timer,
+                self.reactor.monotonic() + self.print_metadata_delay)
         self.error.reset_failure()
         self.gcode.run_script_from_command("CLEAR_PAUSE")
         self.number_of_toolchanges = 0
@@ -2387,6 +2390,7 @@ class afc:
             # Creator 5 swaps complete heads. AFC's usual CHANGE_TOOL path
             # unloads and reloads filament, which drives the shared extruder
             # during every T command. Only perform the physical tool swap.
+            self.afcDeltaTime.set_start_time()
             was_saved = self.position_saved
             self.save_pos()
             saved_here = self.position_saved and not was_saved
@@ -2401,6 +2405,7 @@ class afc:
                     self.restore_pos(move_z_first=False)
             finally:
                 self.in_toolchange = was_changing
+                self.afcDeltaTime.log_total_time("Total change time:")
             return
         try:
             self.afcDeltaTime.set_start_time()

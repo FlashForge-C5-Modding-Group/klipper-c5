@@ -934,15 +934,19 @@ class AFCExtruder:
                 return False
             self.creator5_mount_error = None
             mounted = attached == self.creator5_tool_index
-            # Re-sync lane_loaded on mount transitions. Filament inserted
-            # while this tool was parked never marked it loaded (see
-            # tool_start_callback); once it is actually mounted with
-            # filament present, catch up here instead of waiting for the
-            # sensor to toggle again. 
-            if self.tc_lane is not None:
-                if mounted and self.tool_start_state and not self.tc_lane.tool_loaded:
-                    self.tc_lane.set_tool_loaded()
-                    self.tc_lane.set_loaded()
+            busy = (AFCLaneState.TOOL_LOADING, AFCLaneState.TOOL_UNLOADING,
+                    AFCLaneState.EJECTING, AFCLaneState.CALIBRATING,
+                    AFCLaneState.INFINITE_RUNOUT, AFCLaneState.ERROR)
+            if self.tc_lane is not None and self.tc_lane.status not in busy:
+                if mounted and self.tool_start_state:
+                    if self.tc_lane.status not in (AFCLaneState.LOADED,
+                                                    AFCLaneState.TOOLED):
+                        if not self.tc_lane.tool_loaded:
+                            self.tc_lane.set_tool_loaded()
+                        self.tc_lane.set_loaded()
+                elif not mounted and self.tc_lane.tool_loaded:
+                    if self.tc_lane.status != AFCLaneState.LOADED:
+                        self.tc_lane.set_loaded()
             return mounted
 
         # Return true if both are not set as this would be for single toolhead

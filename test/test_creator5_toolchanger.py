@@ -398,6 +398,7 @@ class Creator5OffsetTests(unittest.TestCase):
         board.approach_x = 250.
         board.clear_travel_speed = 600.
         board.dock_approach_speed = 25.
+        board.dock_predock_offset = 20.
         board.departure_speed = 90.
         board.release_latch_wait_ms = 50
         board._move = mock.Mock()
@@ -411,6 +412,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(board._move.call_args_list, [
             mock.call(x=250., feed=36000.),
             mock.call(y=50., feed=36000.),
+            mock.call(x=278., feed=36000.),
             mock.call(x=288., feed=1500.),
             mock.call(x=298., feed=1500.),
             mock.call(x=250., feed=5400.),

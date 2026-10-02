@@ -7,6 +7,20 @@ import unittest
 from unittest import mock
 
 
+class AFCLaneState:
+    NONE             = "None"
+    ERROR            = "Error"
+    LOADED           = "Loaded"
+    TOOLED           = "Tooled"
+    TOOL_LOADED      = "Tool Loaded"
+    TOOL_LOADING     = "Tool Loading"
+    TOOL_UNLOADING   = "Tool Unloading"
+    HUB_LOADING      = "HUB Loading"
+    EJECTING         = "Ejecting"
+    CALIBRATING      = "Calibrating"
+    INFINITE_RUNOUT  = "Infinite Runout"
+
+
 def load_method(filename, class_name, method_name, symbols=None):
     source = pathlib.Path(__file__).resolve().parents[1] / (
         'klippy/extras' + '/' + filename)
@@ -272,10 +286,11 @@ class Creator5AfcSensorTest(unittest.TestCase):
 
     def test_on_shuttle_marks_loaded_once_mounted_with_filament_already_present(self):
         on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
-                                 'on_shuttle')
+                                 'on_shuttle', symbols={
+                                     'AFCLaneState': AFCLaneState})
         toolchanger = mock.Mock()
         toolchanger.attached_tool_from_pins.return_value = 1
-        lane = mock.Mock(tool_loaded=False)
+        lane = mock.Mock(tool_loaded=False, status=AFCLaneState.NONE)
         source = types.SimpleNamespace(
             creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
             creator5_mount_error='stale',
@@ -289,16 +304,88 @@ class Creator5AfcSensorTest(unittest.TestCase):
         lane.set_loaded.assert_called_once_with()
         self.assertIsNone(source.creator5_mount_error)
 
+    def test_on_shuttle_fixes_status_after_restart_restores_tool_loaded(self):
+        # AFC_prep restores tool_loaded from saved vars on every restart but
+        # deliberately leaves status at its NONE default. Confirmed live: a
+        # mounted tool came back as tool_loaded=True, status="None" after a
+        # restart, which Mainsail reads as "nothing to eject". The old
+        # `not tool_loaded` guard never re-fired here since tool_loaded was
+        # already True, so status stayed stuck at None forever. Keying off
+        # status instead must catch this case too.
+        on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
+                                 'on_shuttle', symbols={
+                                     'AFCLaneState': AFCLaneState})
+        toolchanger = mock.Mock()
+        toolchanger.attached_tool_from_pins.return_value = 1
+        lane = mock.Mock(tool_loaded=True, status=AFCLaneState.NONE)
+        source = types.SimpleNamespace(
+            creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
+            creator5_mount_error=None,
+            printer=mock.Mock(
+                lookup_object=mock.Mock(return_value=toolchanger)))
+
+        result = on_shuttle(source)
+
+        self.assertTrue(result)
+        lane.set_tool_loaded.assert_not_called()
+        lane.set_loaded.assert_called_once_with()
+
+    def test_on_shuttle_fixes_stale_status_while_docked(self):
+        # Same restart scenario, but for a docked (not mounted) tool: this
+        # was also seen live as tool_loaded=True, status="None".
+        on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
+                                 'on_shuttle', symbols={
+                                     'AFCLaneState': AFCLaneState})
+        toolchanger = mock.Mock()
+        toolchanger.attached_tool_from_pins.return_value = None
+        lane = mock.Mock(tool_loaded=True, status=AFCLaneState.NONE)
+        source = types.SimpleNamespace(
+            creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
+            creator5_mount_error=None,
+            printer=mock.Mock(
+                lookup_object=mock.Mock(return_value=toolchanger)))
+
+        result = on_shuttle(source)
+
+        self.assertFalse(result)
+        lane.set_loaded.assert_called_once_with()
+        lane.set_tool_unloaded.assert_not_called()
+        lane.set_unloaded.assert_not_called()
+
+    def test_on_shuttle_leaves_busy_lane_alone(self):
+        # A lane mid-load/unload/eject/etc must not have its status stomped
+        # on by this re-sync, even if tool_loaded/mounted would otherwise
+        # qualify.
+        on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
+                                 'on_shuttle', symbols={
+                                     'AFCLaneState': AFCLaneState})
+        toolchanger = mock.Mock()
+        toolchanger.attached_tool_from_pins.return_value = 1
+        lane = mock.Mock(tool_loaded=True,
+                         status=AFCLaneState.TOOL_UNLOADING)
+        source = types.SimpleNamespace(
+            creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
+            creator5_mount_error=None,
+            printer=mock.Mock(
+                lookup_object=mock.Mock(return_value=toolchanger)))
+
+        result = on_shuttle(source)
+
+        self.assertTrue(result)
+        lane.set_loaded.assert_not_called()
+        lane.set_tool_loaded.assert_not_called()
+
     def test_on_shuttle_keeps_loaded_once_docked(self):
         # This is a standalone toolchanger: each tool keeps its own filament
         # loaded while parked, so docking must not forget lane_loaded. Only
         # an actual filament-sensor runout (tool_start_callback) should clear
         # it.
         on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
-                                 'on_shuttle')
+                                 'on_shuttle', symbols={
+                                     'AFCLaneState': AFCLaneState})
         toolchanger = mock.Mock()
         toolchanger.attached_tool_from_pins.return_value = None
-        lane = mock.Mock(tool_loaded=True)
+        lane = mock.Mock(tool_loaded=True, status=AFCLaneState.TOOLED)
         source = types.SimpleNamespace(
             creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
             creator5_mount_error=None,
@@ -311,10 +398,57 @@ class Creator5AfcSensorTest(unittest.TestCase):
         lane.set_tool_unloaded.assert_not_called()
         lane.set_unloaded.assert_not_called()
 
+    def test_on_shuttle_downgrades_tooled_to_loaded_once_docked(self):
+        # AFCLaneState.TOOLED means "mounted in the toolhead right now" --
+        # Mainsail/grumpyscreen grey out Eject and swap Load->Unload based on
+        # it. A docked-but-still-loaded tool is not in the toolhead, so this
+        # must downgrade back to LOADED (keeping tool_loaded/lane_loaded
+        # intact) rather than staying TOOLED forever.
+        on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
+                                 'on_shuttle', symbols={
+                                     'AFCLaneState': AFCLaneState})
+        toolchanger = mock.Mock()
+        toolchanger.attached_tool_from_pins.return_value = None
+        lane = mock.Mock(tool_loaded=True, status=AFCLaneState.TOOLED)
+        source = types.SimpleNamespace(
+            creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
+            creator5_mount_error=None,
+            printer=mock.Mock(
+                lookup_object=mock.Mock(return_value=toolchanger)))
+
+        result = on_shuttle(source)
+
+        self.assertFalse(result)
+        lane.set_loaded.assert_called_once_with()
+        lane.set_tool_loaded.assert_not_called()
+        lane.set_tool_unloaded.assert_not_called()
+        lane.set_unloaded.assert_not_called()
+
+    def test_on_shuttle_does_not_redowngrade_already_loaded_lane(self):
+        # Once status is already LOADED (post-dock), repeated on_shuttle()
+        # polls while still docked must not keep calling set_loaded() again.
+        on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
+                                 'on_shuttle', symbols={
+                                     'AFCLaneState': AFCLaneState})
+        toolchanger = mock.Mock()
+        toolchanger.attached_tool_from_pins.return_value = None
+        lane = mock.Mock(tool_loaded=True, status=AFCLaneState.LOADED)
+        source = types.SimpleNamespace(
+            creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
+            creator5_mount_error=None,
+            printer=mock.Mock(
+                lookup_object=mock.Mock(return_value=toolchanger)))
+
+        result = on_shuttle(source)
+
+        self.assertFalse(result)
+        lane.set_loaded.assert_not_called()
+
     def test_t_command_swaps_head_without_filament_change(self):
         lane = mock.Mock(extruder_obj=types.SimpleNamespace(
             creator5_tool_index=0))
-        afc = types.SimpleNamespace(position_saved=False, in_toolchange=False)
+        afc = types.SimpleNamespace(position_saved=False, in_toolchange=False,
+                                    afcDeltaTime=mock.Mock())
         afc.save_pos = mock.Mock(side_effect=lambda: setattr(
             afc, 'position_saved', True))
         afc.restore_pos = mock.Mock()
@@ -324,14 +458,23 @@ class Creator5AfcSensorTest(unittest.TestCase):
         lane.tool_swap.assert_called_once_with()
         afc.restore_pos.assert_called_once_with(move_z_first=False)
         self.assertFalse(afc.in_toolchange)
+        afc.afcDeltaTime.set_start_time.assert_called_once_with()
+        afc.afcDeltaTime.log_total_time.assert_called_once_with(
+            'Total change time:')
 
         lane.tool_swap.reset_mock()
         afc.restore_pos.reset_mock()
+        afc.afcDeltaTime.set_start_time.reset_mock()
+        afc.afcDeltaTime.log_total_time.reset_mock()
         lane.tool_swap.side_effect = RuntimeError('grab sensor failed')
         with self.assertRaisesRegex(RuntimeError, 'grab sensor failed'):
             change_tool(afc, lane)
         afc.restore_pos.assert_not_called()
         self.assertFalse(afc.in_toolchange)
+        # Timing is still logged (and still useful) even when the swap fails.
+        afc.afcDeltaTime.set_start_time.assert_called_once_with()
+        afc.afcDeltaTime.log_total_time.assert_called_once_with(
+            'Total change time:')
 
 
 if __name__ == '__main__':

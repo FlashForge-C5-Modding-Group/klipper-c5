@@ -161,6 +161,8 @@ class Creator5Toolchanger:
             'lower_bed_speed', 10., above=0.)
         self.dock_approach_speed = config.getfloat(
             'dock_approach_speed', 20., above=0.)
+        self.dock_predock_offset = config.getfloat(
+            'dock_predock_offset', 20., above=10.)
         self.pickup_predock_speed = config.getfloat(
             'pickup_predock_speed', 40., above=0.)
         self.pickup_latch_speed = config.getfloat(
@@ -793,6 +795,7 @@ class Creator5Toolchanger:
             self._raise_z()
         self._move(x=self.approach_x, feed=clear_feed)
         self._move(y=y, feed=clear_feed)
+        self._move(x=x - self.dock_predock_offset, feed=clear_feed)
         self._move(x=x - 10., feed=self.dock_approach_speed * 60.)
         self._move(x=x, feed=self.dock_approach_speed * 60.)
         self._run('M400')
@@ -801,6 +804,19 @@ class Creator5Toolchanger:
         self._move(x=self.approach_x,
                    feed=self.departure_speed * 60.)
         self._verify(gcmd, None, parked=tool)
+        # _dock() is AFC's custom_unselect command (bypassing its own
+        # unload flow entirely), so lane_loaded/status never got cleared
+        # here -- AFC kept reporting the lane as loaded indefinitely after
+        # a successful physical dock. set_tool_unloaded() is pure
+        # bookkeeping/LED state (no physical motion), safe to call after
+        # the dock move above has already completed.
+        extruder_name = 'extruder' if tool == 0 else 'extruder%d' % tool
+        extruder_obj = self.printer.lookup_object(
+            'AFC_extruder ' + extruder_name, None)
+        if extruder_obj is not None and extruder_obj.lane_loaded:
+            lane = extruder_obj.lanes.get(extruder_obj.lane_loaded)
+            if lane is not None:
+                lane.set_tool_unloaded(normal_toolchange=True)
 
     def _pickup(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
