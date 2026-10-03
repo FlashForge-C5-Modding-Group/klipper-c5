@@ -290,11 +290,28 @@ class Creator5Toolchanger:
         # G28 commands can still delegate to Klipper's normal homing path.
         self.prev_G28 = None
         self._g28_passthrough = False
+        self.prev_set_pressure_advance = None
+        self._tool_pa_memory = {}
         self.printer.register_event_handler('klippy:ready', self._handle_ready)
 
     def _handle_ready(self):
         self.prev_G28 = self.gcode.register_command('G28', None)
         self.gcode.register_command('G28', self.cmd_G28)
+        self.prev_set_pressure_advance = self.gcode.register_command(
+            'SET_PRESSURE_ADVANCE', None)
+        if self.prev_set_pressure_advance is not None:
+            self.gcode.register_command(
+                'SET_PRESSURE_ADVANCE', self.cmd_set_pressure_advance)
+        # Seed memory with each extruder's static config value so the first
+        # pickup after startup (before anything has explicitly set PA) has
+        # a sensible default rather than falling back to 0.
+        for tool in range(4):
+            name = 'extruder' if tool == 0 else 'extruder%d' % tool
+            extruder = self.printer.lookup_object(name, None)
+            stepper = getattr(extruder, 'extruder_stepper', None)
+            if stepper is not None and stepper.config_pa > 0.:
+                self._tool_pa_memory[name] = (
+                    stepper.config_pa, stepper.config_smooth_time)
 
     def cmd_flow_on(self, gcmd):
         self.flow_switch.set_enabled(True)
@@ -818,6 +835,42 @@ class Creator5Toolchanger:
             if lane is not None:
                 lane.set_tool_unloaded(normal_toolchange=True)
 
+    def cmd_set_pressure_advance(self, gcmd):
+        # Slicers using Klipper's "Klipper" gcode flavor commonly emit a
+        # bare "SET_PRESSURE_ADVANCE ADVANCE=0" (no EXTRUDER=) immediately
+        # before every toolchange, to disable PA on whatever extruder is
+        # currently active before it gets docked -- and never restore a
+        # real value afterward anywhere in the file. Remember the last
+        # *nonzero* value actually applied to each extruder here (covering
+        # a static config value, a slicer's own per-filament EXTRUDER=
+        # command, or an auto/adaptive PA routine's result -- whichever one
+        # last legitimately set it) so _restore_pressure_advance() can put
+        # the right number back on the next pickup instead of guessing.
+        self.prev_set_pressure_advance(gcmd)
+        extruder_name = gcmd.get('EXTRUDER', None)
+        if extruder_name is None:
+            extruder_name = self.printer.lookup_object(
+                'toolhead').get_extruder().get_name()
+        extruder = self.printer.lookup_object(extruder_name, None)
+        stepper = getattr(extruder, 'extruder_stepper', None)
+        if stepper is not None and stepper.pressure_advance > 0.:
+            self._tool_pa_memory[extruder_name] = (
+                stepper.pressure_advance, stepper.pressure_advance_smooth_time)
+
+    def _restore_pressure_advance(self, extruder_name):
+        # Re-apply whatever pressure_advance should actually be active for
+        # this tool right after every pickup, so a toolchange can never
+        # leave it zeroed (see cmd_set_pressure_advance above for why).
+        extruder = self.printer.lookup_object(extruder_name, None)
+        stepper = getattr(extruder, 'extruder_stepper', None)
+        if stepper is None:
+            return
+        advance, smooth_time = self._tool_pa_memory.get(
+            extruder_name, (stepper.config_pa, stepper.config_smooth_time))
+        self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s ADVANCE=%.5f '
+                  'SMOOTH_TIME=%.5f'
+                  % (extruder_name, advance, smooth_time))
+
     def _pickup(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
@@ -848,6 +901,7 @@ class Creator5Toolchanger:
         self._verify(gcmd, tool)
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+        self._restore_pressure_advance(extruder)
         self._move(x=self.approach_x,
                    feed=self.pickup_departure_speed * 60.)
 
@@ -1052,6 +1106,7 @@ class Creator5Toolchanger:
             self._apply_offsets(tool)
             extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
             self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+            self._restore_pressure_advance(extruder)
             if self.post_select_accel is not None:
                 self._run('SET_VELOCITY_LIMIT ACCEL=%.0f'
                           % self.post_select_accel)
