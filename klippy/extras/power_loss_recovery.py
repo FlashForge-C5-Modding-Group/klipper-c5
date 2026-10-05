@@ -117,8 +117,9 @@ class PowerLossRecovery:
         heaters = self.printer.lookup_object('heaters', None)
         if heaters is not None:
             for name in heaters.get_status(eventtime)['available_heaters']:
-                heater = heaters.lookup_heater(name)
-                heater_targets[name] = heater.get_status(eventtime)['target']
+                short_name = name.split()[-1]
+                heater = heaters.lookup_heater(short_name)
+                heater_targets[short_name] = heater.get_status(eventtime)['target']
         fan_speed = 0.
         fan = self.printer.lookup_object('fan', None)
         if fan is not None:
