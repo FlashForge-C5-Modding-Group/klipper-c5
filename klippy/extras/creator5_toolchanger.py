@@ -1227,12 +1227,28 @@ class Creator5Toolchanger:
         probe = self.printer.lookup_object('probe', None)
         if probe is None:
             raise gcmd.error('Stock [probe] pin is required for offset calibration')
+        toolhead = self.printer.lookup_object('toolhead')
+        params = probe.get_probe_params(gcmd)
         self._raise_z()
         self._move(x=x, y=y, feed=2400)
         session = probe.start_probe_session(gcmd)
         try:
-            for _ in range(3):
+            for i in range(3):
                 session.run_probe(gcmd)
+                if i < 2:
+                    # run_probe() (SampleAveragingHelper, see probe.py)
+                    # only retracts between its OWN internal samples, never
+                    # after the last one -- every other multi-probe caller
+                    # in klipper (e.g. cmd_PROBE_ACCURACY) explicitly lifts
+                    # between calls for exactly this reason. Without it,
+                    # the next outer iteration here starts right at the
+                    # previous contact point with the probe still
+                    # physically triggered, which is what was producing
+                    # "Probe triggered prior to movement" consistently on
+                    # the 2nd/3rd outer probe.
+                    lift_z = (toolhead.get_position()[2]
+                             + params['sample_retract_dist'])
+                    self._move(z=lift_z, feed=params['lift_speed'] * 60)
             positions = session.pull_probed_results()
         finally:
             session.end_probe_session()
