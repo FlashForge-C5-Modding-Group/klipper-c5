@@ -1474,6 +1474,8 @@ class Creator5Toolchanger:
             for axis, value in zip(axes, self.measurements[tool]):
                 self.configfile.set(self.section, 't%d_measure_%s' % (tool, axis),
                                     '%.4f' % value)
+        if single:
+            self._dock(gcmd, tool)
 
     def cmd_calibrate_attached(self, gcmd):
         if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
