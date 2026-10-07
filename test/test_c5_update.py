@@ -2150,6 +2150,10 @@ class PackageTransformationTests(unittest.TestCase):
              "c05dd781da74d1bf78bd8209730e27aad7de4e49abcf0e0265617395df6fbaa6",
              "6fd03bd00a9ef297188d491b4352deef0"
              "721a24b8f1f21373db7363f969e3f0d"),
+            ("41e0fe72aeb26d366341af983f98431963659a5551b6c8713d08bf6a7080c2bb",
+             "c500fe39463cb30847cf30fbc7b172c7d020eca9838b7cbdadbb83157213ac21",
+             "d939882236fb658097c67a9c5300e2b1cecc5d62def3044d3cc9d5158ef3fd05",
+             "a56d423fb7415dca1d18d6ed74649a6b9edbdeb6dd9f058ecb8f564c57665dc2"),
         )
 
         def located(control, installer, script):
@@ -2171,6 +2175,9 @@ class PackageTransformationTests(unittest.TestCase):
                     {"sha256": plaintext})
                 self.assertEqual(profile["control_outer"]["sha256"],
                                  control)
+                self.assertEqual(profile["device"],
+                                 "Creator5" if plaintext == approved[2][0]
+                                 else "Creator5Pro")
 
         plaintext, _, _, _ = approved[1]
         _, control, installer, script = approved[0]
@@ -2216,6 +2223,9 @@ class PackageTransformationTests(unittest.TestCase):
             valid = Path(temp) / "Creator5Pro-levelboard.tgz"
             self.assertEqual(TOOL._prepare_package_output(
                 valid, [template]), valid.resolve())
+            creator5 = Path(temp) / "Creator5-levelboard.tgz"
+            self.assertEqual(TOOL._prepare_package_output(
+                creator5, [template]), creator5.resolve())
             for invalid in (Path(temp) / "wrong.tgz",
                             Path(temp) / "Creator5Pro-.tgz", template):
                 with self.subTest(path=invalid), self.assertRaises(

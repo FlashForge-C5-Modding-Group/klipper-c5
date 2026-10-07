@@ -32,6 +32,7 @@ _ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz",
 
 CANONICAL_TEMPLATE_PROFILES = (
     {
+        "device": "Creator5Pro",
         "plaintext":
             "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616",
         "control":
@@ -42,6 +43,7 @@ CANONICAL_TEMPLATE_PROFILES = (
             "a042533ff5be0392455fe06a8f5270b8e27da04661e8eef830146ad540ba47e6",
     },
     {
+        "device": "Creator5Pro",
         "plaintext":
             "5aeb22a7c0f7f16c286ed74433582ee7fc1557e050dbf5243a3fb48a93960cd6",
         "control":
@@ -53,6 +55,19 @@ CANONICAL_TEMPLATE_PROFILES = (
         "space_reclaim": True,
     },
     {
+        "device": "Creator5",
+        "plaintext":
+            "41e0fe72aeb26d366341af983f98431963659a5551b6c8713d08bf6a7080c2bb",
+        "control":
+            "c500fe39463cb30847cf30fbc7b172c7d020eca9838b7cbdadbb83157213ac21",
+        "installer":
+            "d939882236fb658097c67a9c5300e2b1cecc5d62def3044d3cc9d5158ef3fd05",
+        "control_script":
+            "a56d423fb7415dca1d18d6ed74649a6b9edbdeb6dd9f058ecb8f564c57665dc2",
+        "space_reclaim": True,
+    },
+    {
+        "device": "Creator5Pro",
         "plaintext":
             "89e7b26e92d27034a07bb15a9323a2879bc29d5a7d8603984151d28243f8f1f6",
         "control":
@@ -67,7 +82,7 @@ CANONICAL_TEMPLATE_PROFILES = (
 CANONICAL_IAP_SHA256 = (
     "c258bf965a92dad33b15bff616ef3ac72e958618b9cbb059f0a9cd4602c51f68")
 PACKAGE_NAME_RE = re.compile(
-    r"^Creator5Pro-[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
+    r"^Creator5(?:Pro)?-[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
 COMPONENT_NAME_RE = re.compile(
     r"^(?:\./)?(control|kernel|library|software)-.+\.tar\.xz$")
 CONTROL_MEMBER_PROFILES = (
@@ -2126,6 +2141,7 @@ def _canonical_template_profile(model, md5sum="md5sum"):
     for member, expected_hash, label in gates:
         if member["sha256"] != expected_hash:
             raise ToolError("unsupported canonical %s hash" % label)
+    profile["device"] = expected["device"]
     return profile
 
 
@@ -2528,7 +2544,8 @@ def _prepare_package_output(output, input_paths):
     except (OSError, RuntimeError):
         raise ToolError("unable to resolve package output path")
     if not PACKAGE_NAME_RE.fullmatch(output.name):
-        raise ToolError("output basename must match Creator5Pro-*.tgz")
+        raise ToolError("output basename must match Creator5-*.tgz or "
+                        "Creator5Pro-*.tgz")
     validate_output_root(output.parent)
     manifest = Path(str(output) + ".manifest.json")
     if output in inputs or manifest in inputs:
@@ -2766,6 +2783,8 @@ def package_update(template, firmware_inputs, output,
     md5sum_path = _program_path("md5sum", "md5sum")
     profile = _canonical_template_profile(
         template_model["payload"], md5sum_path)
+    if not output.name.startswith(profile["device"] + "-"):
+        raise ToolError("output model does not match canonical template")
     selected_boards = tuple(firmware_inputs)
     plaintext, evidence = _build_reduced_plaintext(
         profile, firmware_data, shell_path, md5sum_path)
