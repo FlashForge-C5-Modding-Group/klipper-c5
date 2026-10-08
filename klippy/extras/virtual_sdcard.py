@@ -13,11 +13,25 @@ DEFAULT_ERROR_GCODE = """
 {% endif %}
 """
 
-def creator5_start_command(header):
+def creator5_selected_tool(printer):
+    # The UI may select an AFC tool before starting a file whose header has
+    # no T command. Use the physical Creator 5 head, not AFC's mutable T map:
+    # C5_PRINT_START prepares a physical tool, then resets stale AFC maps.
+    afc = printer.lookup_object('AFC', None)
+    if afc is None or afc.current is None:
+        return None
+    lane = afc.lanes.get(afc.current)
+    extruder = getattr(lane, 'extruder_obj', None)
+    index = getattr(extruder, 'creator5_tool_index', None)
+    if index in (0, 1, 2, 3):
+        return index
+    return None
+
+def creator5_start_command(header, selected_tool=None):
     # A slicer-supplied start remains authoritative; never run it twice.
     if re.search(r'^\s*C5_PRINT_START\b', header, re.I | re.M):
         return None
-    tool = 0
+    tool = 0 if selected_tool is None else selected_tool
     tool_seen = False
     hotend = bed = None
     preheat = None
@@ -372,7 +386,8 @@ class VirtualSD:
                     for offset, definition in definitions:
                         self.gcode.run_script(definition)
                         self.creator5_preloaded_definitions.add(offset)
-                start_command = creator5_start_command(header)
+                start_command = creator5_start_command(
+                    header, creator5_selected_tool(self.printer))
                 self.creator5_start_done = True
                 if start_command is not None:
                     self.gcode.run_script(start_command)

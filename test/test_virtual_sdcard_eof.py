@@ -31,6 +31,8 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.gcode = mock.Mock()
         sd.gcode.error = RuntimeError
         sd.gcode.get_mutex.return_value.test.return_value = False
+        sd.printer = mock.Mock()
+        sd.printer.lookup_object.return_value = None
         sd.print_stats = mock.Mock()
         sd.on_error_gcode = mock.Mock()
         sd.on_error_gcode.render.return_value = 'TURN_OFF_HEATERS'
@@ -106,6 +108,28 @@ class VirtualSDEOFTests(unittest.TestCase):
                          'C5_PRINT_START TOOL=2 HOTEND=220 BED=60')
         self.assertEqual(commands[-2:], ['G1 X10', 'C5_PRINT_STOP'])
         self.assertEqual(sd.file_position, sd.file_size)
+
+    def test_automatic_start_uses_afc_ui_selection_without_file_tool(self):
+        sd = self.make_sd('M109 S220\nG1 X10\n')
+        sd.auto_creator5_start = True
+        lane = mock.Mock(map='T0', extruder_obj=mock.Mock(
+            creator5_tool_index=3))
+        afc = mock.Mock(current='extruder3', lanes={'extruder3': lane})
+        sd.printer.lookup_object.return_value = afc
+        sd.work_handler(0.)
+        self.assertEqual(sd.gcode.run_script.call_args_list[0].args[0],
+                         'C5_PRINT_START TOOL=3 HOTEND=220 BED=0')
+
+    def test_file_tool_overrides_afc_ui_selection(self):
+        sd = self.make_sd('M109 S220\nT2\nG1 X10\n')
+        sd.auto_creator5_start = True
+        lane = mock.Mock(map='T3', extruder_obj=mock.Mock(
+            creator5_tool_index=3))
+        sd.printer.lookup_object.return_value = mock.Mock(
+            current='extruder3', lanes={'extruder3': lane})
+        sd.work_handler(0.)
+        self.assertEqual(sd.gcode.run_script.call_args_list[0].args[0],
+                         'C5_PRINT_START TOOL=2 HOTEND=220 BED=0')
 
     def test_automatic_start_passes_first_layer_height(self):
         sd = self.make_sd('; first_layer_height = 0.08\nM104 S220\nG1 X10')
