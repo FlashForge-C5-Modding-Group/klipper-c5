@@ -56,6 +56,12 @@ class C5TMCUartTests(unittest.TestCase):
         self.uart.send_cmd = FakeCommand(reply)
         self.assertEqual(self.uart.reg_read(None, 0, 0x02)['data'], 0x12345678)
 
+    def test_read_accepts_stray_byte_before_dma_echo(self):
+        reply = (bytearray([0xc5]) + self.uart._encode(0, 0x02)
+                 + self.make_reply(0x02, 0x12345678))
+        self.uart.send_cmd = FakeCommand(reply)
+        self.assertEqual(self.uart.reg_read(None, 0, 0x02)['data'], 0x12345678)
+
     def test_read_rejects_wrong_echo(self):
         reply = bytearray(self.uart._encode(0, 0x02)
                           + self.make_reply(0x02, 0x12345678))
