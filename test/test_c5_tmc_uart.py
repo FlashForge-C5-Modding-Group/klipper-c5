@@ -51,6 +51,18 @@ class C5TMCUartTests(unittest.TestCase):
         self.uart.send_cmd = FakeCommand(reply)
         self.assertIsNone(self.uart.reg_read(None, 0, 0x02)['data'])
 
+    def test_read_accepts_dma_echo_and_reply(self):
+        reply = self.uart._encode(0, 0x02) + self.make_reply(0x02, 0x12345678)
+        self.uart.send_cmd = FakeCommand(reply)
+        self.assertEqual(self.uart.reg_read(None, 0, 0x02)['data'], 0x12345678)
+
+    def test_read_rejects_wrong_echo(self):
+        reply = bytearray(self.uart._encode(0, 0x02)
+                          + self.make_reply(0x02, 0x12345678))
+        reply[0] = 0
+        self.uart.send_cmd = FakeCommand(reply)
+        self.assertIsNone(self.uart.reg_read(None, 0, 0x02)['data'])
+
     def test_write_uses_mcu_clock(self):
         self.uart.send_cmd = FakeCommand()
         self.uart.reg_write(None, 0, 0x6c, 0x140082c3, 1.5)

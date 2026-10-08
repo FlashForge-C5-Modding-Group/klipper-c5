@@ -215,7 +215,7 @@ command_c5_tmc_uart_send(uint32_t *args)
 {
     uint8_t bus = args[0], write_len = args[1], read_len = args[3];
     uint8_t *write = command_decode_ptr(args[2]);
-    uint8_t reply[8], reply_len = 0;
+    uint8_t reply[15], reply_len = 0;
     if (bus || !((write_len == 4 && read_len == 8)
                  || (write_len == 8 && read_len == 0))) {
         sendf("c5_tmc_uart_response bus=%c read=%*s", bus, 0, reply);
@@ -252,21 +252,20 @@ command_c5_tmc_uart_send(uint32_t *args)
         if (!timer_is_before(timer_read_time(), deadline))
             goto done;
     if (read_len) {
-        // The driver echoes the four-byte request, then replies with eight
-        // bytes.  Match the echo; Klippy validates the reply header and CRC.
+        // Capture the whole DMA frame, including the request echo.  Klippy
+        // validates the echo and CRC and can report a partial frame.
         while (DMA1_Channel3->CNDTR > 3)
             if (!timer_is_before(timer_read_time(), deadline))
                 goto done;
-        for (uint_fast8_t i = 0; i < write_len; i++)
-            if (tmc_response[i] != write[i])
-                goto done;
-        for (uint_fast8_t i = 0; i < sizeof(reply); i++)
-            reply[i] = tmc_response[write_len + i];
-        reply_len = sizeof(reply);
     }
 
 done:
     flag = irq_save();
+    if (read_len) {
+        reply_len = sizeof(tmc_response) - DMA1_Channel3->CNDTR;
+        for (uint_fast8_t i = 0; i < reply_len; i++)
+            reply[i] = tmc_response[i];
+    }
     DMA1_Channel2->CCR &= ~1u;
     DMA1_Channel3->CCR &= ~1u;
     DMA1->IFCR = N32_DMA1_CH2_ALL | N32_DMA1_CH3_ALL;
