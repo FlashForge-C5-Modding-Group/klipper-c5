@@ -24,6 +24,8 @@ class afcPrep:
         self.delay              = config.getfloat('delay_time', 0.1, minval=0.0)                # Time to delay when moving extruders and spoolers during PREP routine
         self.enable             = config.getboolean("enable", False)                            # Set True to disable PREP checks
         self.dis_unload_macro   = config.getboolean("disable_unload_filament_remapping", False) # Set to True to disable remapping UNLOAD_FILAMENT macro to TOOL_UNLOAD macro
+        self.reset_creator5_maps_on_prep = config.getboolean(
+            'reset_creator5_maps_on_prep', False)
         self.get_td1_data       = config.getboolean("capture_td1_data", False)                  # Set to True to capture TD-1 data for all lanes during prep
 
         # Flag to set once resume rename as occurred for the first time
@@ -40,6 +42,20 @@ class afcPrep:
         self.afc: afc = self.printer.lookup_object('AFC')
         self.afc.gcode.register_command('PREP', self.PREP, desc=None)
         self.logger = self.afc.logger
+
+    def _restore_lane_map(self, lane, stored):
+        # A prior infinite-spool or manual swap may have persisted T numbers
+        # in AFC.var.unit. On Creator 5, each configured T number denotes a
+        # physical head at the start of a new session. Restore that mapping
+        # before PREP registers T commands or reports filament presence.
+        if (self.reset_creator5_maps_on_prep
+                and lane.extruder_obj.creator5_tool_index is not None
+                and lane._map is not None):
+            lane.map = lane._map
+        elif 'map' in stored:
+            lane.map = stored['map']
+        if lane.map is not None:
+            self.afc.tool_cmds[lane.map] = lane.name
 
     def _rename_macros(self):
         """
@@ -188,9 +204,8 @@ class afcPrep:
 
                     if 'runout_lane' in units[cur_lane.unit][cur_lane.name]: cur_lane.runout_lane = units[cur_lane.unit][cur_lane.name]['runout_lane']
                     if cur_lane.runout_lane == '' or cur_lane.runout_lane == 'NONE': cur_lane.runout_lane = None
-                    if 'map' in units[cur_lane.unit][cur_lane.name]: cur_lane.map = units[cur_lane.unit][cur_lane.name]['map']
-                    if cur_lane.map != None:
-                        self.afc.tool_cmds[cur_lane.map] = cur_lane.name
+                    self._restore_lane_map(
+                        cur_lane, units[cur_lane.unit][cur_lane.name])
                     # Check first for hub_loaded as this was the old name in software with version <= 1030
                     if 'hub_loaded' in units[cur_lane.unit][cur_lane.name]: lane.loaded_to_hub = units[cur_lane.unit][cur_lane.name]['hub_loaded']
                     # Check for loaded_to_hub as this is how its being saved version > 1030
@@ -287,4 +302,3 @@ class afcPrep:
 
 def load_config(config):
     return afcPrep(config)
-

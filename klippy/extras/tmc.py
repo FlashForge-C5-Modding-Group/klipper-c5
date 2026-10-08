@@ -484,7 +484,11 @@ class TMCCommandHelper:
         force_move = self.printer.lookup_object("force_move")
         self.stepper = force_move.lookup_stepper(self.stepper_name)
         # Note pulse duration and step_both_edge optimizations available
-        self.stepper.setup_default_pulse_duration(.000000100, True)
+        if getattr(self.mcu_tmc, 'is_c5_shared_driver', False):
+            # Stock eBoard uses single-edge stepping for the shared motor.
+            self.stepper.setup_default_pulse_duration(.000000500, False)
+        else:
+            self.stepper.setup_default_pulse_duration(.000000100, True)
     def _handle_connect(self):
         # Check if using step on both edges optimization
         pulse_duration, step_both_edge = self.stepper.get_pulse_duration()
@@ -493,7 +497,8 @@ class TMCCommandHelper:
         # Check for soft stepper enable/disable
         enable_line = self.stepper_enable.lookup_enable(self.stepper_name)
         enable_line.register_state_callback(self._handle_stepper_enable)
-        if not enable_line.has_dedicated_enable():
+        if (not enable_line.has_dedicated_enable()
+            and not getattr(self.mcu_tmc, 'is_c5_shared_driver', False)):
             self.toff = self.fields.get_field("toff")
             self.fields.set_field("toff", 0)
             logging.info("Enabling TMC virtual enable for '%s'",

@@ -42,6 +42,28 @@ def load_method(filename, class_name, method_name, symbols=None):
 
 
 class Creator5AfcSensorTest(unittest.TestCase):
+    def test_prep_restores_physical_creator5_map_not_saved_swap(self):
+        restore = load_method('AFC_prep.py', 'afcPrep', '_restore_lane_map')
+        prep = types.SimpleNamespace(reset_creator5_maps_on_prep=True,
+                                     afc=types.SimpleNamespace(tool_cmds={}))
+        lane = types.SimpleNamespace(name='extruder3', map='T0',
+                                     _map='T3', extruder_obj=types.SimpleNamespace(
+                                         creator5_tool_index=3))
+        restore(prep, lane, {'map': 'T0'})
+        self.assertEqual(lane.map, 'T3')
+        self.assertEqual(prep.afc.tool_cmds, {'T3': 'extruder3'})
+
+    def test_prep_retains_saved_map_without_creator5_option(self):
+        restore = load_method('AFC_prep.py', 'afcPrep', '_restore_lane_map')
+        prep = types.SimpleNamespace(reset_creator5_maps_on_prep=False,
+                                     afc=types.SimpleNamespace(tool_cmds={}))
+        lane = types.SimpleNamespace(name='extruder3', map='T3',
+                                     _map='T3', extruder_obj=types.SimpleNamespace(
+                                         creator5_tool_index=3))
+        restore(prep, lane, {'map': 'T0'})
+        self.assertEqual(lane.map, 'T0')
+        self.assertEqual(prep.afc.tool_cmds, {'T0': 'extruder3'})
+
     def test_infinite_spool_changes_to_selected_loaded_head(self):
         runout = load_method('AFC_lane.py', 'AFCLane',
                              '_perform_creator5_infinite_runout')

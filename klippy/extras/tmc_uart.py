@@ -190,6 +190,64 @@ class MCU_TMC_uart_bitbang:
     def get_mcu(self):
         return self.mcu
 
+class MCU_C5_TMC_uart:
+    # The Creator 5 eBoard owns USART3 (PB10/PB11).  Its pressure-advance
+    # sampler also uses that UART, so GPIO bitbanging cannot be used here.
+    is_c5_shared_driver = True
+    def __init__(self, mcu):
+        self.mcu = mcu
+        self.mutex = lookup_tmc_uart_mutex(mcu)
+        self.cmd_queue = mcu.alloc_command_queue()
+        self.instances = set()
+        self.send_cmd = None
+        mcu.register_config_callback(self.build_config)
+    def build_config(self):
+        if not self.mcu.get_constants().get('C5_EBOARD_TMC_UART'):
+            raise self.mcu.get_printer().config_error(
+                "eBoard firmware lacks configurable TMC UART support;"
+                " update the eBoard MCU")
+        self.send_cmd = self.mcu.lookup_query_command(
+            "c5_tmc_uart_send bus=%c write=%*s read=%c",
+            "c5_tmc_uart_response bus=%c read=%*s",
+            cq=self.cmd_queue, is_async=True)
+    def register_instance(self, rx_pin_params, tx_pin_params,
+                          select_pins_desc, addr):
+        if (rx_pin_params['pin'] != 'PB11' or tx_pin_params['pin'] != 'PB10'
+            or select_pins_desc is not None or addr != 0):
+            raise self.mcu.get_printer().config_error(
+                "Creator 5 eBoard TMC must use RX PB11, TX PB10, address 0"
+                " and no select_pins")
+        if addr in self.instances:
+            raise self.mcu.get_printer().config_error(
+                "Creator 5 eBoard has only one shared extruder TMC driver")
+        self.instances.add(addr)
+        return None
+    def _encode(self, addr, reg, val=None):
+        msg = bytearray([0x05, addr, reg | (0x80 if val is not None else 0)])
+        if val is not None:
+            msg.extend([(val >> 24) & 0xff, (val >> 16) & 0xff,
+                        (val >> 8) & 0xff, val & 0xff])
+        msg.append(MCU_TMC_uart_bitbang._calc_crc8(self, msg))
+        return msg
+    def reg_read(self, instance_id, addr, reg):
+        msg = self._encode(addr, reg)
+        params = self.send_cmd.send([0, msg, 8])
+        data = bytearray(params['read'])
+        val = None
+        if (len(data) == 8 and data[:3] == bytearray([0x05, 0xff, reg])
+            and data[7] == MCU_TMC_uart_bitbang._calc_crc8(self, data[:7])):
+            val = ((data[3] << 24) | (data[4] << 16)
+                   | (data[5] << 8) | data[6])
+        return {'data': val, '#receive_time': params['#receive_time']}
+    def reg_write(self, instance_id, addr, reg, val, print_time=None):
+        minclock = 0
+        if print_time is not None:
+            minclock = self.mcu.print_time_to_clock(print_time)
+        self.send_cmd.send([0, self._encode(addr, reg, val), 0],
+                           minclock=minclock)
+    def get_mcu(self):
+        return self.mcu
+
 # Lookup a (possibly shared) tmc uart
 def lookup_tmc_uart_bitbang(config, max_addr):
     ppins = config.get_printer().lookup_object("pins")
@@ -206,8 +264,13 @@ def lookup_tmc_uart_bitbang(config, max_addr):
     addr = config.getint('uart_address', 0, minval=0, maxval=max_addr)
     mcu_uart = rx_pin_params.get('class')
     if mcu_uart is None:
-        mcu_uart = MCU_TMC_uart_bitbang(rx_pin_params, tx_pin_params,
-                                        select_pins_desc)
+        mcu = rx_pin_params['chip']
+        if mcu.get_name() == 'eboard' and (rx_pin_params['pin'] == 'PB11'
+                                           or tx_pin_params['pin'] == 'PB10'):
+            mcu_uart = MCU_C5_TMC_uart(mcu)
+        else:
+            mcu_uart = MCU_TMC_uart_bitbang(rx_pin_params, tx_pin_params,
+                                            select_pins_desc)
         rx_pin_params['class'] = mcu_uart
     instance_id = mcu_uart.register_instance(rx_pin_params, tx_pin_params,
                                              select_pins_desc, addr)
@@ -223,6 +286,8 @@ class MCU_TMC_uart:
         self.ifcnt = None
         self.instance_id, self.addr, self.mcu_uart = lookup_tmc_uart_bitbang(
             config, max_addr)
+        self.is_c5_shared_driver = getattr(
+            self.mcu_uart, 'is_c5_shared_driver', False)
         self.mutex = self.mcu_uart.mutex
         self.tmc_frequency = tmc_frequency
     def get_fields(self):
