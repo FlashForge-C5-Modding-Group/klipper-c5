@@ -257,6 +257,13 @@ command_c5_tmc_uart_send(uint32_t *args)
         while (DMA1_Channel3->CNDTR > 3)
             if (!timer_is_before(timer_read_time(), deadline))
                 goto done;
+        // A stale leading byte can precede the request echo.  Once twelve
+        // bytes have arrived, allow the final CRC byte to reach DMA too.
+        uint32_t settle_deadline = (timer_read_time()
+                                    + timer_from_us(300));
+        while (timer_is_before(timer_read_time(), settle_deadline))
+            if (!DMA1_Channel3->CNDTR)
+                break;
     }
 
 done:

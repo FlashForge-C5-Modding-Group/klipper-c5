@@ -233,7 +233,11 @@ class MCU_C5_TMC_uart:
         msg = self._encode(addr, reg)
         params = self.send_cmd.send([0, msg, 8])
         raw = bytearray(params['read'])
-        data = raw[4:] if len(raw) == 12 and raw[:4] == msg else raw
+        data = raw
+        if len(raw) > 8:
+            echo_pos = raw.find(msg)
+            if echo_pos >= 0 and len(raw) >= echo_pos + 12:
+                data = raw[echo_pos + 4:echo_pos + 12]
         val = None
         if (len(data) == 8 and data[:3] == bytearray([0x05, 0xff, reg])
             and data[7] == MCU_TMC_uart_bitbang._calc_crc8(self, data[:7])):
