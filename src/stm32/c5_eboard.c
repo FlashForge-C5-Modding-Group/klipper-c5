@@ -45,6 +45,7 @@ static volatile uint32_t dma_snapshot;
 static uint32_t previous_snapshot, poll_divider;
 static volatile uint8_t pa_mode_active;
 static uint8_t tmc_request[4] = { 0x05, 0x00, 0x41, 0xcf };
+static uint8_t tmc_transfer[8];
 static volatile uint8_t tmc_response[15];
 
 static volatile uint32_t *
@@ -234,15 +235,19 @@ command_c5_tmc_uart_send(uint32_t *args)
     DMA1_Channel3->CNDTR = sizeof(tmc_response);
     if (read_len)
         DMA1_Channel3->CCR |= 1u;
+    for (uint_fast8_t i = 0; i < write_len; i++)
+        tmc_transfer[i] = write[i];
+    DMA1_Channel2->CMAR = (uint32_t)(uintptr_t)tmc_transfer;
+    DMA1_Channel2->CNDTR = write_len;
+    DMA1_Channel2->CCR |= 1u;
     irq_restore(flag);
 
     uint32_t deadline = timer_read_time() + timer_from_us(3000);
-    for (uint_fast8_t i = 0; i < write_len; i++) {
-        while (!(USART3->SR & USART_SR_TXE))
-            if (!timer_is_before(timer_read_time(), deadline))
-                goto done;
-        USART3->DR = write[i];
-    }
+    // Use the same DMA transmitter as the stock eBoard PA query.  USART3
+    // remains at its stock baud rate and the complete datagram is contiguous.
+    while (DMA1_Channel2->CCR & 1u)
+        if (!timer_is_before(timer_read_time(), deadline))
+            goto done;
     while (!(USART3->SR & USART_SR_TC))
         if (!timer_is_before(timer_read_time(), deadline))
             goto done;
@@ -267,6 +272,7 @@ done:
     DMA1->IFCR = N32_DMA1_CH2_ALL | N32_DMA1_CH3_ALL;
     c5_clear_usart_idle();
     c5_clear_tmc_response();
+    DMA1_Channel2->CMAR = (uint32_t)(uintptr_t)tmc_request;
     DMA1_Channel2->CNDTR = sizeof(tmc_request);
     DMA1_Channel3->CNDTR = sizeof(tmc_response);
     if (resume_pa) {

@@ -238,6 +238,9 @@ class MCU_C5_TMC_uart:
             and data[7] == MCU_TMC_uart_bitbang._calc_crc8(self, data[:7])):
             val = ((data[3] << 24) | (data[4] << 16)
                    | (data[5] << 8) | data[6])
+        else:
+            logging.warning("Creator 5 eBoard TMC UART read 0x%02x: %s",
+                            reg, data.hex())
         return {'data': val, '#receive_time': params['#receive_time']}
     def reg_write(self, instance_id, addr, reg, val, print_time=None):
         minclock = 0

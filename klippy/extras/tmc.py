@@ -508,6 +508,10 @@ class TMCCommandHelper:
             self._init_registers()
         except self.printer.command_error as e:
             logging.info("TMC %s failed to init: %s", self.name, str(e))
+            if getattr(self.mcu_tmc, 'is_c5_shared_driver', False):
+                # The eBoard no longer programs this motor driver at boot.
+                # Do not permit motion if Klippy cannot configure it.
+                raise
     # get_status information export
     def get_status(self, eventtime=None):
         cpos = None
