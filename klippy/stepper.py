@@ -77,17 +77,6 @@ class MCU_stepper:
         self.set_stepper_kinematics(sk)
     def _build_config(self):
         constants = self._mcu.get_constants()
-        if (self._step_pin == "PB14"
-                and constants.get("MCU") == "n32g455ccl7"):
-            if (self._step_pulse_duration is not None
-                    and not 0.0000002 <= self._step_pulse_duration
-                    <= 0.0000005):
-                raise self._mcu.get_printer().config_error(
-                    "Creator 5 eBoard extruder step_pulse_duration must "
-                    "be between 0.0000002 and 0.0000005")
-            if self._step_pulse_duration is None:
-                self._step_pulse_duration = 0.0000005
-            self._req_step_both_edge = False
         if self._step_pulse_duration is None:
             self._step_pulse_duration = .000002
         invert_step = self._invert_step
