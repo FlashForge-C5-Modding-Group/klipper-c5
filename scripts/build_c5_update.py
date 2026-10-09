@@ -2711,7 +2711,6 @@ def _create_manifest(firmware_reports, template_plaintext_hash, plaintext,
                 "output control checksums",
                 "fresh ciphertext decryption and reinspection",
             ],
-            "hardware_verified": False,
         },
     }
 
