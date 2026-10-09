@@ -76,11 +76,22 @@ class MCU_stepper:
         sk = ffi_main.gc(getattr(ffi_lib, alloc_func)(*params), ffi_lib.free)
         self.set_stepper_kinematics(sk)
     def _build_config(self):
+        constants = self._mcu.get_constants()
+        if (self._step_pin == "PB14"
+                and constants.get("MCU") == "n32g455ccl7"):
+            if (self._step_pulse_duration is not None
+                    and not 0.0000002 <= self._step_pulse_duration
+                    <= 0.0000005):
+                raise self._mcu.get_printer().config_error(
+                    "Creator 5 eBoard extruder step_pulse_duration must "
+                    "be between 0.0000002 and 0.0000005")
+            if self._step_pulse_duration is None:
+                self._step_pulse_duration = 0.0000005
+            self._req_step_both_edge = False
         if self._step_pulse_duration is None:
             self._step_pulse_duration = .000002
         invert_step = self._invert_step
         # Check if can enable "step on both edges"
-        constants = self._mcu.get_constants()
         ssbe = int(constants.get('STEPPER_STEP_BOTH_EDGE', '0'))
         sbe = int(constants.get('STEPPER_BOTH_EDGE', '0'))
         sou = int(constants.get('STEPPER_OPTIMIZED_UNSTEP', '0'))
