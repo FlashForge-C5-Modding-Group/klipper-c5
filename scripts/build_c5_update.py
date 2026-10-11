@@ -2782,16 +2782,6 @@ def package_update(template, firmware_inputs, output,
     md5sum_path = _program_path("md5sum", "md5sum")
     profile = _canonical_template_profile(
         template_model["payload"], md5sum_path)
-    # No device/output-name cross-check here on purpose: the MCU
-    # firmware is hardware-identical between Creator5 and Creator5Pro,
-    # and our actual flashing path (flash-mcu-firmware.sh) extracts
-    # control-*.tar.xz and calls IAPCommand/ISPCommand directly -- it
-    # never runs the canonical template's own runFirmwareExe.sh, which
-    # is the only place a MACHINE/PID model gate exists, and even that
-    # gate only fires when invoked by the stock firmware's own
-    # auto-updater with explicit machine args, not when flashed this
-    # way. So one package built from either canonical template is
-    # physically installable on both models regardless of its name.
     selected_boards = tuple(firmware_inputs)
     plaintext, evidence = _build_reduced_plaintext(
         profile, firmware_data, shell_path, md5sum_path)

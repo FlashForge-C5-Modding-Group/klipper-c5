@@ -265,6 +265,7 @@ class Creator5Toolchanger:
             ('C5_WHEEL_RUNOUT', self.cmd_wheel_runout),
             ('C5_WHEEL_CLOG', self.cmd_wheel_runout),
             ('C5_TOOL_PURGE', self.cmd_purge),
+            ('C5_MOVE_TO_PURGE_BUCKET', self.cmd_move_to_purge_bucket),
             ('C5_BED_SOAK', self.cmd_bed_soak),
             ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
@@ -1701,6 +1702,19 @@ class Creator5Toolchanger:
                     if state_saved and not complete:
                         self._run('RESTORE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE MOVE=0')
         self._with_motion(gcmd, calibrate)
+
+    def cmd_move_to_purge_bucket(self, gcmd):
+        # Called before heating to the full priming temperature so any ooze
+        # during heat-soak lands in the purge bucket instead of wherever the
+        # pickup left the toolhead (often over the bed).
+        dock, grab, attached = self._preflight(gcmd)
+        if attached is None:
+            raise gcmd.error('No attached tool to move to the purge bucket')
+        def move():
+            self._raise_z()
+            self._run('G90')
+            self._move_to_prep_bucket()
+        self._with_motion(gcmd, move)
 
     def cmd_purge(self, gcmd):
         length = gcmd.get_float('LENGTH', self.purge_length,
